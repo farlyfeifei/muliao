@@ -33,11 +33,12 @@ class VoiceRuntimeResources:
     player: CancellableAudioPlayer | None = None
     sink: PyAudioPcmSink | None = None
     echo_guard: EchoGuard | None = None
+    goal_client: Any | None = None
 
     def close(self) -> None:
         errors: list[BaseException] = []
         seen: set[int] = set()
-        for resource in (self.speaker, self.router, self.player, self.sink):
+        for resource in (self.speaker, self.router, self.player, self.sink, self.goal_client):
             if resource is None or id(resource) in seen:
                 continue
             seen.add(id(resource))
@@ -84,10 +85,11 @@ def build_runtime(
     speak: bool = True,
     enable_asr: bool = True,
 ):
-    """构建显式 M1+ runtime；当前仅支持 ``mode='fast'``。"""
+    """构建显式 M1+ runtime；支持 ``mode='fast'``（FAST 单通道）与 ``mode='goal'``
+    （FAST/DESKTOP-GOAL 三通道分流，经 VoiceOrchestrator）。"""
 
-    if mode != "fast":
-        raise ValueError("build_runtime currently supports only mode='fast'")
+    if mode not in {"fast", "goal"}:
+        raise ValueError("build_runtime supports mode='fast' or mode='goal'")
     settings.validate_m0()
     router = JevFastRouter(
         url=settings.jev_url,
@@ -122,13 +124,36 @@ def build_runtime(
         if enable_asr
         else _TranscriptOnlyRecognizer()
     )
+    permission = ExistingVoicePermission()
+    events = JsonLineEventSink()
+
+    if mode == "goal":
+        engine, goal_client = _build_goal_engine(
+            settings,
+            router=router,
+            recognizer=recognizer,
+            permission=permission,
+            speaker=speaker,
+            events=events,
+            echo_guard=echo_guard,
+            act=act,
+        )
+        return engine, VoiceRuntimeResources(
+            router=router,
+            speaker=speaker,
+            player=player,
+            sink=sink,
+            echo_guard=echo_guard,
+            goal_client=goal_client,
+        )
+
     engine = VoiceEngine(
-        permission=ExistingVoicePermission(),
+        permission=permission,
         recognizer=recognizer,
         router=router,
         executor=FastActionExecutor(adapter),
         speaker=speaker,
-        events=JsonLineEventSink(),
+        events=events,
         echo_guard=echo_guard,
     )
     return engine, VoiceRuntimeResources(
@@ -138,6 +163,64 @@ def build_runtime(
         sink=sink,
         echo_guard=echo_guard,
     )
+
+
+def _build_goal_engine(
+    settings: VoiceSettings,
+    *,
+    router: Any,
+    recognizer: Any,
+    permission: Any,
+    speaker: object,
+    events: Any,
+    echo_guard: EchoGuard | None,
+    act: bool,
+):
+    """Wire the FAST/DESKTOP-GOAL orchestrator behind the engine interface.
+
+    Returns ``(engine, goal_client)`` where ``goal_client`` is the shared httpx
+    client owned by the runtime resources so it is closed exactly once. The
+    desktop GOAL action executor stays dry-run unless ``act`` is set; there is
+    no real Windows UIA/OCR actuator yet (that is a later milestone), so an
+    ``act=True`` desktop GOAL still plans through the dry-run executor.
+    """
+
+    import httpx
+
+    from .goal import DryRunActionExecutor, GoalLoop
+    from .goal_router import JevGoalChooser
+    from .goal_runtime import GoalEngineAdapter, make_goal_ask
+    from .orchestrator import VoiceOrchestrator
+
+    # One direct, certificate-validated client shared by the chooser transport;
+    # trust_env=False mirrors the FAST router's proxy workaround.
+    goal_client = httpx.Client(timeout=15.0, trust_env=False)
+    chooser = JevGoalChooser(
+        ask=make_goal_ask(settings.jev_url, settings.jev_key, settings.jev_model, client=goal_client),
+        api_key=settings.jev_key,
+        model=settings.jev_model,
+    )
+    goal_loop = GoalLoop(
+        perception=None,
+        chooser=chooser,
+        action=DryRunActionExecutor(),
+        dry_run=not act,
+    )
+    orchestrator = VoiceOrchestrator(
+        goal_loop=goal_loop,
+        router=router,
+        executor=FastActionExecutor(DryRunFastAdapter() if not act else WindowsFastAdapter()),
+        permission=permission,
+    )
+    engine = GoalEngineAdapter(
+        orchestrator=orchestrator,
+        recognizer=recognizer,
+        permission=permission,
+        speaker=speaker,
+        events=events,
+    )
+    engine.echo_guard = echo_guard
+    return engine, goal_client
 
 
 def build_capture(
