@@ -2,20 +2,83 @@
   "schema_version": 1,
   "models": {
     "sensevoice": {
-      "purpose": "M0 final command ASR after local wake gating",
+      "purpose": "Final local command ASR after wake gating",
       "runtime": "sherpa-onnx",
       "env": "MULIAO_VOICE_SENSEVOICE_DIR",
-      "default_relative_dir": "models/sensevoice",
+      "default_path": "C:/ProgramData/Muliao/models/sensevoice",
       "files": [
-        {"name": "model.int8.onnx", "size_bytes": 239233841},
-        {"name": "tokens.txt", "size_bytes": 315894}
+        {
+          "name": "model.int8.onnx",
+          "size_bytes": 239233841,
+          "purpose": "SenseVoice-Small quantized acoustic and language model"
+        },
+        {
+          "name": "tokens.txt",
+          "size_bytes": 315894,
+          "purpose": "SenseVoice token symbol table"
+        }
       ],
       "source": "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    },
+    "streaming_zipformer": {
+      "purpose": "Display-only streaming Chinese and English captions",
+      "runtime": "sherpa-onnx",
+      "env": "MULIAO_VOICE_STREAMING_DIR",
+      "default_path": "C:/ProgramData/Muliao/models/streaming-zipformer",
+      "files": [
+        {
+          "name": "tokens.txt",
+          "size_bytes": 56317,
+          "purpose": "Token symbol table"
+        },
+        {
+          "name": "encoder-epoch-99-avg-1.onnx",
+          "size_bytes": 330083505,
+          "purpose": "Streaming Zipformer encoder network"
+        },
+        {
+          "name": "decoder-epoch-99-avg-1.onnx",
+          "size_bytes": 13876452,
+          "purpose": "Transducer prediction decoder network"
+        },
+        {
+          "name": "joiner-epoch-99-avg-1.onnx",
+          "size_bytes": 12833618,
+          "purpose": "Transducer encoder-decoder joiner network"
+        },
+        {
+          "name": "bpe.model",
+          "size_bytes": 244836,
+          "purpose": "SentencePiece BPE vocabulary model"
+        }
+      ],
+      "source": "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+    },
+    "vits_tts": {
+      "purpose": "Optional fully local VITS speech synthesis",
+      "runtime": "sherpa-onnx",
+      "env": "MULIAO_VOICE_VITS_DIR",
+      "default_path": "C:/ProgramData/Muliao/models/vits",
+      "optional": true,
+      "files": [
+        {
+          "name": "model.onnx",
+          "purpose": "VITS text-to-speech network",
+          "optional": true
+        },
+        {
+          "name": "tokens.txt",
+          "purpose": "VITS token symbol table",
+          "optional": true
+        }
+      ]
     }
   },
   "notes": [
     "Model assets are never committed to git.",
-    "Production packaging must place model files under an ASCII-only path.",
-    "API keys must come from environment variables or repository-external config."
+    "Every configured model directory must be absolute, repository-external, and ASCII-only.",
+    "Environment variables override default_path values.",
+    "The application never downloads arbitrary URLs; source values are manual acquisition references only.",
+    "This manifest must never contain API keys, tokens, passwords, or other credentials."
   ]
 }
