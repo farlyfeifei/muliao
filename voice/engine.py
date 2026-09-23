@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import threading
+import time
 from typing import Any, Callable, Mapping, TypeVar
 
 from .cancellation import CancellationToken, VoiceCancelled
@@ -179,7 +180,9 @@ class VoiceEngine:
         try:
             operation.token.raise_if_cancelled()
             self._emit(operation, "voice.state", {"state": "recognizing"})
-            transcript = self._transcribe(audio, operation.token)
+            transcript = self._timed(
+                operation, "asr_ms", lambda: self._transcribe(audio, operation.token)
+            )
             operation.token.raise_if_cancelled()
         except VoiceCancelled:
             return self._cancelled(operation)
@@ -285,7 +288,9 @@ class VoiceEngine:
                 return self._cancelled(operation, command, decisions, actions)
 
             self._emit(operation, "voice.state", {"state": "deciding", "step": index, "steps": len(commands)})
-            allowed, decision = self._allowed_call(lambda: self.router.route(part))
+            allowed, decision = self._allowed_call(
+                lambda: self._timed(operation, "jev_ms", lambda: self.router.route(part))
+            )
             if not allowed:
                 return self._permission_denied(operation, "before routing", command, decisions, actions)
             if operation.token.cancelled or not self._is_current(operation):
@@ -360,7 +365,9 @@ class VoiceEngine:
                     {"steps": len(actions)},
                 )
 
-            allowed, action = self._allowed_call(lambda: self.executor.execute(decision))
+            allowed, action = self._allowed_call(
+                lambda: self._timed(operation, "exec_ms", lambda: self.executor.execute(decision))
+            )
             if not allowed:
                 return self._permission_denied(operation, "before action", command, decisions, actions)
             assert isinstance(action, ActionResult)
@@ -424,7 +431,7 @@ class VoiceEngine:
             if not self._is_current(operation):
                 raise VoiceCancelled("stale voice operation")
             self._emit(operation, "voice.tts", {"state": "started", "text": reply, "backend": self._speaker_backend("requested")})
-            self._speak(reply, operation)
+            self._timed(operation, "tts_ms", lambda: self._speak(reply, operation))
 
         try:
             allowed, _ = self._allowed_call(speak)
@@ -551,6 +558,24 @@ class VoiceEngine:
         if not self.permission.allowed():
             return False, None
         return True, callback()
+
+    def _timed(self, operation: _Operation, name: str, work: Callable[[], T]) -> T:
+        """Run ``work`` and emit a ``voice.metric`` latency sample on success.
+
+        The sample is a privacy-safe scalar duration in milliseconds (no
+        transcript, audio, candidate text, or URL). A raised exception
+        propagates untouched and records no sample, so the existing error paths
+        stay authoritative. Stale/cancelled operations are dropped by ``_emit``.
+        """
+
+        started = time.perf_counter()
+        result = work()
+        self._emit(
+            operation,
+            "voice.metric",
+            {"name": name, "value": round((time.perf_counter() - started) * 1000, 3)},
+        )
+        return result
 
     @staticmethod
     def _capture(capture: AudioCapture, token: CancellationToken) -> AudioSegment:
