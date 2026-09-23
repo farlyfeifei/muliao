@@ -1,13 +1,14 @@
-"""Jev M0 白名单路由：只允许打开记事本。"""
+"""Jev 语音路由：M0 记事本白名单与 M1 FAST 选择题。"""
 from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
 from .contracts import RouteDecision
+from .spans import SelectedSpan, select_text_span
 
 
 M0_QUESTIONS = {
@@ -42,6 +43,86 @@ M0_QUESTIONS = {
 }
 
 
+FAST_QUESTIONS = {
+    "addressed": {
+        "type": "noul",
+        "instructions": "Is `utterance` a direct instruction to this computer voice assistant rather than chatter, praise, reading aloud, or thinking out loud?",
+    },
+    "kind": {
+        "type": "choice",
+        "instructions": "Which single deterministic FAST action does `utterance` request? The Chinese transcript may contain homophones or ASR errors. Choose goal for anything that needs looking at the screen or multiple UI steps.",
+        "criteria": {
+            "open_app": "Open or switch to an allowlisted application",
+            "open_url": "Open an explicit HTTP or HTTPS URL present verbatim in the utterance",
+            "search": "Search the web for a query present verbatim in the utterance",
+            "volume_up": "Increase system volume",
+            "volume_down": "Decrease system volume",
+            "mute": "Mute system audio",
+            "unmute": "Unmute system audio",
+            "media": "Control media playback: play/pause, next, previous, or stop",
+            "shortcut": "Press one allowlisted keyboard shortcut",
+            "screenshot": "Open the Windows screenshot capture UI",
+            "type_text": "Type text present verbatim in the utterance into the focused control",
+            "stop": "Stop or cancel the current voice operation",
+            "goal": "A multi-step task that needs screen inspection or clicking a visible control",
+            "none": "Not a supported computer command",
+        },
+    },
+    "app": {
+        "type": "choice",
+        "instructions": "If `utterance` opens an application, which allowlisted application is it? Answer none otherwise.",
+        "criteria": {
+            "notepad": "Windows Notepad / 记事本",
+            "browser": "Default web browser / 浏览器",
+            "explorer": "Windows File Explorer / 文件资源管理器",
+            "settings": "Windows Settings / 设置",
+            "none": "No allowlisted application",
+        },
+    },
+    "media": {
+        "type": "choice",
+        "instructions": "If `utterance` controls media, which allowlisted operation is requested? Answer none otherwise.",
+        "criteria": {
+            "play_pause": "Play, pause, or toggle playback",
+            "next": "Next track",
+            "previous": "Previous track",
+            "stop": "Stop playback",
+            "none": "No media operation",
+        },
+    },
+    "shortcut": {
+        "type": "choice",
+        "instructions": "If `utterance` asks for a keyboard shortcut, which allowlisted shortcut is requested? Answer none otherwise.",
+        "criteria": {
+            "copy": "Copy",
+            "paste": "Paste",
+            "cut": "Cut",
+            "select_all": "Select all",
+            "undo": "Undo",
+            "redo": "Redo",
+            "save": "Save",
+            "find": "Find",
+            "new_tab": "New browser tab",
+            "close_tab": "Close current tab",
+            "refresh": "Refresh",
+            "switch_window": "Switch window",
+            "show_desktop": "Show desktop",
+            "escape": "Escape",
+            "enter": "Enter",
+            "none": "No shortcut",
+        },
+    },
+    "complete": {
+        "type": "noul",
+        "instructions": "Is `utterance` a complete command with its required object or text present?",
+    },
+    "destructive": {
+        "type": "noul",
+        "instructions": "Would carrying out `utterance` destroy data, close unsaved work, send content, spend money, expose credentials, or otherwise be hard to undo?",
+    },
+}
+
+
 def _safe_float(value: Any) -> float:
     try:
         return float(value or 0.0)
@@ -55,8 +136,15 @@ def _answer_probability(answer: Any, key: str) -> float:
     return _safe_float(answer.get(key, 0.0))
 
 
-class JevM0Router:
-    """持久连接 Jev 路由器，严格收敛到 ``open_app:notepad``。"""
+def _choice(answers: Mapping[str, Any], key: str) -> tuple[str, float]:
+    answer = answers.get(key)
+    if not isinstance(answer, dict):
+        return "none", 0.0
+    return str(answer.get("choice") or "none"), _safe_float(answer.get("confidence"))
+
+
+class _JevRouterBase:
+    questions: Mapping[str, Any]
 
     def __init__(
         self,
@@ -71,6 +159,7 @@ class JevM0Router:
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        # 本机系统代理会截断 TypeSafe TLS；直连仍保持正常证书校验。
         self._client = client or httpx.Client(timeout=timeout, trust_env=False)
         self._owns_client = client is None
         self._lock = threading.Lock()
@@ -85,13 +174,13 @@ class JevM0Router:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    def route(self, command: str) -> RouteDecision:
+    def _ask(self, command: str) -> tuple[Mapping[str, Any], Mapping[str, Any]] | RouteDecision:
         if not self.api_key:
             return RouteDecision(accepted=False, reason="jev_missing_api_key")
         body = {
             "state": json.dumps({"utterance": command}, ensure_ascii=False),
             "model": self.model,
-            "questions": M0_QUESTIONS,
+            "questions": self.questions,
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         try:
@@ -101,20 +190,28 @@ class JevM0Router:
             payload = response.json()
         except Exception as exc:
             return RouteDecision(accepted=False, reason=f"jev_error:{type(exc).__name__}")
-
         answers = payload.get("answers") if isinstance(payload, dict) else {}
-        answers = answers if isinstance(answers, dict) else {}
+        if not isinstance(answers, dict):
+            answers = {}
+        return answers, payload if isinstance(payload, dict) else {}
+
+
+class JevM0Router(_JevRouterBase):
+    """M0 持久连接路由器，严格收敛到 ``open_app:notepad``。"""
+
+    questions = M0_QUESTIONS
+
+    def route(self, command: str) -> RouteDecision:
+        result = self._ask(command)
+        if isinstance(result, RouteDecision):
+            return result
+        answers, payload = result
         addressed = _answer_probability(answers.get("addressed"), "noul")
         complete = _answer_probability(answers.get("complete"), "noul")
         destructive = _answer_probability(answers.get("destructive"), "noul")
-        kind_answer = answers.get("kind") if isinstance(answers.get("kind"), dict) else {}
-        app_answer = answers.get("app") if isinstance(answers.get("app"), dict) else {}
-        kind = str(kind_answer.get("choice") or "none")
-        app = str(app_answer.get("choice") or "none")
-        confidence = min(
-            _safe_float(kind_answer.get("confidence")),
-            _safe_float(app_answer.get("confidence")),
-        )
+        kind, kind_conf = _choice(answers, "kind")
+        app, app_conf = _choice(answers, "app")
+        confidence = min(kind_conf, app_conf)
         allowed = (
             addressed >= 0.5
             and complete >= 0.6
@@ -132,5 +229,103 @@ class JevM0Router:
             destructive=destructive > 0.5,
             complete=complete >= 0.6,
             reason=reason,
-            raw={"answers": answers, "model": payload.get("model") if isinstance(payload, dict) else None},
+            raw={"answers": answers, "model": payload.get("model")},
         )
+
+
+class JevFastRouter(_JevRouterBase):
+    """M1 FAST 路由器；自由文本由代码原样截取，不由 Jev 生成。"""
+
+    questions = FAST_QUESTIONS
+    _SUPPORTED_KINDS = {
+        "open_app",
+        "open_url",
+        "search",
+        "volume_up",
+        "volume_down",
+        "mute",
+        "unmute",
+        "media",
+        "shortcut",
+        "screenshot",
+        "type_text",
+        "stop",
+    }
+
+    def route(self, command: str) -> RouteDecision:
+        result = self._ask(command)
+        if isinstance(result, RouteDecision):
+            return result
+        answers, payload = result
+        addressed = _answer_probability(answers.get("addressed"), "noul")
+        complete = _answer_probability(answers.get("complete"), "noul")
+        destructive = _answer_probability(answers.get("destructive"), "noul")
+        kind, kind_conf = _choice(answers, "kind")
+        target, target_conf, span = self._target_for(kind, answers, command)
+        confidence = min(kind_conf, target_conf) if target_conf is not None else kind_conf
+        allowed = (
+            addressed >= 0.5
+            and complete >= 0.6
+            and destructive <= 0.5
+            and kind in self._SUPPORTED_KINDS
+            and target != "none"
+            and confidence >= 0.5
+        )
+        raw: dict[str, Any] = {"answers": answers, "model": payload.get("model")}
+        if span is not None:
+            raw["span"] = span.as_dict()
+            if kind == "search":
+                raw["query"] = span.text
+            elif kind == "open_url":
+                raw["url"] = span.text
+            elif kind == "type_text":
+                raw["text"] = span.text
+        if kind in {"volume_up", "volume_down"}:
+            raw["steps"] = 2
+        reason = "" if allowed else "FAST route is incomplete, unsafe, low-confidence, or outside the allowlist"
+        return RouteDecision(
+            accepted=allowed,
+            kind=self._normalized_kind(kind),
+            target=target,
+            confidence=confidence,
+            destructive=destructive > 0.5,
+            complete=complete >= 0.6,
+            reason=reason,
+            raw=raw,
+        )
+
+    @staticmethod
+    def _normalized_kind(kind: str) -> str:
+        if kind in {"volume_up", "volume_down"}:
+            return "volume"
+        return kind
+
+    @staticmethod
+    def _target_for(
+        kind: str,
+        answers: Mapping[str, Any],
+        command: str,
+    ) -> tuple[str, float | None, SelectedSpan | None]:
+        if kind == "open_app":
+            app, confidence = _choice(answers, "app")
+            return app, confidence, None
+        if kind in {"open_url", "search", "type_text"}:
+            span = select_text_span(command, kind)
+            return (span.text if span is not None else "none"), None, span
+        if kind == "volume_up":
+            return "up", None, None
+        if kind == "volume_down":
+            return "down", None, None
+        if kind in {"mute", "unmute"}:
+            return "on" if kind == "mute" else "off", None, None
+        if kind == "media":
+            target, confidence = _choice(answers, "media")
+            return target, confidence, None
+        if kind == "shortcut":
+            target, confidence = _choice(answers, "shortcut")
+            return target, confidence, None
+        if kind == "screenshot":
+            return "screen", None, None
+        if kind == "stop":
+            return "current", None, None
+        return "none", 0.0, None

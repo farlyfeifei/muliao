@@ -123,7 +123,6 @@ class VoiceEngine:
         wake = self.wake.detect(item.text)
         if wake is not None:
             command = wake.command
-            self.session.activate()
             wake_source = "wake_phrase"
         elif self.session.is_active():
             command = item.text.strip()
@@ -137,6 +136,8 @@ class VoiceEngine:
         if not self.permission.allowed():
             self._emit("voice.error", {"code": "permission_revoked"})
             return VoiceResult(status="permission_denied", detail="voice_control was revoked")
+        if wake is not None:
+            self.session.activate()
         if cancellation.cancelled:
             return self._cancelled(command=command)
 
