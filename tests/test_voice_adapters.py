@@ -15,9 +15,11 @@ if str(ROOT) not in sys.path:
 from voice.actions import DryRunExecutor, WindowsNotepadExecutor
 from voice.asr_local import SenseVoiceRecognizer
 from voice.capture import PyAudioVADCapture
+from voice.cancellation import CancellationToken, VoiceCancelled
 from voice.contracts import AudioSegment, RouteDecision
 from voice.events import JsonLineEventSink
 from voice.jev_router import JevM0Router
+from voice.safety import CaptureMuteGate
 from voice.tts_local import SapiSpeaker
 
 
@@ -42,6 +44,47 @@ class SequenceVad:
 
 
 class CaptureAdapterTests(unittest.TestCase):
+    def test_pre_cancelled_capture_opens_no_audio_device(self):
+        token = CancellationToken()
+        token.cancel()
+        audio_factory_calls: list[str] = []
+        capture = PyAudioVADCapture(
+            pyaudio_factory=lambda: audio_factory_calls.append("opened"),
+        )
+
+        with self.assertRaises(VoiceCancelled):
+            capture.capture_utterance(cancellation=token)
+
+        self.assertEqual(audio_factory_calls, [])
+
+    def test_cancel_after_audio_factory_still_prevents_stream_open(self):
+        token = CancellationToken()
+        open_calls: list[str] = []
+        terminate_calls: list[str] = []
+
+        class Audio:
+            def open(self, **_kwargs):
+                open_calls.append("opened")
+                raise AssertionError("cancelled capture must not open a stream")
+
+            def terminate(self) -> None:
+                terminate_calls.append("terminated")
+
+        def audio_factory():
+            token.cancel()
+            return Audio()
+
+        capture = PyAudioVADCapture(
+            pyaudio_factory=audio_factory,
+            vad_factory=lambda _mode: object(),
+        )
+
+        with self.assertRaises(VoiceCancelled):
+            capture.capture_utterance(cancellation=token)
+
+        self.assertEqual(open_calls, [])
+        self.assertEqual(terminate_calls, ["terminated"])
+
     def test_vad_capture_includes_speech_and_trailing_silence(self):
         frame = b"\1\0" * 480
         stream = FakeStream([frame] * 7)
@@ -69,6 +112,91 @@ class CaptureAdapterTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(TimeoutError, "no speech"):
             capture._read_segment(stream, vad)
+    def test_muted_frame_clears_pre_roll_and_never_reaches_vad_or_caption_asr(self):
+        audible = b"\1\0" * 480
+        muted = b"\2\0" * 480
+        gate = CaptureMuteGate()
+
+        class PlaybackAwareStream(FakeStream):
+            def read(self, size: int, exception_on_overflow: bool = False) -> bytes:
+                if self.reads == 2:
+                    gate.tts_finished(1)
+                return super().read(size, exception_on_overflow)
+
+        stream = PlaybackAwareStream([audible, muted, audible, audible])
+        vad_frames: list[bytes] = []
+        caption_frames: list[bytes] = []
+
+        class GateAwareVad:
+            def is_speech(self, frame: bytes, sample_rate: int) -> bool:
+                vad_frames.append(frame)
+                if len(vad_frames) == 1:
+                    gate.tts_started(1)
+                return True
+
+        capture = PyAudioVADCapture(
+            frame_ms=30,
+            pre_roll_ms=60,
+            silence_ms=600,
+            min_speech_ms=60,
+            max_utterance_ms=60,
+            listen_timeout_ms=1_000,
+            mute_gate=gate,
+        )
+        capture.frame_consumer = caption_frames.append
+
+        segment = capture._read_segment(stream, GateAwareVad())
+
+        self.assertEqual(vad_frames, [audible, audible, audible])
+        self.assertEqual(caption_frames, [audible, audible, audible])
+        self.assertNotIn(muted, vad_frames)
+        self.assertEqual(segment.pcm, audible * 2)
+
+    def test_muted_frames_restart_listen_timeout_budget(self):
+        silent = b"\0\0" * 480
+        speech = b"\1\0" * 480
+        gate = CaptureMuteGate()
+        gate.tts_started(1)
+
+        class PlaybackAwareStream(FakeStream):
+            def read(self, size: int, exception_on_overflow: bool = False) -> bytes:
+                if self.reads == 4:
+                    gate.tts_finished(1)
+                return super().read(size, exception_on_overflow)
+
+        stream = PlaybackAwareStream([silent] * 5 + [speech, speech])
+        capture = PyAudioVADCapture(
+            frame_ms=30,
+            pre_roll_ms=30,
+            silence_ms=600,
+            min_speech_ms=60,
+            max_utterance_ms=60,
+            listen_timeout_ms=60,
+            mute_gate=gate,
+        )
+
+        segment = capture._read_segment(stream, SequenceVad([False, True, True]))
+
+        self.assertEqual(segment.pcm, speech * 2)
+        self.assertEqual(stream.reads, 7)
+
+    def test_caption_consumer_failure_does_not_block_final_capture(self):
+        frame = b"\1\0" * 480
+        stream = FakeStream([frame] * 3)
+        vad = SequenceVad([True, True, True])
+        capture = PyAudioVADCapture(
+            frame_ms=30,
+            pre_roll_ms=30,
+            silence_ms=600,
+            min_speech_ms=60,
+            max_utterance_ms=90,
+            listen_timeout_ms=1_000,
+        )
+        capture.frame_consumer = lambda _: (_ for _ in ()).throw(RuntimeError("caption failed"))
+
+        segment = capture._read_segment(stream, vad)
+
+        self.assertEqual(segment.pcm, frame * 3)
 
 
 class FakeSenseResult:

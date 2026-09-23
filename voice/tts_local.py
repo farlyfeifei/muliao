@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 
 class NullSpeaker:
+    enabled = False
+
     def speak(
         self,
         text: str,
@@ -94,9 +96,6 @@ class FallbackSpeaker:
         cancellation: Any | None,
         operation_id: int | str | None,
     ) -> None:
-        # Keep the epoch lock through local submission.  stop() either advances the
-        # epoch before this block (so no fallback starts), or waits for submission
-        # and then purges local audio before it returns.
         with self._lock:
             if (
                 self._closed
@@ -106,19 +105,26 @@ class FallbackSpeaker:
                 return
             self.last_backend = "local"
             self.last_error = f"{type(exc).__name__}: {exc}"
-            try:
-                self.local.speak(
-                    text,
-                    cancellation=cancellation,
-                    operation_id=operation_id,
-                )
-            except TypeError as local_exc:
-                if (
-                    "cancellation" not in str(local_exc)
-                    and "operation_id" not in str(local_exc)
-                ):
-                    raise
-                self.local.speak(text)
+        # Speak outside the epoch lock.  The local speaker waits for real
+        # playback, so holding the lock here would block stop() from reaching
+        # local_stop() and let audio outlive an emergency stop.  The operation
+        # token is re-checked by the local speaker at entry and during playback,
+        # so a cancellation landing after this point still prevents new audio.
+        if cancellation is not None and cancellation.cancelled:
+            return
+        try:
+            self.local.speak(
+                text,
+                cancellation=cancellation,
+                operation_id=operation_id,
+            )
+        except TypeError as local_exc:
+            if (
+                "cancellation" not in str(local_exc)
+                and "operation_id" not in str(local_exc)
+            ):
+                raise
+            self.local.speak(text)
 
     def stop(self, *, operation_id: int | str | None = None) -> bool:
         with self._lock:
@@ -134,7 +140,10 @@ class FallbackSpeaker:
             self._operation_id = None
         cancel = getattr(self.cloud, "cancel", None)
         if callable(cancel):
-            cancel()
+            try:
+                cancel()
+            except Exception:
+                pass
         local_stop = getattr(self.local, "stop", None)
         if callable(local_stop):
             try:
@@ -153,7 +162,10 @@ class FallbackSpeaker:
             self._generation += 1
         close = getattr(self.cloud, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:
+                pass
         local_close = getattr(self.local, "close", None)
         if callable(local_close):
             local_close()
@@ -276,6 +288,76 @@ class SapiSpeaker:
         if command.error is not None:
             raise command.error
 
+    def _wait_for_speech(
+        self,
+        voice: Any,
+        current: _SapiCommand,
+        wait_until_done: Callable[[int], Any],
+    ) -> bool:
+        """Wait for playback while pumping stop/close on the COM owner thread.
+
+        Returns True when a close command was consumed and the owner loop must exit.
+        Deferred speak commands are requeued after the current playback ends or is purged.
+        """
+
+        deferred: list[_SapiCommand] = []
+        close_requested = False
+        cancel_deferred = False
+        try:
+            while True:
+                if current.cancellation is not None and current.cancellation.cancelled:
+                    cancel_deferred = True
+                    voice.Speak("", self._ASYNC | self._PURGE_BEFORE_SPEAK)
+                    break
+                if bool(wait_until_done(50)):
+                    break
+                try:
+                    control = self._commands.get_nowait()
+                except queue.Empty:
+                    continue
+                if control.kind == "speak":
+                    deferred.append(control)
+                    continue
+                try:
+                    if control.kind == "stop":
+                        cancel_deferred = True
+                        voice.Speak("", self._ASYNC | self._PURGE_BEFORE_SPEAK)
+                        break
+                    if control.kind == "close":
+                        close_requested = True
+                        cancel_deferred = True
+                        voice.Speak("", self._ASYNC | self._PURGE_BEFORE_SPEAK)
+                        break
+                except BaseException as exc:
+                    control.error = exc
+                    cancel_deferred = True
+                    if control.kind == "close":
+                        close_requested = True
+                    break
+                finally:
+                    control.done.set()
+                    self._commands.task_done()
+        finally:
+            with self._state_lock:
+                closed = self._closed
+                if not cancel_deferred and not closed:
+                    for command in deferred:
+                        self._commands.put(command)
+                        self._commands.task_done()
+                    deferred.clear()
+
+            if deferred:
+                detail = (
+                    "SAPI speaker is closed"
+                    if close_requested or closed
+                    else "SAPI speech was stopped"
+                )
+                for command in deferred:
+                    command.error = RuntimeError(detail)
+                    command.done.set()
+                    self._commands.task_done()
+        return close_requested
+
     def _run(self) -> None:
         voice = None
         initialized = False
@@ -300,18 +382,32 @@ class SapiSpeaker:
                                     # Historical injected test doubles often expose
                                     # Speak(text) only; real SAPI always receives flags.
                                     voice.Speak(command.text)
+                                wait_until_done = getattr(voice, "WaitUntilDone", None)
+                                if callable(wait_until_done) and self._wait_for_speech(
+                                    voice,
+                                    command,
+                                    wait_until_done,
+                                ):
+                                    return
                             else:
                                 voice.Speak(command.text, self._ASYNC)
+                                if self._wait_for_speech(
+                                    voice,
+                                    command,
+                                    voice.WaitUntilDone,
+                                ):
+                                    return
                     elif command.kind == "stop":
                         voice.Speak("", self._ASYNC | self._PURGE_BEFORE_SPEAK)
                     elif command.kind == "close":
                         voice.Speak("", self._ASYNC | self._PURGE_BEFORE_SPEAK)
-                        return
                 except BaseException as exc:
                     command.error = exc
                 finally:
                     command.done.set()
                     self._commands.task_done()
+                if command.kind == "close":
+                    return
         except BaseException as exc:
             # Construction failure is delivered before __init__ returns.  A later
             # owner-thread failure is delivered to every queued caller.

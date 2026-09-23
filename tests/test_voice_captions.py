@@ -163,11 +163,12 @@ class StreamingCaptionBridgeTests(unittest.TestCase):
         self.assertEqual(partials[1].payload["stable_text"], "打开")
         self.assertTrue(all(not event.payload["actionable"] for event in partials))
 
-    def test_rewritten_unprefixed_partial_after_wake_stays_display_only(self):
+    def test_rewritten_unprefixed_partial_closes_privacy_gate_without_text(self):
+        secret = "会议密码是123456"
         recognizer = FakeStreamingRecognizer(
             accepts=[
                 (update(PARTIAL, "幕僚幕僚打开"),),
-                (update(PARTIAL, "请打开记事本"),),
+                (update(PARTIAL, secret),),
             ]
         )
         bridge, events = self.make_bridge(recognizer)
@@ -177,11 +178,10 @@ class StreamingCaptionBridgeTests(unittest.TestCase):
 
         self.assertEqual(
             [event.type for event in events.events],
-            ["voice.partial", "voice.partial"],
+            ["voice.partial", "voice.metric"],
         )
-        self.assertEqual(events.events[-1].payload["text"], "请打开记事本")
-        self.assertFalse(events.events[-1].payload["actionable"])
-        self.assertTrue(events.events[-1].payload["display_only"])
+        self.assertEqual(events.events[-1].payload["name"], "caption_wake_lost")
+        self.assertNotIn(secret, repr([event.payload for event in events.events]))
 
     def test_final_is_command_only_non_actionable_then_resets_utterance(self):
         recognizer = FakeStreamingRecognizer(

@@ -6,6 +6,7 @@ hypothesis, and none of its events are actionable command inputs.
 """
 from __future__ import annotations
 
+import queue
 import threading
 from typing import Any, Mapping, Protocol
 
@@ -191,7 +192,25 @@ class StreamingCaptionBridge:
         command: str | None
         if self._awake:
             match = self.wake.detect(update.text)
-            command = match.command if match is not None else update.text.strip()
+            if match is not None:
+                command = match.command
+            else:
+                candidate = update.text.strip()
+                if self._previous_command and candidate.startswith(self._previous_command):
+                    command = candidate
+                else:
+                    self._awake = False
+                    self._previous_command = ""
+                    self.events.emit(
+                        self._METRIC_EVENT,
+                        {
+                            "name": "caption_wake_lost",
+                            "value": 1,
+                            "generation": generation,
+                            "utterance_id": utterance_id,
+                        },
+                    )
+                    return update.is_final
         else:
             if update.is_final:
                 self.events.emit(
@@ -274,4 +293,148 @@ class StreamingCaptionBridge:
             self.recognizer.close()
 
 
-__all__ = ["StreamingCaptionBridge"]
+class AsyncCaptionPump:
+    """Bounded display-only worker that never blocks authoritative capture/ASR."""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        bridge: StreamingCaptionBridge,
+        *,
+        max_items: int = 8,
+        close_timeout: float = 0.5,
+        thread_factory: Any = threading.Thread,
+    ) -> None:
+        if max_items < 1:
+            raise ValueError("max_items must be positive")
+        self.bridge = bridge
+        self.events = bridge.events
+        self.close_timeout = max(0.0, float(close_timeout))
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=max_items)
+        self._lock = threading.RLock()
+        self._closed = False
+        self._thread = thread_factory(
+            target=self._run,
+            name="voice-caption-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread.is_alive()
+
+    def accept_pcm(
+        self,
+        pcm: bytes | bytearray | memoryview,
+        *,
+        sample_rate: int = 16_000,
+        channels: int = 1,
+        sample_width: int = 2,
+    ) -> bool:
+        item = (
+            "pcm",
+            bytes(pcm),
+            int(sample_rate),
+            int(channels),
+            int(sample_width),
+        )
+        return self._offer(item, metric="caption_frame_dropped")
+
+    def finish(self) -> bool:
+        return self._offer(("finish",), metric="caption_finish_dropped")
+
+    def reset(self) -> bool:
+        return self._offer(("reset",), metric="caption_reset_dropped")
+
+    def _offer(self, item: Any, *, metric: str) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._queue.put_nowait(item)
+                return True
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except queue.Empty:
+                    pass
+                try:
+                    self._queue.put_nowait(item)
+                    self.events.emit("voice.metric", {"name": metric, "value": 1})
+                    return True
+                except queue.Full:
+                    self.events.emit("voice.metric", {"name": metric, "value": 1})
+                    return False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            while True:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except queue.Empty:
+                    break
+            self._queue.put_nowait(self._STOP)
+        self._thread.join(timeout=self.close_timeout)
+        if self._thread.is_alive():
+            self.events.emit(
+                "voice.error",
+                {"code": "caption_worker_close_timeout", "detail": "caption worker did not stop"},
+            )
+
+    def _run(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                try:
+                    if item is self._STOP:
+                        return
+                    kind = item[0]
+                    if kind == "pcm":
+                        _, pcm, sample_rate, channels, sample_width = item
+                        self.bridge.accept_pcm(
+                            pcm,
+                            sample_rate=sample_rate,
+                            channels=channels,
+                            sample_width=sample_width,
+                        )
+                    elif kind == "finish":
+                        try:
+                            self.bridge.finish()
+                        except Exception:
+                            self.bridge.reset()
+                            raise
+                    elif kind == "reset":
+                        self.bridge.reset()
+                except Exception as exc:
+                    self.events.emit(
+                        "voice.error",
+                        {
+                            "code": f"caption_{item[0]}_failed",
+                            "detail": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                finally:
+                    self._queue.task_done()
+        finally:
+            try:
+                self.bridge.close()
+            except Exception as exc:
+                self.events.emit(
+                    "voice.error",
+                    {"code": "caption_close_failed", "detail": f"{type(exc).__name__}: {exc}"},
+                )
+
+
+__all__ = ["AsyncCaptionPump", "StreamingCaptionBridge"]

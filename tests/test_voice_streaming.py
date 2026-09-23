@@ -196,6 +196,39 @@ class StreamingZipformerTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, "missing streaming Zipformer assets"):
             adapter.accept_waveform(b"\0\0")
 
+    def test_warmup_decodes_at_least_once_when_nothing_is_ready(self):
+        class NeverReadyRecognizer(FakeOnlineRecognizer):
+            def __init__(self):
+                super().__init__([])
+                self.decode_calls = 0
+
+            def is_ready(self, stream):
+                return False
+
+            def decode_stream(self, stream):
+                self.decode_calls += 1
+
+        fake = NeverReadyRecognizer()
+        adapter = self.make_adapter(fake)
+
+        adapter.warmup()
+
+        self.assertEqual(fake.decode_calls, 1)
+        self.assertTrue(adapter.recognizer_loaded)
+
+    def test_warmup_raises_on_incompatible_backend(self):
+        class BrokenRecognizer(FakeOnlineRecognizer):
+            def is_ready(self, stream):
+                return False
+
+            def decode_stream(self, stream):
+                raise RuntimeError("native graph incompatible")
+
+        adapter = self.make_adapter(BrokenRecognizer([]))
+
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            adapter.warmup()
+
     def test_close_is_idempotent_and_blocks_more_audio(self):
         fake = FakeOnlineRecognizer([["幕僚"]])
         adapter = self.make_adapter(fake)

@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 from voice.safety import (
     DEFAULT_EMERGENCY_KEYS,
     CaptureMuteGate,
+    EchoAwareSpeaker,
     EchoGuard,
     EmergencyStopUnavailable,
     EmergencyStopWatcher,
@@ -213,19 +214,27 @@ class EchoGuardTests(unittest.TestCase):
         self.assertIsNone(guard.mute_gate.filter_frame(b"raw-pcm"))
         self.assertTrue(guard.should_drop("完全不相似的用户指令"))
 
-    def test_default_500ms_window_drops_normalized_similar_echo(self) -> None:
+    def test_default_1500ms_window_drops_normalized_similar_echo(self) -> None:
         clock = MutableClock(5.0)
         guard = EchoGuard(clock=clock)
         guard.tts_started("好的，记事本 已经打开！", generation=7)
         clock.advance(1.0)
         guard.tts_finished(7)
 
-        clock.advance(0.499)
+        clock.advance(1.49)
         self.assertTrue(guard.should_drop("好的记事本已经打开", generation=7))
-        clock.advance(0.001)
-        self.assertTrue(guard.should_drop("好的，记事本已经打开。", generation=7))
-        clock.advance(0.001)
+        clock.advance(0.02)
         self.assertFalse(guard.should_drop("好的记事本已经打开", generation=7))
+
+    def test_echo_is_still_dropped_after_default_vad_tail_silence(self) -> None:
+        clock = MutableClock(8.0)
+        guard = EchoGuard(clock=clock)
+        guard.tts_started("好的已经完成", generation=8)
+        guard.tts_finished(8)
+
+        clock.advance(0.8)
+
+        self.assertTrue(guard.should_drop("好的，已经完成。", generation=8))
 
     def test_edit_distance_and_contains_detect_echo_but_unrelated_text_passes(self) -> None:
         clock = MutableClock(20.0)
@@ -259,7 +268,7 @@ class EchoGuardTests(unittest.TestCase):
         self.assertTrue(guard.should_drop("新的播报内容", generation=2))
         self.assertFalse(guard.should_drop("迟到的旧播报", generation=1))
 
-    def test_cancelled_playback_restores_capture_and_keeps_short_echo_window(self) -> None:
+    def test_cancelled_playback_restores_capture_and_keeps_echo_window(self) -> None:
         clock = MutableClock(40.0)
         guard = EchoGuard(clock=clock)
         guard.tts_started("操作已取消", generation=9)
@@ -270,7 +279,7 @@ class EchoGuardTests(unittest.TestCase):
         self.assertFalse(guard.mute_gate.muted)
         self.assertTrue(guard.should_drop("操作已取消", generation=9))
 
-        clock.advance(0.501)
+        clock.advance(1.501)
         self.assertFalse(guard.should_drop("操作已取消", generation=9))
 
     def test_echo_guard_state_is_thread_safe(self) -> None:
@@ -306,6 +315,120 @@ class EchoGuardTests(unittest.TestCase):
         self.assertGreaterEqual(latest, 3_000)
         self.assertFalse(guard.playing)
         self.assertFalse(guard.mute_gate.muted)
+
+    def test_guard_transition_and_atomic_frame_submit_do_not_deadlock(self) -> None:
+        guard = EchoGuard()
+        consumer_entered = threading.Event()
+        release_consumer = threading.Event()
+        transition_done = threading.Event()
+        failures: list[BaseException] = []
+
+        def consume(_frame: bytes) -> None:
+            consumer_entered.set()
+            if not release_consumer.wait(WAIT_SECONDS):
+                raise TimeoutError("consumer was not released")
+            guard.should_drop("frame transcript")
+
+        producer = threading.Thread(
+            target=lambda: guard.mute_gate.submit(b"frame", consume),
+            daemon=True,
+        )
+
+        def transition() -> None:
+            try:
+                guard.tts_started("播报内容", generation=1)
+                transition_done.set()
+            except BaseException as exc:
+                failures.append(exc)
+
+        producer.start()
+        self.assertTrue(consumer_entered.wait(WAIT_SECONDS))
+        starter = threading.Thread(target=transition, daemon=True)
+        starter.start()
+        time.sleep(0.05)
+        self.assertFalse(transition_done.is_set())
+        release_consumer.set()
+        producer.join(WAIT_SECONDS)
+        starter.join(WAIT_SECONDS)
+
+        self.assertFalse(producer.is_alive())
+        self.assertFalse(starter.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(transition_done.is_set())
+        self.assertTrue(guard.playing)
+        guard.tts_finished(1)
+
+    def test_echo_aware_stop_keeps_capture_muted_until_audio_stops(self) -> None:
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+
+        class Speaker:
+            def stop(self, *, operation_id=None) -> bool:
+                stop_entered.set()
+                if not release_stop.wait(WAIT_SECONDS):
+                    raise TimeoutError("stop was not released")
+                return True
+
+        guard = EchoGuard()
+        wrapped = EchoAwareSpeaker(Speaker(), guard)
+        guard.tts_started("还在播放", generation=8)
+        worker = threading.Thread(
+            target=lambda: wrapped.stop(operation_id=8),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(stop_entered.wait(WAIT_SECONDS))
+        self.assertTrue(guard.playing)
+        self.assertTrue(guard.mute_gate.muted)
+
+        release_stop.set()
+        worker.join(WAIT_SECONDS)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(guard.playing)
+        self.assertFalse(guard.mute_gate.muted)
+
+    def test_echo_aware_stop_failure_keeps_capture_muted(self) -> None:
+        class Speaker:
+            def stop(self, *, operation_id=None) -> bool:
+                raise RuntimeError("audio purge failed")
+
+        guard = EchoGuard()
+        wrapped = EchoAwareSpeaker(Speaker(), guard)
+        guard.tts_started("仍可能有尾音", generation=9)
+
+        with self.assertRaisesRegex(RuntimeError, "purge failed"):
+            wrapped.stop(operation_id=9)
+
+        self.assertTrue(guard.playing)
+        self.assertTrue(guard.mute_gate.muted)
+        guard.clear(9)
+
+    def test_echo_aware_missing_stop_backend_stays_fail_closed(self) -> None:
+        guard = EchoGuard()
+        wrapped = EchoAwareSpeaker(object(), guard)
+        guard.tts_started("无法确认是否停止", generation=10)
+
+        self.assertFalse(wrapped.stop(operation_id=10))
+
+        self.assertTrue(guard.playing)
+        self.assertTrue(guard.mute_gate.muted)
+        guard.clear(10)
+
+    def test_echo_aware_failed_stop_result_stays_fail_closed(self) -> None:
+        class Speaker:
+            def stop(self, *, operation_id=None) -> bool:
+                return False
+
+        guard = EchoGuard()
+        wrapped = EchoAwareSpeaker(Speaker(), guard)
+        guard.tts_started("下层拒绝停止", generation=11)
+
+        self.assertFalse(wrapped.stop(operation_id=11))
+
+        self.assertTrue(guard.playing)
+        self.assertTrue(guard.mute_gate.muted)
+        guard.clear(11)
 
     def test_guard_retains_text_metadata_but_no_audio(self) -> None:
         guard = EchoGuard()

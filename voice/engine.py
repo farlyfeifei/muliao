@@ -57,6 +57,7 @@ class VoiceEngine:
         session: VoiceSession | None = None,
         splitter: CommandSplitter | None = None,
         events: EventSink | None = None,
+        echo_guard: Any | None = None,
     ) -> None:
         self.permission = permission
         self.recognizer = recognizer
@@ -67,12 +68,25 @@ class VoiceEngine:
         self.session = session or VoiceSession()
         self.splitter = splitter or CommandSplitter()
         self.events = events or NullEventSink()
+        self.echo_guard = echo_guard
         self._operation_lock = threading.RLock()
         self._next_operation_id = 0
         self._current: _Operation | None = None
 
+    def request_cancel(self) -> bool:
+        """Cancel the active token without waiting for hardware teardown."""
+
+        with self._operation_lock:
+            operation = self._current
+            if operation is None or operation.terminal or operation.token.cancelled:
+                return False
+            operation.token.cancel()
+            operation_id = operation.operation_id
+        self.session.close(operation_id)
+        return True
+
     def cancel_current(self) -> bool:
-        """取消当前 operation；终态由 operation 自己在下一检查点唯一提交。"""
+        """Cancel current work and synchronously interrupt capture and playback."""
 
         with self._operation_lock:
             operation = self._current
@@ -84,6 +98,17 @@ class VoiceEngine:
         self._stop_capture(capture)
         self._stop_speaker(operation_id)
         self.session.close(operation_id)
+        return True
+
+    def stop_current_playback(self) -> bool:
+        """Stop playback for the currently cancelled operation without touching capture."""
+
+        with self._operation_lock:
+            operation = self._current
+            if operation is None or operation.terminal or not operation.token.cancelled:
+                return False
+            operation_id = operation.operation_id
+        self._stop_speaker(operation_id)
         return True
 
     def run_once(self, capture: AudioCapture) -> VoiceResult:
@@ -101,6 +126,14 @@ class VoiceEngine:
                     event_type="voice.error",
                 )
             self._emit(operation, "voice.state", {"state": "listening"})
+            if not self.permission.allowed():
+                return self._finish(
+                    operation,
+                    VoiceResult(status="permission_denied", detail="voice_control is not granted"),
+                    "permission_denied",
+                    {"code": "permission_denied"},
+                    event_type="voice.error",
+                )
             audio = self._capture(capture, operation.token)
             operation.token.raise_if_cancelled()
             if not self._is_current(operation):
@@ -108,6 +141,13 @@ class VoiceEngine:
             return self._process_audio(operation, audio)
         except VoiceCancelled:
             return self._cancelled(operation)
+        except TimeoutError:
+            self._emit(operation, "voice.metric", {"name": "capture_timeout", "value": 1})
+            return self._finish(
+                operation,
+                VoiceResult(status="capture_timeout"),
+                "sleeping",
+            )
         except Exception as exc:
             if operation.token.cancelled:
                 return self._cancelled(operation)
@@ -141,9 +181,6 @@ class VoiceEngine:
             self._emit(operation, "voice.state", {"state": "recognizing"})
             transcript = self._transcribe(audio, operation.token)
             operation.token.raise_if_cancelled()
-            if not self._is_current(operation):
-                return self._finish_stale(operation)
-            return self._process_transcript(operation, transcript)
         except VoiceCancelled:
             return self._cancelled(operation)
         except Exception as exc:
@@ -156,6 +193,9 @@ class VoiceEngine:
                 {"code": "recognition_error", "detail": f"{type(exc).__name__}: {exc}"},
                 event_type="voice.error",
             )
+        if not self._is_current(operation):
+            return self._finish_stale(operation)
+        return self._process_transcript(operation, transcript)
 
     def process_transcript(
         self,
@@ -182,6 +222,9 @@ class VoiceEngine:
             return self._cancelled(operation)
 
         item = transcript if isinstance(transcript, Transcript) else Transcript(text=str(transcript))
+        if self.echo_guard is not None and bool(self.echo_guard.should_drop(item.text)):
+            self._emit(operation, "voice.metric", {"name": "echo_drop", "value": 1})
+            return self._finish(operation, VoiceResult(status="echo_drop"), "sleeping")
         wake = self.wake.detect(item.text)
         if wake is not None:
             command = wake.command
@@ -296,9 +339,9 @@ class VoiceEngine:
             if decision.kind == "stop":
                 if not self._commit_session(operation, "close"):
                     return self._cancelled(operation, command, decisions, actions)
-                stop = getattr(self.speaker, "stop", None)
-                if callable(stop):
-                    stop()
+                if not self._is_current(operation):
+                    return self._finish_stale(operation)
+                self._stop_speaker(operation.operation_id)
                 action = ActionResult(True, "stop:current", "voice operation stopped")
                 actions.append(action)
                 self._emit(operation, "voice.action", {"step": index, "steps": len(commands), "ok": True, "action": action.action, "detail": action.detail})
@@ -369,6 +412,10 @@ class VoiceEngine:
             return self._finish_committed_without_tts(
                 operation, item, command, decisions, actions, "tts_skipped_cancelled"
             )
+        if not bool(getattr(self.speaker, "enabled", True)):
+            return self._finish_committed_without_tts(
+                operation, item, command, decisions, actions, "tts_skipped_disabled"
+            )
 
         reply = self._completion_reply(actions)
 
@@ -384,6 +431,20 @@ class VoiceEngine:
         except VoiceCancelled:
             return self._finish_committed_without_tts(
                 operation, item, command, decisions, actions, "tts_skipped_cancelled"
+            )
+        except Exception as exc:
+            # 动作已提交：播报失败必须仍是 executed，调用方不得据此重试副作用。
+            if operation.token.cancelled:
+                return self._finish_committed_without_tts(
+                    operation, item, command, decisions, actions, "tts_skipped_cancelled"
+                )
+            self._emit(
+                operation,
+                "voice.error",
+                {"code": "tts_failed", "detail": f"{type(exc).__name__}: {exc}"},
+            )
+            return self._finish_committed_without_tts(
+                operation, item, command, decisions, actions, f"tts_failed:{type(exc).__name__}"
             )
         if not allowed:
             return self._finish_committed_without_tts(

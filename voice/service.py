@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field, is_dataclass
 import inspect
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Mapping
@@ -19,86 +21,98 @@ class VoicePermissionDenied(PermissionError):
     """Raised before any microphone, router, or action dependency is started."""
 
 
-class _InterruptibleCapture:
-    """Add cooperative ``stop()`` to the existing single-utterance capture.
+def _accepts_cancellation(callable_obj: Any) -> bool:
+    """Return whether ``callable_obj`` accepts a ``cancellation`` keyword.
 
-    ``PyAudioVADCapture`` intentionally owns its stream inside
-    ``capture_utterance``.  The API service needs to interrupt that blocking read
-    when a stop request arrives, so this adapter mirrors the small open/close shell
-    while reusing the capture's tested VAD segment reader.
+    Signature detection replaces error-text probing so a compatible capture
+    raising an internal ``TypeError`` is never retried (which would open the
+    microphone a second time).
     """
 
-    def __init__(self, capture: Any) -> None:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    if "cancellation" in parameters:
+        return True
+    return any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+
+
+def _call_capture(capture_utterance: Callable[..., Any], cancellation: Any | None) -> Any:
+    if cancellation is not None and _accepts_cancellation(capture_utterance):
+        return capture_utterance(cancellation=cancellation)
+    return capture_utterance()
+
+
+class _CaptionedCapture:
+    """Preserve native cancellation while adding display-only caption boundaries."""
+
+    def __init__(self, capture: Any, bridge: Any, events: "VoiceEventHub") -> None:
         self._capture = capture
-        self._lock = threading.Lock()
-        self._stream: Any | None = None
-        self._audio: Any | None = None
+        self._bridge = bridge
+        self._events = events
         self._closed = False
+        self._lock = threading.Lock()
 
-    def capture_utterance(self) -> Any:
-        import pyaudio
-        import webrtcvad
-
+    def capture_utterance(self, *, cancellation: Any | None = None) -> Any:
         with self._lock:
             if self._closed:
                 raise RuntimeError("voice capture is stopped")
-
-        audio_factory = getattr(self._capture, "_pyaudio_factory", None) or pyaudio.PyAudio
-        vad_factory = getattr(self._capture, "_vad_factory", None) or webrtcvad.Vad
-        audio = audio_factory()
-        vad = vad_factory(self._capture.vad_mode)
-        stream = None
+        capture = getattr(self._capture, "capture_utterance", None)
+        if not callable(capture):
+            raise TypeError("voice capture must implement capture_utterance")
         try:
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self._capture.sample_rate,
-                input=True,
-                input_device_index=self._capture.input_device_index,
-                frames_per_buffer=self._capture.samples_per_frame,
-            )
-            with self._lock:
-                stopped = self._closed
-                if not stopped:
-                    self._stream = stream
-                    self._audio = audio
-            if stopped:
-                raise RuntimeError("voice capture is stopped")
-            return self._capture._read_segment(stream, vad)
-        finally:
-            with self._lock:
-                if self._stream is stream:
-                    self._stream = None
-                if self._audio is audio:
-                    self._audio = None
-            self._shutdown(stream, audio)
+            audio = _call_capture(capture, cancellation)
+        except Exception:
+            self._caption("reset")
+            raise
+        if cancellation is not None and bool(getattr(cancellation, "cancelled", False)):
+            self._caption("reset")
+            raise_if_cancelled = getattr(cancellation, "raise_if_cancelled", None)
+            if callable(raise_if_cancelled):
+                raise_if_cancelled()
+            raise RuntimeError("voice capture cancelled")
+        self._caption("finish")
+        return audio
 
     def stop(self) -> None:
-        with self._lock:
-            self._closed = True
-            stream = self._stream
-            audio = self._audio
-        self._shutdown(stream, audio)
+        stop = getattr(self._capture, "stop", None)
+        try:
+            if callable(stop):
+                stop()
+        finally:
+            self._caption("reset")
 
     def close(self) -> None:
-        self.stop()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        close = getattr(self._capture, "close", None)
+        stop = getattr(self._capture, "stop", None)
+        try:
+            if callable(close):
+                close()
+            elif callable(stop):
+                stop()
+        finally:
+            self._caption("reset")
 
-    @staticmethod
-    def _shutdown(stream: Any | None, audio: Any | None) -> None:
-        if stream is not None:
-            try:
-                stream.stop_stream()
-            except Exception:
-                pass
-            try:
-                stream.close()
-            except Exception:
-                pass
-        if audio is not None:
-            try:
-                audio.terminate()
-            except Exception:
-                pass
+    def _caption(self, method: str) -> None:
+        callback = getattr(self._bridge, method, None)
+        if not callable(callback):
+            return
+        try:
+            callback()
+        except Exception as exc:
+            self._events.emit(
+                "voice.error",
+                {
+                    "code": f"caption_{method}_failed",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
 
 @dataclass
@@ -114,10 +128,16 @@ class VoiceRuntime:
     capture: Any | None = None
     test_engine: Any | None = None
     resources: Any | None = None
+    caption_bridge: Any | None = None
+    emergency_watcher: Any | None = None
+    permission_watcher: Any | None = None
     closeables: tuple[Any, ...] = ()
     _release_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _released: bool = field(default=False, init=False, repr=False)
     _preclosed: set[int] = field(default_factory=set, init=False, repr=False)
+    _interrupt_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _interrupt_started: bool = field(default=False, init=False, repr=False)
+    _interrupt_threads: tuple[threading.Thread, ...] = field(default=(), init=False, repr=False)
 
 
 class VoiceEventHub:
@@ -208,16 +228,21 @@ class VoiceService:
         runtime_factory: Callable[..., Any] | None = None,
         test_engine_factory: Callable[..., Any] | None = None,
         event_hub: VoiceEventHub | None = None,
+        emergency_watcher_factory: Callable[[Callable[[], Any]], Any] | None = None,
+        permission_watcher_factory: Callable[[Callable[[], bool], Callable[[], Any]], Any]
+        | None = None,
         stop_timeout: float = 2.0,
     ) -> None:
-        self.permission = permission or ExistingVoicePermission()
-        self.events = event_hub or VoiceEventHub()
+        self.permission = ExistingVoicePermission() if permission is None else permission
+        self.events = VoiceEventHub() if event_hub is None else event_hub
         self._injected_engine = engine
         self._injected_capture = capture
         self._engine_factory = engine_factory
         self._capture_factory = capture_factory
         self._runtime_factory = runtime_factory
         self._test_engine_factory = test_engine_factory
+        self._emergency_watcher_factory = emergency_watcher_factory
+        self._permission_watcher_factory = permission_watcher_factory
         self._stop_timeout = max(0.0, float(stop_timeout))
 
         self._lock = threading.RLock()
@@ -265,19 +290,42 @@ class VoiceService:
             self.events.emit("voice.state", {"state": "starting", "generation": generation})
 
             try:
-                runtime = self._create_runtime(dry_run=False)
+                allowed, runtime = self._permission_call(
+                    lambda: self._create_runtime(dry_run=False)
+                )
+                if not allowed or runtime is None:
+                    raise VoicePermissionDenied(
+                        "voice_control was revoked during startup"
+                    )
                 if runtime.capture is None:
+                    self._release_runtime(runtime)
                     raise RuntimeError("voice runtime did not provide an audio capture")
                 self._runtime = runtime
+                permission_watcher = self._create_permission_watcher()
+                runtime.permission_watcher = permission_watcher
+                emergency_watcher = self._create_emergency_watcher(runtime)
+                runtime.emergency_watcher = emergency_watcher
                 worker = threading.Thread(
                     target=self._worker_main,
                     args=(generation, runtime, stop_event),
                     name=f"muliao-voice-{generation}",
                     daemon=True,
                 )
-                self._worker = worker
-                self._started_at = time.time()
-                worker.start()
+
+                def activate_runtime() -> bool:
+                    self._worker = worker
+                    self._started_at = time.time()
+                    permission_watcher.start()
+                    if emergency_watcher is not None:
+                        emergency_watcher.start()
+                    worker.start()
+                    return True
+
+                allowed, activated = self._permission_call(activate_runtime)
+                if not allowed or not activated:
+                    raise VoicePermissionDenied(
+                        "voice_control was revoked before microphone start"
+                    )
             except Exception as exc:
                 runtime = self._runtime
                 self._runtime = None
@@ -294,8 +342,8 @@ class VoiceService:
             result.update({"changed": True, "idempotent": False})
             return result
 
-    def stop(self) -> dict[str, Any]:
-        """Cancel current work, interrupt capture when supported, then release it."""
+    def stop(self, *, wait: bool = True) -> dict[str, Any]:
+        """Cancel current work and optionally wait for the worker to release it."""
 
         with self._lock:
             worker = self._worker
@@ -313,12 +361,19 @@ class VoiceService:
             generation = self._generation
 
         self.events.emit("voice.state", {"state": "stopping", "generation": generation})
+        interrupt_threads: tuple[threading.Thread, ...] = ()
         if runtime is not None:
-            self._cancel_engine(runtime.engine)
-            self._interrupt_capture(runtime)
+            self._request_engine_cancel(runtime.engine)
+            interrupt_threads = self._start_runtime_interrupt(runtime)
 
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=self._stop_timeout)
+        if wait:
+            deadline = time.monotonic() + self._stop_timeout
+            for thread in interrupt_threads:
+                if thread is threading.current_thread():
+                    continue
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
         with self._lock:
             still_running = bool(self._worker is not None and self._worker.is_alive())
@@ -343,33 +398,52 @@ class VoiceService:
 
         transient: VoiceRuntime | None = None
         with self._test_lock:
-            with self._lock:
-                active_runtime = self._runtime
-            if active_runtime is not None and active_runtime.test_engine is not None:
-                engine = active_runtime.test_engine
-            elif self._test_engine_factory is not None:
-                value = _call_factory(
-                    self._test_engine_factory,
-                    events=self.events,
-                    dry_run=True,
-                )
-                transient = _normalize_runtime(value)
-                engine = transient.test_engine or transient.engine
-            elif self._injected_engine is not None and self._runtime_factory is None:
-                # Injected engines are test doubles or caller-owned dry-run engines.
-                engine = self._injected_engine
-                self._attach_events(engine)
-            else:
-                transient = self._create_runtime(dry_run=True)
-                engine = transient.test_engine or transient.engine
+            def run_test() -> tuple[Any, Any]:
+                nonlocal transient
+                with self._lock:
+                    active_runtime = self._runtime
+                if active_runtime is not None and active_runtime.test_engine is not None:
+                    engine = active_runtime.test_engine
+                elif self._test_engine_factory is not None:
+                    value = _call_factory(
+                        self._test_engine_factory,
+                        events=self.events,
+                        dry_run=True,
+                    )
+                    transient = _normalize_runtime(value)
+                    engine = transient.test_engine or transient.engine
+                elif any(
+                    item is not None
+                    for item in (
+                        self._injected_engine,
+                        self._engine_factory,
+                        self._capture_factory,
+                        self._runtime_factory,
+                    )
+                ):
+                    raise RuntimeError(
+                        "test_command requires an explicit test_engine_factory when "
+                        "execution/runtime dependencies are injected"
+                    )
+                else:
+                    transient = _default_runtime_factory(events=self.events, dry_run=True)
+                    engine = transient.test_engine or transient.engine
 
-            try:
                 process = getattr(engine, "process_transcript", None)
                 if not callable(process):
                     raise TypeError("voice engine must implement process_transcript(text)")
-                result = process(command)
+                return process(command), engine
+
+            try:
+                allowed, outcome = self._permission_call(run_test)
+                if not allowed or outcome is None:
+                    raise VoicePermissionDenied(
+                        "voice_control was revoked before dry-run execution"
+                    )
+                result, _engine = outcome
                 result_data = _jsonable(result)
                 status = result_data.get("status") if isinstance(result_data, dict) else None
+                result_data = _sanitize_result(status, result_data)
                 self.events.emit(
                     "voice.result",
                     {"source": "test", "dry_run": True, "status": status, "result": result_data},
@@ -429,11 +503,7 @@ class VoiceService:
         try:
             while should_run and not stop_event.is_set():
                 if not self._allowed():
-                    self._set_last_error(
-                        "permission_revoked",
-                        RuntimeError("voice_control was revoked"),
-                    )
-                    self.events.emit("voice.error", dict(self._last_error or {}))
+                    self._permission_revoked()
                     break
                 try:
                     result = self._run_once(runtime, stop_event)
@@ -453,6 +523,9 @@ class VoiceService:
                     continue
                 result_data = _jsonable(result)
                 result_status = result_data.get("status") if isinstance(result_data, dict) else None
+                if result_status == "capture_timeout":
+                    continue
+                result_data = _sanitize_result(result_status, result_data)
                 self.events.emit(
                     "voice.result",
                     {"source": "microphone", "status": result_status, "result": result_data},
@@ -475,6 +548,10 @@ class VoiceService:
     def _run_once(self, runtime: VoiceRuntime, stop_event: threading.Event) -> Any | None:
         engine = runtime.engine
         capture = runtime.capture
+        run_once = getattr(engine, "run_once", None)
+        if callable(run_once):
+            result = run_once(capture)
+            return None if stop_event.is_set() else result
         process_audio = getattr(engine, "process_audio", None)
         capture_once = getattr(capture, "capture_utterance", None)
         if callable(process_audio) and callable(capture_once):
@@ -483,10 +560,7 @@ class VoiceService:
             if stop_event.is_set():
                 return None
             return process_audio(audio)
-        run_once = getattr(engine, "run_once", None)
-        if callable(run_once):
-            return run_once(capture)
-        raise TypeError("voice engine must implement process_audio(audio) or run_once(capture)")
+        raise TypeError("voice engine must implement run_once(capture) or process_audio(audio)")
 
     def _create_runtime(self, *, dry_run: bool) -> VoiceRuntime:
         if self._runtime_factory is not None:
@@ -547,20 +621,124 @@ class VoiceService:
         except (AttributeError, TypeError):
             pass
 
+    def _create_permission_watcher(self) -> Any:
+        factory = self._permission_watcher_factory
+        if factory is None:
+            from .safety import PermissionRevocationWatcher
+
+            factory = PermissionRevocationWatcher
+        return factory(self._allowed, self._permission_revoked)
+
+    def _permission_revoked(self) -> None:
+        with self._lock:
+            runtime = self._runtime
+            stop_event = self._stop_event
+            if runtime is None or stop_event is None or stop_event.is_set():
+                return
+            self._last_error = {
+                "code": "permission_revoked",
+                "detail": "voice_control was revoked",
+            }
+        self.events.emit("voice.error", dict(self._last_error))
+        self.stop(wait=False)
+
+    def _create_emergency_watcher(self, runtime: VoiceRuntime) -> Any | None:
+        del runtime
+        factory = self._emergency_watcher_factory
+        if factory is None:
+            uses_default_runtime = (
+                self._runtime_factory is None
+                and self._injected_engine is None
+                and self._engine_factory is None
+            )
+            if not uses_default_runtime:
+                return None
+            from .safety import EmergencyStopWatcher
+
+            factory = EmergencyStopWatcher
+        return factory(lambda: self.stop(wait=False))
+
+    def _start_runtime_interrupt(self, runtime: VoiceRuntime) -> tuple[threading.Thread, ...]:
+        with runtime._interrupt_lock:
+            if runtime._interrupt_started:
+                return runtime._interrupt_threads
+            runtime._interrupt_started = True
+            capture_thread = threading.Thread(
+                target=self._interrupt_capture,
+                args=(runtime,),
+                name=f"voice-capture-stop-{self._generation}",
+                daemon=True,
+            )
+            engine_thread = threading.Thread(
+                target=self._interrupt_engine,
+                args=(runtime.engine,),
+                name=f"voice-engine-stop-{self._generation}",
+                daemon=True,
+            )
+            threads = (capture_thread, engine_thread)
+            started: list[threading.Thread] = []
+            for thread in threads:
+                try:
+                    thread.start()
+                    started.append(thread)
+                except Exception as exc:
+                    self.events.emit(
+                        "voice.error",
+                        {
+                            "code": "interrupt_start_failed",
+                            "detail": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+            runtime._interrupt_threads = tuple(started)
+            return runtime._interrupt_threads
+
+    @staticmethod
+    def _interrupt_engine(engine: Any) -> None:
+        if callable(getattr(engine, "request_cancel", None)):
+            stop_playback = getattr(engine, "stop_current_playback", None)
+            if callable(stop_playback):
+                try:
+                    stop_playback()
+                except Exception:
+                    pass
+            return
+        cancel = getattr(engine, "cancel_current", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
     def _interrupt_capture(self, runtime: VoiceRuntime) -> None:
         capture = runtime.capture
         if capture is None:
             return
+        runtime._preclosed.add(id(capture))
         stop = getattr(capture, "stop", None)
-        if callable(stop):
+        stop_done = threading.Event()
+
+        def request_stop() -> None:
             try:
-                stop()
+                if callable(stop):
+                    stop()
             except Exception as exc:
                 self.events.emit(
                     "voice.error",
                     {"code": "capture_stop_failed", "detail": f"{type(exc).__name__}: {exc}"},
                 )
-            return
+            finally:
+                stop_done.set()
+
+        stop_thread: threading.Thread | None = None
+        if callable(stop):
+            stop_thread = threading.Thread(
+                target=request_stop,
+                name=f"voice-capture-cooperative-stop-{self._generation}",
+                daemon=True,
+            )
+            stop_thread.start()
+            stop_done.wait(timeout=0.05)
+
         close = getattr(capture, "close", None)
         if callable(close):
             try:
@@ -569,31 +747,58 @@ class VoiceService:
             except Exception as exc:
                 self.events.emit(
                     "voice.error",
-                    {"code": "capture_stop_failed", "detail": f"{type(exc).__name__}: {exc}"},
+                    {"code": "capture_close_failed", "detail": f"{type(exc).__name__}: {exc}"},
                 )
+        if stop_thread is not None and stop_thread is not threading.current_thread():
+            stop_thread.join(timeout=self._stop_timeout)
 
     @staticmethod
-    def _cancel_engine(engine: Any) -> None:
-        cancel = getattr(engine, "cancel_current", None)
-        if callable(cancel):
+    def _request_engine_cancel(engine: Any) -> None:
+        request = getattr(engine, "request_cancel", None)
+        if callable(request):
             try:
-                cancel()
+                request()
             except Exception:
                 pass
+
+    def _permission_call(self, callback: Callable[[], Any]) -> tuple[bool, Any | None]:
+        runner = getattr(self.permission, "run_if_allowed", None)
+        if callable(runner):
+            return runner(callback)
+        if not self._allowed():
+            return False, None
+        return True, callback()
 
     def _release_runtime(self, runtime: VoiceRuntime) -> None:
         with runtime._release_lock:
             if runtime._released:
                 return
             runtime._released = True
+        seen: set[int] = set()
+        for watcher in (runtime.permission_watcher, runtime.emergency_watcher):
+            if watcher is None or id(watcher) in seen:
+                continue
+            seen.add(id(watcher))
+            close = getattr(watcher, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    self.events.emit(
+                        "voice.error",
+                        {"code": "release_failed", "detail": f"{type(exc).__name__}: {exc}"},
+                    )
+        for thread in runtime._interrupt_threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=self._stop_timeout)
         resources = [
-            runtime.test_engine,
             runtime.capture,
+            runtime.caption_bridge,
+            runtime.test_engine,
             runtime.engine,
             runtime.resources,
             *runtime.closeables,
         ]
-        seen: set[int] = set()
         for resource in resources:
             if resource is None or id(resource) in seen:
                 continue
@@ -674,6 +879,9 @@ def _normalize_runtime(value: Any) -> VoiceRuntime:
             capture=value.get("capture"),
             test_engine=value.get("test_engine"),
             resources=value.get("resources"),
+            caption_bridge=value.get("caption_bridge"),
+            emergency_watcher=value.get("emergency_watcher"),
+            permission_watcher=value.get("permission_watcher"),
             closeables=tuple(value.get("closeables") or ()),
         )
     if isinstance(value, tuple):
@@ -690,27 +898,160 @@ def _normalize_runtime(value: Any) -> VoiceRuntime:
             capture=getattr(value, "capture", None),
             test_engine=getattr(value, "test_engine", None),
             resources=getattr(value, "resources", None),
+            caption_bridge=getattr(value, "caption_bridge", None),
+            emergency_watcher=getattr(value, "emergency_watcher", None),
+            permission_watcher=getattr(value, "permission_watcher", None),
             closeables=tuple(getattr(value, "closeables", ()) or ()),
         )
     return VoiceRuntime(engine=value)
 
 
 def _default_runtime_factory(*, events: VoiceEventHub, dry_run: bool = False) -> VoiceRuntime:
-    """Import and construct heavy dependencies only after permission succeeds."""
+    """Construct transcript-only dry runs or a fully preflighted real runtime."""
 
     from .config import VoiceSettings
     from .runtime import build_capture, build_runtime
 
     settings = VoiceSettings.load()
-    engine, resources = build_runtime(
-        settings,
-        mode="fast",
-        act=not dry_run,
-        speak=not dry_run,
+    if dry_run:
+        engine, resources = build_runtime(
+            settings,
+            mode="fast",
+            act=False,
+            speak=False,
+            enable_asr=False,
+        )
+        engine.events = events
+        return VoiceRuntime(engine=engine, resources=resources)
+
+    if settings.sample_rate != 16_000:
+        raise ValueError("streaming captions require a 16000 Hz capture sample rate")
+
+    from .asr_streaming import StreamingZipformerRecognizer
+    from .captions import AsyncCaptionPump, StreamingCaptionBridge
+    from .models import (
+        ModelValidationError,
+        load_model_inventory,
+        validate_model_assets,
+        warmup_sensevoice,
     )
-    engine.events = events
-    capture = None if dry_run else _InterruptibleCapture(build_capture(settings))
-    return VoiceRuntime(engine=engine, capture=capture, resources=resources)
+
+    manifest_path = Path(__file__).resolve().parents[1] / "voice-models.json"
+    manifest_env = dict(os.environ)
+    manifest_env["MULIAO_VOICE_SENSEVOICE_DIR"] = str(settings.sensevoice_dir)
+    inventory = load_model_inventory(
+        manifest_path,
+        repository_root=manifest_path.parent,
+        env=manifest_env,
+    )
+    report = validate_model_assets(
+        inventory,
+        model_names=("sensevoice", "streaming_zipformer"),
+    )
+    report.raise_for_errors()
+
+    engine = None
+    resources = None
+    streaming_recognizer = None
+    bridge = None
+    caption_pump = None
+    try:
+        engine, resources = build_runtime(
+            settings,
+            mode="fast",
+            act=True,
+            speak=True,
+            enable_asr=True,
+        )
+        engine.events = events
+        warmup = warmup_sensevoice(
+            settings.sensevoice_dir,
+            recognizer_factory=lambda _path: engine.recognizer._get_recognizer(),
+            sample_rate=settings.sample_rate,
+        )
+        if not warmup.ok:
+            raise ModelValidationError(
+                "SenseVoice warm-up failed: " + (warmup.error or "unknown error")
+            )
+        events.emit(
+            "voice.metric",
+            {"name": "sensevoice_warmup_ms", "value": round(warmup.total_seconds * 1000, 3)},
+        )
+
+        streaming = inventory.require("streaming_zipformer")
+        files = {asset.name: asset.path for asset in streaming.files}
+        streaming_recognizer = StreamingZipformerRecognizer(
+            tokens=files["tokens.txt"],
+            encoder=files["encoder-epoch-99-avg-1.onnx"],
+            decoder=files["decoder-epoch-99-avg-1.onnx"],
+            joiner=files["joiner-epoch-99-avg-1.onnx"],
+        )
+        streaming_started = time.perf_counter()
+        streaming_recognizer.warmup()
+        events.emit(
+            "voice.metric",
+            {
+                "name": "streaming_zipformer_warmup_ms",
+                "value": round((time.perf_counter() - streaming_started) * 1000, 3),
+            },
+        )
+        bridge = StreamingCaptionBridge(
+            streaming_recognizer,
+            engine.wake,
+            events,
+            resources.echo_guard,
+        )
+        caption_pump = AsyncCaptionPump(bridge)
+
+        def accept_caption_frame(frame: bytes) -> None:
+            caption_pump.accept_pcm(
+                frame,
+                sample_rate=settings.sample_rate,
+                channels=1,
+                sample_width=2,
+            )
+
+        raw_capture = build_capture(
+            settings,
+            echo_guard=resources.echo_guard,
+            frame_consumer=accept_caption_frame,
+            frame_resetter=caption_pump.reset,
+        )
+        capture = _CaptionedCapture(raw_capture, caption_pump, events)
+        return VoiceRuntime(
+            engine=engine,
+            capture=capture,
+            resources=resources,
+            caption_bridge=caption_pump,
+        )
+    except Exception:
+        if caption_pump is not None:
+            try:
+                caption_pump.close()
+            except Exception:
+                pass
+        elif bridge is not None:
+            try:
+                bridge.close()
+            except Exception:
+                pass
+        elif streaming_recognizer is not None:
+            try:
+                streaming_recognizer.close()
+            except Exception:
+                pass
+        if resources is not None:
+            try:
+                resources.close()
+            except Exception:
+                pass
+        raise
+
+
+def _sanitize_result(status: Any, result: Any) -> Any:
+    if status in {"wake_miss", "echo_drop", "capture_timeout"}:
+        return {"status": str(status)}
+    return result
 
 
 def _jsonable(value: Any) -> Any:

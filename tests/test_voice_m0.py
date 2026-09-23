@@ -38,6 +38,12 @@ class FakeCapture(Counter):
         return AudioSegment(b"\0\0" * 160)
 
 
+class TimeoutCapture(Counter):
+    def capture_utterance(self, *, cancellation=None) -> AudioSegment:
+        self.calls += 1
+        raise TimeoutError("no speech detected before capture timeout")
+
+
 class FakeRecognizer(Counter):
     def __init__(self, text: str) -> None:
         super().__init__()
@@ -93,6 +99,7 @@ def make_engine(
     permission_sequence=None,
     transcript="幕僚幕僚，打开记事本",
     decision=None,
+    echo_guard=None,
 ):
     permission = FakePermission(allowed, permission_sequence)
     recognizer = FakeRecognizer(transcript)
@@ -107,6 +114,7 @@ def make_engine(
         executor=executor,
         speaker=speaker,
         events=events,
+        echo_guard=echo_guard,
     )
     return engine, permission, recognizer, router, executor, speaker, events
 
@@ -146,6 +154,24 @@ class VoiceM0Tests(unittest.TestCase):
         self.assertEqual(executor.calls, 0)
         self.assertEqual(speaker.calls, 0)
 
+    def test_capture_timeout_is_metric_not_error_and_calls_no_dependencies(self):
+        engine, _, recognizer, router, executor, speaker, events = make_engine()
+        capture = TimeoutCapture()
+
+        result = engine.run_once(capture)
+
+        self.assertEqual(result.status, "capture_timeout")
+        self.assertEqual(capture.calls, 1)
+        self.assertEqual(recognizer.calls, 0)
+        self.assertEqual(router.calls, 0)
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+        self.assertFalse(any(event.type == "voice.error" for event in events.events))
+        self.assertEqual(
+            [event.payload.get("name") for event in events.events if event.type == "voice.metric"],
+            ["capture_timeout"],
+        )
+
     def test_wake_miss_has_zero_jev_and_action_calls(self):
         engine, _, recognizer, router, executor, speaker, events = make_engine(
             transcript="打开记事本"
@@ -159,6 +185,38 @@ class VoiceM0Tests(unittest.TestCase):
         self.assertEqual(speaker.calls, 0)
         self.assertTrue(any(e.type == "voice.metric" for e in events.events))
         self.assertFalse(any(e.type == "voice.final" for e in events.events))
+
+    def test_echo_drop_has_zero_jev_action_tts_and_leaks_no_transcript(self):
+        echoed = "幕僚幕僚这是刚才的播报回声"
+
+        class EchoGuard:
+            def __init__(self) -> None:
+                self.checked: list[str] = []
+
+            def should_drop(self, text: str) -> bool:
+                self.checked.append(text)
+                return text == echoed
+
+        guard = EchoGuard()
+        engine, _, _, router, executor, speaker, events = make_engine(
+            transcript=echoed,
+            echo_guard=guard,
+        )
+
+        result = engine.process_transcript(echoed)
+
+        self.assertEqual(result.status, "echo_drop")
+        self.assertEqual(result.transcript, "")
+        self.assertEqual(guard.checked, [echoed])
+        self.assertEqual(router.calls, 0)
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+        self.assertEqual(
+            [event.payload.get("name") for event in events.events if event.type == "voice.metric"],
+            ["echo_drop"],
+        )
+        self.assertFalse(any(event.type == "voice.final" for event in events.events))
+        self.assertNotIn(echoed, repr([event.payload for event in events.events]))
 
     def test_permission_revoked_after_recognition_stops_before_jev(self):
         engine, _, _, router, executor, speaker, events = make_engine(
@@ -214,6 +272,26 @@ class VoiceM0Tests(unittest.TestCase):
         self.assertEqual(executor.calls, 0)
         self.assertEqual(speaker.calls, 0)
         self.assertTrue(any(e.type == "voice.confirmation" for e in events.events))
+
+
+    def test_tts_failure_after_commit_stays_executed_not_retryable(self):
+        engine, _, _, _, executor, _, events = make_engine()
+
+        class FailingSpeaker(Counter):
+            def speak(self, text: str, **kwargs) -> None:
+                self.calls += 1
+                raise RuntimeError("audio device busy")
+
+        engine.speaker = FailingSpeaker()
+
+        result = engine.process_transcript("幕僚幕僚，打开记事本")
+
+        self.assertEqual(result.status, "executed")
+        self.assertEqual(executor.calls, 1)
+        self.assertTrue(result.detail.startswith("tts_failed:"))
+        self.assertTrue(
+            any(e.payload.get("code") == "tts_failed" for e in events.events),
+        )
 
 
 if __name__ == "__main__":

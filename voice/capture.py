@@ -26,6 +26,7 @@ class PyAudioVADCapture:
         input_device_index: int | None = None,
         pyaudio_factory: Callable[[], Any] | None = None,
         vad_factory: Callable[[int], Any] | None = None,
+        mute_gate: Any | None = None,
     ) -> None:
         if sample_rate not in {8_000, 16_000, 32_000, 48_000}:
             raise ValueError("unsupported VAD sample rate")
@@ -42,6 +43,9 @@ class PyAudioVADCapture:
         self.input_device_index = input_device_index
         self._pyaudio_factory = pyaudio_factory
         self._vad_factory = vad_factory
+        self.mute_gate = mute_gate
+        self.frame_consumer: Callable[[bytes], Any] | None = None
+        self.frame_resetter: Callable[[], Any] | None = None
         self._stop_event = threading.Event()
         self._stream = None
         self._stream_lock = threading.Lock()
@@ -51,14 +55,20 @@ class PyAudioVADCapture:
         return self.sample_rate * self.frame_ms // 1000
 
     def capture_utterance(self, *, cancellation: CancellationToken | None = None) -> AudioSegment:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         import pyaudio
         import webrtcvad
 
         self._stop_event.clear()
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         audio = (self._pyaudio_factory or pyaudio.PyAudio)()
         vad = (self._vad_factory or webrtcvad.Vad)(self.vad_mode)
         stream = None
         try:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             stream = audio.open(
                 format=pyaudio.paInt16,
                 channels=1,
@@ -112,6 +122,7 @@ class PyAudioVADCapture:
         speech_count = 0
         trailing_silence = 0
         frames_read = 0
+        muted = False
 
         while len(frames) < max_frames:
             if self._stop_event.is_set() or (cancellation is not None and cancellation.cancelled):
@@ -122,7 +133,43 @@ class PyAudioVADCapture:
             frames_read += 1
             if len(frame) != self.samples_per_frame * 2:
                 continue
-            speaking = bool(vad.is_speech(frame, self.sample_rate))
+            speaking_result: list[bool] = []
+
+            def consume_allowed(allowed_frame: bytes) -> None:
+                if self.frame_consumer is not None:
+                    try:
+                        self.frame_consumer(allowed_frame)
+                    except Exception:
+                        # 实时字幕是 display-only；失败不能阻断最终命令 ASR。
+                        pass
+                speaking_result.append(bool(vad.is_speech(allowed_frame, self.sample_rate)))
+
+            if self.mute_gate is not None:
+                submit = getattr(self.mute_gate, "submit", None)
+                if callable(submit):
+                    allowed = bool(submit(frame, consume_allowed))
+                else:
+                    allowed = bool(self.mute_gate.allow_frame(frame))
+                    if allowed:
+                        consume_allowed(frame)
+                if not allowed:
+                    pre_roll.clear()
+                    frames.clear()
+                    started = False
+                    speech_count = 0
+                    trailing_silence = 0
+                    frames_read = 0
+                    if not muted and self.frame_resetter is not None:
+                        try:
+                            self.frame_resetter()
+                        except Exception:
+                            pass
+                    muted = True
+                    continue
+            else:
+                consume_allowed(frame)
+            muted = False
+            speaking = speaking_result[0]
             if not started:
                 pre_roll.append(frame)
                 if not speaking:

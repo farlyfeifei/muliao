@@ -15,7 +15,10 @@ if str(ROOT) not in sys.path:
 from voice.audio_player import PyAudioPcmSink
 from voice.cancellation import CancellationToken
 from voice.config import VoiceSettings
-from voice.runtime import build_runtime
+from voice.contracts import RouteDecision
+from voice.events import MemoryEventSink
+from voice.runtime import VoiceRuntimeResources, build_capture, build_runtime
+from voice.safety import EchoAwareSpeaker
 from voice.tts_local import FallbackSpeaker, SapiSpeaker
 
 
@@ -140,7 +143,191 @@ class FallbackSpeakerTests(unittest.TestCase):
         self.assertEqual(local.close_calls, 1)
 
 
+    def test_stop_during_local_fallback_playback_is_not_blocked_by_epoch_lock(self):
+        local_entered = threading.Event()
+        release_local = threading.Event()
+
+        class Cloud:
+            def speak(self, text: str) -> None:
+                raise RuntimeError("cloud offline")
+
+            def cancel(self) -> None:
+                return None
+
+        class Local:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+
+            def speak(self, text: str, *, cancellation=None, operation_id=None) -> None:
+                local_entered.set()
+                release_local.wait(timeout=2.0)
+
+            def stop(self, *, operation_id=None) -> None:
+                self.stop_calls += 1
+                release_local.set()
+
+        local = Local()
+        speaker = FallbackSpeaker(Cloud(), local)
+        worker = threading.Thread(target=lambda: speaker.speak("完成"))
+        worker.start()
+        self.assertTrue(local_entered.wait(timeout=1.0))
+
+        stop_returned = threading.Event()
+        stopper = threading.Thread(target=lambda: (speaker.stop(), stop_returned.set()))
+        stopper.start()
+        self.assertTrue(stop_returned.wait(timeout=1.0))
+
+        release_local.set()
+        worker.join(timeout=1.0)
+        stopper.join(timeout=1.0)
+        self.assertEqual(local.stop_calls, 1)
+
+
 class SapiSpeakerThreadingTests(unittest.TestCase):
+    @staticmethod
+    def wait_for_queue_size(
+        speaker: SapiSpeaker,
+        expected: int,
+        timeout: float = 1.0,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if speaker._commands.qsize() == expected:
+                return True
+            time.sleep(0.005)
+        return speaker._commands.qsize() == expected
+
+    def test_close_purge_error_still_exits_owner_when_playback_finishes_first(self):
+        wait_entered = threading.Event()
+        playback_done = threading.Event()
+
+        class Voice:
+            def Speak(self, text: str, flags: int = 0) -> None:
+                if not text and flags == 3:
+                    raise RuntimeError("purge failed")
+
+            def WaitUntilDone(self, timeout_ms: int) -> bool:
+                wait_entered.set()
+                return playback_done.wait(timeout=2.0)
+
+        speaker = SapiSpeaker(dispatch=lambda name: Voice())
+        speak_done = threading.Event()
+        close_done = threading.Event()
+        close_errors: list[BaseException] = []
+        speaker_thread = threading.Thread(
+            target=lambda: (speaker.speak("播放中"), speak_done.set()),
+            daemon=True,
+        )
+        speaker_thread.start()
+        self.assertTrue(wait_entered.wait(timeout=1.0))
+
+        def close() -> None:
+            try:
+                speaker.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+            finally:
+                close_done.set()
+
+        closer = threading.Thread(target=close, daemon=True)
+        closer.start()
+        self.assertTrue(self.wait_for_queue_size(speaker, 1))
+        playback_done.set()
+
+        self.assertTrue(close_done.wait(timeout=1.0))
+        self.assertTrue(speak_done.wait(timeout=1.0))
+        speaker_thread.join(timeout=1.0)
+        closer.join(timeout=1.0)
+        self.assertFalse(speaker_thread.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(speaker._thread.is_alive())
+        self.assertEqual([str(exc) for exc in close_errors], ["purge failed"])
+        self.assertEqual(speaker._commands.unfinished_tasks, 0)
+
+    def test_deferred_speak_is_completed_when_stop_and_close_are_queued(self):
+        first_wait_entered = threading.Event()
+        release_first_wait = threading.Event()
+        second_wait_entered = threading.Event()
+        release_second_wait = threading.Event()
+        wait_calls = 0
+        wait_lock = threading.Lock()
+
+        class Voice:
+            def Speak(self, text: str, flags: int = 0) -> None:
+                return None
+
+            def WaitUntilDone(self, timeout_ms: int) -> bool:
+                nonlocal wait_calls
+                with wait_lock:
+                    wait_calls += 1
+                    call = wait_calls
+                if call == 1:
+                    first_wait_entered.set()
+                    release_first_wait.wait(timeout=2.0)
+                    return False
+                second_wait_entered.set()
+                return release_second_wait.wait(timeout=2.0)
+
+        speaker = SapiSpeaker(dispatch=lambda name: Voice())
+        active_done = threading.Event()
+        deferred_done = threading.Event()
+        stop_done = threading.Event()
+        close_done = threading.Event()
+        deferred_errors: list[BaseException] = []
+        close_errors: list[BaseException] = []
+
+        active = threading.Thread(
+            target=lambda: (speaker.speak("active"), active_done.set()),
+            daemon=True,
+        )
+        active.start()
+        self.assertTrue(first_wait_entered.wait(timeout=1.0))
+
+        def deferred_speak() -> None:
+            try:
+                speaker.speak("deferred")
+            except BaseException as exc:
+                deferred_errors.append(exc)
+            finally:
+                deferred_done.set()
+
+        deferred = threading.Thread(target=deferred_speak, daemon=True)
+        deferred.start()
+        self.assertTrue(self.wait_for_queue_size(speaker, 1))
+        release_first_wait.set()
+        self.assertTrue(second_wait_entered.wait(timeout=1.0))
+
+        stopper = threading.Thread(
+            target=lambda: (speaker.stop(), stop_done.set()),
+            daemon=True,
+        )
+        stopper.start()
+        self.assertTrue(self.wait_for_queue_size(speaker, 1))
+
+        def close() -> None:
+            try:
+                speaker.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+            finally:
+                close_done.set()
+
+        closer = threading.Thread(target=close, daemon=True)
+        closer.start()
+        self.assertTrue(self.wait_for_queue_size(speaker, 2))
+        release_second_wait.set()
+
+        for done in (active_done, stop_done, close_done, deferred_done):
+            self.assertTrue(done.wait(timeout=1.0))
+        for worker in (active, deferred, stopper, closer):
+            worker.join(timeout=1.0)
+            self.assertFalse(worker.is_alive())
+        self.assertFalse(speaker._thread.is_alive())
+        self.assertEqual(close_errors, [])
+        self.assertEqual(len(deferred_errors), 1)
+        self.assertIn("closed", str(deferred_errors[0]))
+        self.assertEqual(speaker._commands.unfinished_tasks, 0)
+
     def test_com_voice_speak_purge_and_uninitialize_stay_on_owner_thread(self):
         calls: list[tuple[str, int, str | int | None]] = []
         owner: list[int] = []
@@ -230,6 +417,95 @@ class SapiSpeakerThreadingTests(unittest.TestCase):
         stale.join(timeout=1.0)
         speaker.close()
         self.assertNotIn("stale", spoken)
+    def test_speak_waits_until_real_playback_finishes(self):
+        playback_started = threading.Event()
+        playback_done = threading.Event()
+
+        class Voice:
+            def Speak(self, text: str, flags: int = 0) -> None:
+                if text:
+                    playback_started.set()
+
+            def WaitUntilDone(self, timeout_ms: int) -> bool:
+                return playback_done.wait(timeout_ms / 1000.0)
+
+        speaker = SapiSpeaker(dispatch=lambda name: Voice())
+        finished = threading.Event()
+        worker = threading.Thread(
+            target=lambda: (speaker.speak("仍在播放", operation_id=11), finished.set()),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            self.assertTrue(playback_started.wait(timeout=1.0))
+            self.assertFalse(finished.wait(timeout=0.1))
+            playback_done.set()
+            self.assertTrue(finished.wait(timeout=1.0))
+            worker.join(timeout=1.0)
+            self.assertFalse(worker.is_alive())
+        finally:
+            playback_done.set()
+            speaker.close()
+
+    def test_stop_preempts_active_playback_and_unblocks_speak(self):
+        playback_started = threading.Event()
+        purge_seen = threading.Event()
+
+        class Voice:
+            def Speak(self, text: str, flags: int = 0) -> None:
+                if text:
+                    playback_started.set()
+                elif flags == 3:
+                    purge_seen.set()
+
+            def WaitUntilDone(self, timeout_ms: int) -> bool:
+                time.sleep(timeout_ms / 1000.0)
+                return False
+
+        speaker = SapiSpeaker(dispatch=lambda name: Voice())
+        worker = threading.Thread(
+            target=lambda: speaker.speak("需要急停", operation_id=12),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            self.assertTrue(playback_started.wait(timeout=1.0))
+            self.assertTrue(speaker.stop(operation_id=12))
+            self.assertTrue(purge_seen.wait(timeout=1.0))
+            worker.join(timeout=1.0)
+            self.assertFalse(worker.is_alive())
+        finally:
+            speaker.close()
+
+    def test_close_preempts_active_playback_and_joins_owner_thread(self):
+        playback_started = threading.Event()
+        purge_seen = threading.Event()
+
+        class Voice:
+            def Speak(self, text: str, flags: int = 0) -> None:
+                if text:
+                    playback_started.set()
+                elif flags == 3:
+                    purge_seen.set()
+
+            def WaitUntilDone(self, timeout_ms: int) -> bool:
+                time.sleep(timeout_ms / 1000.0)
+                return False
+
+        speaker = SapiSpeaker(dispatch=lambda name: Voice())
+        worker = threading.Thread(
+            target=lambda: speaker.speak("关闭时停止", operation_id=13),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(playback_started.wait(timeout=1.0))
+
+        speaker.close()
+
+        self.assertTrue(purge_seen.wait(timeout=1.0))
+        worker.join(timeout=1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(speaker._thread.is_alive())
 
 
 class FakeOutputStream:
@@ -304,18 +580,47 @@ class RuntimeBuildTests(unittest.TestCase):
         )
         return replace(base, **changes)
 
-    def test_no_mimo_key_builds_local_only_speaker(self):
+    def test_resource_close_attempts_every_backend_and_aggregates_failures(self):
+        calls: list[str] = []
+
+        class Resource:
+            def __init__(self, name: str, *, fail: bool = False) -> None:
+                self.name = name
+                self.fail = fail
+
+            def close(self) -> None:
+                calls.append(self.name)
+                if self.fail:
+                    raise RuntimeError(f"{self.name} failed")
+
+        resources = VoiceRuntimeResources(
+            router=Resource("router", fail=True),
+            speaker=Resource("speaker", fail=True),
+            player=Resource("player", fail=True),
+            sink=Resource("sink"),
+        )
+
+        with self.assertRaises(ExceptionGroup) as raised:
+            resources.close()
+
+        self.assertEqual(calls, ["speaker", "router", "player", "sink"])
+        self.assertEqual(len(raised.exception.exceptions), 3)
+
+    def test_no_mimo_key_builds_echo_aware_local_speaker(self):
         with mock.patch("voice.runtime.SapiSpeaker") as local_cls:
             local = local_cls.return_value
             engine, resources = build_runtime(self.settings(), speak=True)
             try:
-                self.assertIs(engine.speaker, local)
+                self.assertIsInstance(engine.speaker, EchoAwareSpeaker)
+                self.assertIs(engine.speaker.speaker, local)
+                self.assertIs(engine.echo_guard, resources.echo_guard)
+                self.assertIs(engine.speaker.guard, resources.echo_guard)
                 self.assertIsNone(resources.player)
                 self.assertIsNone(resources.sink)
             finally:
                 resources.close()
 
-    def test_mimo_key_builds_fallback_without_exposing_key(self):
+    def test_mimo_key_builds_echo_aware_fallback_without_exposing_key(self):
         with (
             mock.patch("voice.runtime.SapiSpeaker") as local_cls,
             mock.patch("voice.runtime.PyAudioPcmSink") as sink_cls,
@@ -327,13 +632,83 @@ class RuntimeBuildTests(unittest.TestCase):
                 speak=True,
             )
             try:
-                self.assertIsInstance(engine.speaker, FallbackSpeaker)
+                self.assertIsInstance(engine.speaker, EchoAwareSpeaker)
+                self.assertIsInstance(engine.speaker.speaker, FallbackSpeaker)
+                self.assertIs(engine.echo_guard, resources.echo_guard)
+                self.assertIs(engine.speaker.guard, resources.echo_guard)
                 cloud_cls.assert_called_once()
                 kwargs = cloud_cls.call_args.kwargs
                 self.assertEqual(kwargs["api_key"], "test-only")
                 self.assertEqual(kwargs["voice"], "冰糖")
                 self.assertIs(resources.sink, sink_cls.return_value)
                 self.assertIs(resources.player, player_cls.return_value)
+            finally:
+                resources.close()
+
+    def test_transcript_only_execution_emits_no_tts_events(self):
+        engine, resources = build_runtime(
+            self.settings(),
+            speak=False,
+            enable_asr=False,
+        )
+        events = MemoryEventSink()
+        engine.events = events
+        engine.router.route = mock.Mock(
+            return_value=RouteDecision(
+                accepted=True,
+                kind="open_app",
+                target="notepad",
+                confidence=0.99,
+            )
+        )
+        with mock.patch.object(engine.permission, "allowed", return_value=True), mock.patch.object(
+            engine.permission,
+            "run_if_allowed",
+            side_effect=lambda callback: (True, callback()),
+        ):
+            try:
+                result = engine.process_transcript("幕僚幕僚，打开记事本")
+            finally:
+                resources.close()
+
+        self.assertEqual(result.status, "executed")
+        self.assertEqual(result.detail, "tts_skipped_disabled")
+        self.assertFalse(any(event.type == "voice.tts" for event in events.events))
+
+    def test_capture_uses_runtime_echo_guard_gate_and_frame_consumer(self):
+        consumer = mock.Mock()
+        with mock.patch("voice.runtime.SapiSpeaker"):
+            engine, resources = build_runtime(self.settings(), speak=True)
+        try:
+            capture = build_capture(
+                self.settings(),
+                echo_guard=resources.echo_guard,
+                frame_consumer=consumer,
+            )
+            self.assertIs(capture.mute_gate, resources.echo_guard.mute_gate)
+            self.assertIs(capture.frame_consumer, consumer)
+            self.assertIs(engine.echo_guard, resources.echo_guard)
+        finally:
+            resources.close()
+
+    def test_transcript_only_runtime_skips_asr_echo_and_tts_events(self):
+        with (
+            mock.patch("voice.runtime.SenseVoiceRecognizer") as recognizer_cls,
+            mock.patch("voice.runtime.SapiSpeaker") as sapi_cls,
+        ):
+            engine, resources = build_runtime(
+                self.settings(),
+                speak=False,
+                enable_asr=False,
+            )
+            try:
+                recognizer_cls.assert_not_called()
+                sapi_cls.assert_not_called()
+                self.assertIsNone(engine.echo_guard)
+                self.assertIsNone(resources.echo_guard)
+                self.assertFalse(engine.speaker.enabled)
+                with self.assertRaisesRegex(RuntimeError, "disabled"):
+                    engine.recognizer.transcribe(None)
             finally:
                 resources.close()
 

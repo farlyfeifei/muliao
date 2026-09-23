@@ -246,6 +246,136 @@ class EmergencyStopWatcher:
         self.close()
 
 
+class PermissionRevocationWatcher:
+    """Poll an authorization predicate and stop work on the first revocation."""
+
+    def __init__(
+        self,
+        allowed: Callable[[], bool],
+        callback: Callable[[], Any],
+        *,
+        poll_interval: float = 0.02,
+        thread_factory: Callable[..., threading.Thread] = threading.Thread,
+    ) -> None:
+        if not callable(allowed):
+            raise TypeError("allowed must be callable")
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        self.allowed = allowed
+        self.callback = callback
+        self.poll_interval = float(poll_interval)
+        self._thread_factory = thread_factory
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+        self._triggered = False
+        self._last_error: BaseException | None = None
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def triggered(self) -> bool:
+        with self._lock:
+            return self._triggered
+
+    @property
+    def last_error(self) -> BaseException | None:
+        with self._lock:
+            return self._last_error
+
+    @property
+    def thread(self) -> threading.Thread | None:
+        with self._lock:
+            return self._thread
+
+    def start(self) -> bool:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("permission watcher is closed")
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._stop_event.clear()
+            self._triggered = False
+            thread = self._thread_factory(
+                target=self._run,
+                name="voice-permission-watch",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+            return True
+
+    def poll_once(self) -> bool:
+        try:
+            allowed = bool(self.allowed())
+        except BaseException as exc:
+            with self._lock:
+                self._last_error = exc
+            allowed = False
+        with self._lock:
+            if allowed or self._triggered or self._closed:
+                return False
+            self._triggered = True
+        try:
+            self.callback()
+        except BaseException as exc:
+            with self._lock:
+                self._last_error = exc
+        return True
+
+    def stop(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            thread = self._thread
+            self._stop_event.set()
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout=timeout)
+        stopped = not thread.is_alive()
+        if stopped:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+        return stopped
+
+    def close(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            self._closed = True
+            self._stop_event.set()
+            thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout=timeout)
+        stopped = not thread.is_alive()
+        if stopped:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+        return stopped
+
+    def _run(self) -> None:
+        current = threading.current_thread()
+        try:
+            while not self._stop_event.is_set():
+                if self.poll_once():
+                    return
+                self._stop_event.wait(self.poll_interval)
+        finally:
+            with self._lock:
+                if self._thread is current:
+                    self._thread = None
+
+
 class CaptureMuteGate:
     """Thread-safe generation-owned gate in front of VAD/ASR ingestion.
 
@@ -306,7 +436,12 @@ class CaptureMuteGate:
         del frame
         return self.capture_allowed
 
-    def tts_started(self, generation: Generation | None = None) -> Generation:
+    def tts_started(
+        self,
+        generation: Generation | None = None,
+        *,
+        on_started: Callable[[Generation], Any] | None = None,
+    ) -> Generation:
         with self._lock:
             selected: Generation = (
                 self._next_generation_locked() if generation is None else generation
@@ -318,21 +453,40 @@ class CaptureMuteGate:
                 self._sequence = max(self._sequence, int(selected))
             self._active_generation = selected
             self._muted = True
+            if on_started is not None:
+                on_started(selected)
             return selected
 
-    def tts_finished(self, generation: Generation | None = None) -> bool:
-        return self._release(generation)
+    def tts_finished(
+        self,
+        generation: Generation | None = None,
+        *,
+        before_release: Callable[[Generation], Any] | None = None,
+    ) -> bool:
+        return self._release(generation, before_release=before_release)
 
-    def tts_cancelled(self, generation: Generation | None = None) -> bool:
-        return self._release(generation)
+    def tts_cancelled(
+        self,
+        generation: Generation | None = None,
+        *,
+        before_release: Callable[[Generation], Any] | None = None,
+    ) -> bool:
+        return self._release(generation, before_release=before_release)
 
-    def _release(self, generation: Generation | None) -> bool:
+    def _release(
+        self,
+        generation: Generation | None,
+        *,
+        before_release: Callable[[Generation], Any] | None = None,
+    ) -> bool:
         with self._lock:
             if self._active_generation is None:
                 return False
             selected = self._active_generation if generation is None else generation
             if selected != self._active_generation:
                 return False
+            if before_release is not None:
+                before_release(selected)
             self._active_generation = None
             self._muted = False
             return True
@@ -418,6 +572,69 @@ def edit_similarity(left: str, right: str) -> float:
     return 1.0 - (_edit_distance(left, right) / max(len(left), len(right)))
 
 
+class EchoAwareSpeaker:
+    """Wrap a speaker so capture mute and echo metadata cover real playback lifetime."""
+
+    def __init__(self, speaker: Any, guard: "EchoGuard") -> None:
+        self.speaker = speaker
+        self.guard = guard
+
+    @property
+    def last_backend(self) -> str:
+        return str(getattr(self.speaker, "last_backend", "local") or "local")
+
+    def speak(
+        self,
+        text: str,
+        *,
+        cancellation: Any | None = None,
+        operation_id: Generation | None = None,
+    ) -> None:
+        if cancellation is not None and cancellation.cancelled:
+            return
+        generation = self.guard.tts_started(text, operation_id)
+        try:
+            try:
+                self.speaker.speak(
+                    text,
+                    cancellation=cancellation,
+                    operation_id=operation_id,
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                self.speaker.speak(text)
+            if cancellation is not None and cancellation.cancelled:
+                self.guard.tts_cancelled(generation)
+                return
+            self.guard.tts_finished(generation)
+        except BaseException:
+            self.guard.tts_cancelled(generation)
+            raise
+
+    def stop(self, *, operation_id: Generation | None = None) -> bool:
+        stop = getattr(self.speaker, "stop", None)
+        if not callable(stop):
+            return False
+        try:
+            outcome = stop(operation_id=operation_id)
+            stopped = True if outcome is None else bool(outcome)
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            stop()
+            stopped = True
+        if stopped:
+            self.guard.tts_cancelled(operation_id)
+        return stopped
+
+    def close(self) -> None:
+        close = getattr(self.speaker, "close", None)
+        if callable(close):
+            close()
+        self.guard.clear()
+
+
 class EchoGuard:
     """Suppress transcripts caused by the most recent TTS playback.
 
@@ -431,7 +648,7 @@ class EchoGuard:
     def __init__(
         self,
         *,
-        post_playback_window_ms: float = 500.0,
+        post_playback_window_ms: float = 1_500.0,
         similarity_threshold: float = 0.80,
         clock: Callable[[], float] = time.monotonic,
         mute_gate: CaptureMuteGate | None = None,
@@ -444,6 +661,7 @@ class EchoGuard:
         self.similarity_threshold = float(similarity_threshold)
         self._clock = clock
         self.mute_gate = mute_gate or CaptureMuteGate()
+        self._transition_lock = threading.RLock()
         self._lock = threading.RLock()
         self._recent: RecentTts | None = None
         self._playing = False
@@ -489,24 +707,28 @@ class EchoGuard:
     ) -> Generation:
         timestamp = self._clock() if now is None else float(now)
         normalized = normalize_for_echo(text)
-        with self._lock:
-            selected: Generation = (
-                self._next_generation_locked() if generation is None else generation
-            )
-            current = None if self._recent is None else self._recent.generation
-            if CaptureMuteGate._older(selected, current):
-                return selected
-            if isinstance(selected, numbers.Integral) and not isinstance(selected, bool):
-                self._sequence = max(self._sequence, int(selected))
-            self._recent = RecentTts(
-                text=str(text),
-                normalized_text=normalized,
-                generation=selected,
-                started_at=timestamp,
-            )
-            self._playing = True
-            self.mute_gate.tts_started(selected)
-            return selected
+
+        def record_started(selected: Generation) -> None:
+            with self._lock:
+                self._recent = RecentTts(
+                    text=str(text),
+                    normalized_text=normalized,
+                    generation=selected,
+                    started_at=timestamp,
+                )
+                self._playing = True
+                if isinstance(selected, numbers.Integral) and not isinstance(selected, bool):
+                    self._sequence = max(self._sequence, int(selected))
+
+        with self._transition_lock:
+            with self._lock:
+                current = None if self._recent is None else self._recent.generation
+                selected: Generation = (
+                    self._next_generation_locked() if generation is None else generation
+                )
+                if CaptureMuteGate._older(selected, current):
+                    return selected
+            return self.mute_gate.tts_started(selected, on_started=record_started)
 
     def tts_finished(
         self,
@@ -532,23 +754,36 @@ class EchoGuard:
         now: float | None,
     ) -> bool:
         timestamp = self._clock() if now is None else float(now)
-        with self._lock:
-            if self._recent is None or not self._playing:
-                return False
-            selected = self._recent.generation if generation is None else generation
-            if selected != self._recent.generation:
-                return False
-            self._recent = replace(
-                self._recent,
-                finished_at=timestamp,
-                cancelled=cancelled,
-            )
-            self._playing = False
+
+        def record_finished(selected: Generation) -> None:
+            with self._lock:
+                if self._recent is None or not self._playing:
+                    return
+                if selected != self._recent.generation:
+                    return
+                self._recent = replace(
+                    self._recent,
+                    finished_at=timestamp,
+                    cancelled=cancelled,
+                )
+                self._playing = False
+
+        with self._transition_lock:
+            with self._lock:
+                if self._recent is None or not self._playing:
+                    return False
+                selected = self._recent.generation if generation is None else generation
+                if selected != self._recent.generation:
+                    return False
             if cancelled:
-                self.mute_gate.tts_cancelled(selected)
-            else:
-                self.mute_gate.tts_finished(selected)
-            return True
+                return self.mute_gate.tts_cancelled(
+                    selected,
+                    before_release=record_finished,
+                )
+            return self.mute_gate.tts_finished(
+                selected,
+                before_release=record_finished,
+            )
 
     on_tts_started = tts_started
     on_tts_finished = tts_finished
@@ -557,18 +792,33 @@ class EchoGuard:
     def clear(self, generation: Generation | None = None) -> bool:
         """Forget retained text, optionally only for the matching generation."""
 
-        with self._lock:
-            if self._recent is None:
-                return False
-            if generation is not None and generation != self._recent.generation:
-                return False
-            selected = self._recent.generation
-            was_playing = self._playing
-            self._recent = None
-            self._playing = False
+        with self._transition_lock:
+            with self._lock:
+                if self._recent is None:
+                    return False
+                if generation is not None and generation != self._recent.generation:
+                    return False
+                selected = self._recent.generation
+                was_playing = self._playing
+
+            def clear_state(active: Generation) -> None:
+                with self._lock:
+                    if self._recent is None or self._recent.generation != active:
+                        return
+                    self._recent = None
+                    self._playing = False
+
             if was_playing:
-                self.mute_gate.tts_cancelled(selected)
-            return True
+                return self.mute_gate.tts_cancelled(
+                    selected,
+                    before_release=clear_state,
+                )
+            with self._lock:
+                if self._recent is None or self._recent.generation != selected:
+                    return False
+                self._recent = None
+                self._playing = False
+                return True
 
     def should_drop(
         self,
@@ -627,9 +877,11 @@ class EchoGuard:
 __all__ = [
     "CaptureMuteGate",
     "DEFAULT_EMERGENCY_KEYS",
+    "EchoAwareSpeaker",
     "EchoGuard",
     "EmergencyStopUnavailable",
     "EmergencyStopWatcher",
+    "PermissionRevocationWatcher",
     "RecentTts",
     "VK_CONTROL",
     "VK_SHIFT",

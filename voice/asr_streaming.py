@@ -171,6 +171,33 @@ class StreamingZipformerRecognizer:
         )
         return self._recognizer
 
+    def warmup(self, *, silence_samples: int = 320) -> None:
+        """Load native assets and decode a short isolated silent stream.
+
+        Warm-up always decodes at least once so an incompatible backend fails
+        here — before the microphone opens — rather than on the first live frame.
+        """
+
+        if silence_samples <= 0:
+            raise ValueError("silence_samples must be positive")
+        with self._lock:
+            self._ensure_open()
+            recognizer = self._get_recognizer()
+            stream = recognizer.create_stream()
+            silence = np.zeros(silence_samples, dtype=np.float32)
+            stream.accept_waveform(self.SAMPLE_RATE, silence)
+            decoded = 0
+            while recognizer.is_ready(stream):
+                recognizer.decode_stream(stream)
+                decoded += 1
+            if decoded == 0:
+                # The backend reported nothing ready for the probe; decode once
+                # anyway to surface a broken recognizer before capture starts.
+                recognizer.decode_stream(stream)
+            reset_stream = getattr(recognizer, "reset", None)
+            if callable(reset_stream):
+                reset_stream(stream)
+
     def _get_stream(self) -> tuple[Any, Any]:
         recognizer = self._get_recognizer()
         if self._stream is None:

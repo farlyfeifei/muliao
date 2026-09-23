@@ -41,6 +41,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-tts", action="store_true", help="不播放确认语")
     args = parser.parse_args(argv)
 
+    from .permission_gate import ExistingVoicePermission
+
+    if not ExistingVoicePermission().allowed():
+        print(json.dumps({
+            "type": "voice.error",
+            "payload": {
+                "code": "permission_denied",
+                "detail": "voice_control is not granted",
+            },
+        }, ensure_ascii=False), file=sys.stderr)
+        return 1
+
     settings = VoiceSettings.load()
     engine = lifecycle = None
     try:

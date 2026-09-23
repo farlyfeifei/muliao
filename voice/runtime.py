@@ -14,8 +14,14 @@ from .events import JsonLineEventSink
 from .fast_actions import DryRunFastAdapter, FastActionExecutor, WindowsFastAdapter
 from .jev_router import JevFastRouter, JevM0Router
 from .permission_gate import ExistingVoicePermission
+from .safety import EchoAwareSpeaker, EchoGuard
 from .tts_local import FallbackSpeaker, NullSpeaker, SapiSpeaker
 from .tts_mimo import MiMoTtsClient
+
+
+class _TranscriptOnlyRecognizer:
+    def transcribe(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("audio recognition is disabled for this runtime")
 
 
 @dataclass
@@ -26,16 +32,24 @@ class VoiceRuntimeResources:
     speaker: object
     player: CancellableAudioPlayer | None = None
     sink: PyAudioPcmSink | None = None
+    echo_guard: EchoGuard | None = None
 
     def close(self) -> None:
-        close = getattr(self.speaker, "close", None)
-        if callable(close):
-            close()
-        self.router.close()
-        if self.player is not None:
-            self.player.close()
-        if self.sink is not None:
-            self.sink.close()
+        errors: list[BaseException] = []
+        seen: set[int] = set()
+        for resource in (self.speaker, self.router, self.player, self.sink):
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup("voice runtime resource close failed", errors)
 
 
 def _local_speaker(speak: bool) -> object:
@@ -68,6 +82,7 @@ def build_runtime(
     mode: str = "fast",
     act: bool = False,
     speak: bool = True,
+    enable_asr: bool = True,
 ):
     """构建显式 M1+ runtime；当前仅支持 ``mode='fast'``。"""
 
@@ -79,10 +94,11 @@ def build_runtime(
         api_key=settings.jev_key,
         model=settings.jev_model,
     )
+    echo_guard = EchoGuard() if speak else None
     local_speaker = _local_speaker(speak)
     player = None
     sink = None
-    speaker: object = local_speaker
+    base_speaker: object = local_speaker
     if speak and settings.mimo_tts_enabled and settings.mimo_api_key:
         sink = PyAudioPcmSink()
         player = CancellableAudioPlayer(sink)
@@ -93,22 +109,45 @@ def build_runtime(
             voice=settings.mimo_tts_voice,
             base_url=settings.mimo_base_url,
         )
-        speaker = FallbackSpeaker(cloud, local_speaker)
+        base_speaker = FallbackSpeaker(cloud, local_speaker)
+    speaker: object = (
+        EchoAwareSpeaker(base_speaker, echo_guard)
+        if speak and echo_guard is not None
+        else base_speaker
+    )
 
     adapter = WindowsFastAdapter() if act else DryRunFastAdapter()
+    recognizer: Any = (
+        SenseVoiceRecognizer(settings.sensevoice_dir)
+        if enable_asr
+        else _TranscriptOnlyRecognizer()
+    )
     engine = VoiceEngine(
         permission=ExistingVoicePermission(),
-        recognizer=SenseVoiceRecognizer(settings.sensevoice_dir),
+        recognizer=recognizer,
         router=router,
         executor=FastActionExecutor(adapter),
         speaker=speaker,
         events=JsonLineEventSink(),
+        echo_guard=echo_guard,
     )
-    return engine, VoiceRuntimeResources(router=router, speaker=speaker, player=player, sink=sink)
+    return engine, VoiceRuntimeResources(
+        router=router,
+        speaker=speaker,
+        player=player,
+        sink=sink,
+        echo_guard=echo_guard,
+    )
 
 
-def build_capture(settings: VoiceSettings) -> PyAudioVADCapture:
-    return PyAudioVADCapture(
+def build_capture(
+    settings: VoiceSettings,
+    *,
+    echo_guard: EchoGuard | None = None,
+    frame_consumer: Any | None = None,
+    frame_resetter: Any | None = None,
+) -> PyAudioVADCapture:
+    capture = PyAudioVADCapture(
         sample_rate=settings.sample_rate,
         frame_ms=settings.frame_ms,
         vad_mode=settings.vad_mode,
@@ -118,4 +157,8 @@ def build_capture(settings: VoiceSettings) -> PyAudioVADCapture:
         listen_timeout_ms=settings.listen_timeout_ms,
         min_speech_ms=settings.min_speech_ms,
         input_device_index=settings.input_device_index,
+        mute_gate=None if echo_guard is None else echo_guard.mute_gate,
     )
+    capture.frame_consumer = frame_consumer
+    capture.frame_resetter = frame_resetter
+    return capture
