@@ -8,6 +8,7 @@ legacy flat aliases still consumed by ``server.py``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping, Sequence
 
 
@@ -196,6 +197,13 @@ def coerce_bool(value: Any, field: str = "value") -> bool:
     raise ValueError(f"planner answer {field!r} is not boolean-like: {value!r}")
 
 
+def coerce_bool_default(value: Any, default: bool, field: str) -> bool:
+    try:
+        return coerce_bool(value, field)
+    except ValueError:
+        return bool(default)
+
+
 def coerce_risk_score(value: Any, default: float = 4.5) -> float:
     value = answer_value(value)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -227,11 +235,15 @@ def risk_label(score: float) -> str:
     return "low"
 
 
-def coerce_recipe(value: Any, *, default: str = "single") -> str:
+def coerce_recipe(value: Any, *, default: str | None = None) -> str:
     raw = answer_value(value)
     text = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
     text = _RECIPE_ALIASES.get(text, text)
-    return text if text in RECIPES else default
+    if text in RECIPES:
+        return text
+    if default is not None:
+        return default
+    raise ValueError(f"unknown recipe: {raw!r}")
 
 
 def recipe_stages(recipe_id: str) -> list[dict[str, Any]]:
@@ -381,6 +393,17 @@ def plan_for_recipe(
     )
 
 
+def _contains_term(text: str, term: str) -> bool:
+    if any(ord(char) > 127 for char in term):
+        return term in text
+    pattern = r"(?<![a-z0-9_])" + re.escape(term) + r"(?![a-z0-9_])"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+
+def _contains_any(text: str, terms: Sequence[str]) -> bool:
+    return any(_contains_term(text, term) for term in terms)
+
+
 def deterministic_fallback(
     goal: str,
     permissions_snapshot: Any = None,
@@ -389,10 +412,13 @@ def deterministic_fallback(
 ) -> PlannerDecision:
     text = " ".join(str(goal or "").strip().lower().split())
     sensitive_terms = (
-        "删除", "清空", "卸载", "外发", "发送给", "发布", "上传", "系统设置", "注册表",
-        "付款", "转账", "购买", "密码", "凭据", "密钥", "管理员权限",
-        "delete", "remove all", "wipe", "uninstall", "send to", "publish", "upload",
-        "registry", "system setting", "purchase", "pay", "transfer money", "credential", "sudo",
+        "删除", "清空", "抹除", "格式化", "卸载", "删库", "外发", "发送给", "发邮件",
+        "发布", "上传", "生产环境", "部署生产", "系统设置", "注册表", "付款", "转账", "购买",
+        "密码", "凭据", "密钥", "管理员权限",
+        "delete", "remove all", "wipe", "format disk", "uninstall", "drop database", "rm -rf",
+        "send to", "send email", "publish", "upload", "deploy production", "production deploy",
+        "registry", "system setting", "purchase", "pay", "transfer money", "credential", "password",
+        "secret key", "sudo", "administrator",
     )
     diagnose_terms = (
         "故障", "报错", "错误", "失败", "崩溃", "异常", "日志", "通知", "诊断", "排查",
@@ -406,28 +432,35 @@ def deterministic_fallback(
         "实现", "编写", "生成", "创建", "构建", "开发", "代码", "报告", "方案", "修复",
         "implement", "write", "generate", "create", "build", "develop", "code", "report", "fix",
     )
+    decomposition_terms = (
+        "多步骤", "端到端", "架构", "审计", "分工", "并行", "分别", "多个", "多路", "同时",
+        "multi-step", "end-to-end", "architecture", "audit", "parallel", "independent", "multiple", "several",
+    )
     vague_exact = {
-        "", "do it", "fix it", "handle it", "take care of it", "帮我弄一下", "处理一下", "修一下", "搞定它", "照办",
+        "", "do it", "fix it", "handle it", "take care of it", "帮我弄一下", "处理一下", "修一下",
+        "帮我看看", "搞定它", "照办",
     }
+    compound = len(text) >= 160 and any(token in text for token in (" and ", "、", "以及", ";", "；"))
+    decomposable = compound or len(text) >= 280 or _contains_any(text, decomposition_terms)
 
-    if any(term in text for term in sensitive_terms):
+    if _contains_any(text, sensitive_terms):
         recipe_id, risk = "sensitive", 7.0
-    elif any(term in text for term in diagnose_terms):
+    elif _contains_any(text, diagnose_terms):
         recipe_id, risk = "diagnose", 2.5
-    elif any(term in text for term in research_terms):
+    elif _contains_any(text, research_terms):
         recipe_id, risk = "research", 1.5
-    elif any(term in text for term in build_terms):
+    elif _contains_any(text, build_terms) or decomposable:
         recipe_id, risk = "build", 2.0
     else:
         recipe_id, risk = "single", 0.5
     _ = permissions_snapshot
     return _finalize_decision(
         recipe_id=recipe_id,
-        swarm_worthy=recipe_id != "single",
+        swarm_worthy=recipe_id != "single" or decomposable,
         risk_score=risk,
         needs_clarification=text in vague_exact or len(text) < 4,
         evidence_heavy=recipe_id in {"research", "diagnose"},
-        parallelizable=recipe_id in {"research", "diagnose"},
+        parallelizable=recipe_id in {"research", "diagnose"} or decomposable,
         planner_source="deterministic_fallback",
         degraded=True,
         degraded_reason=degraded_reason,
@@ -451,21 +484,30 @@ def normalize_plan(plan: Mapping[str, Any]) -> PlannerDecision:
     risk_score = coerce_risk_score(
         plan.get("risk_score", nested_risk.get("score", plan.get("risk_level", 7.0 if recipe_id == "sensitive" else 1.0)))
     )
-    clarify = bool(
+    clarify = coerce_bool_default(
         nested_clarification.get(
             "required", plan.get("needs_clarification", plan.get("needs_clarify", False))
-        )
+        ),
+        False,
+        "needs_clarification",
     )
     clarify_reasons = nested_clarification.get("reasons", ())
     if not isinstance(clarify_reasons, Sequence) or isinstance(clarify_reasons, (str, bytes, bytearray)):
         clarify_reasons = ()
 
+    nested_confirmation_required = coerce_bool_default(
+        nested_confirmation.get("required", False),
+        False,
+        "confirmation.required",
+    )
+    legacy_confirmation_required = coerce_bool_default(
+        plan.get("requires_confirmation", False),
+        False,
+        "requires_confirmation",
+    )
     explicit_confirmation = bool(
-        nested_confirmation.get("required", False)
-        or (
-            plan.get("requires_confirmation", False)
-            and not clarify
-        )
+        nested_confirmation_required
+        or (legacy_confirmation_required and not clarify)
     )
     confirm_reasons = nested_confirmation.get("reasons", plan.get("confirmation_reasons", ()))
     if not isinstance(confirm_reasons, Sequence) or isinstance(confirm_reasons, (str, bytes, bytearray)):
@@ -476,14 +518,24 @@ def normalize_plan(plan: Mapping[str, Any]) -> PlannerDecision:
         swarm_worthy=worthy,
         risk_score=risk_score,
         needs_clarification=clarify,
-        evidence_heavy=bool(plan.get("evidence_heavy", recipe_id in {"research", "diagnose"})),
-        parallelizable=bool(plan.get("parallelizable", recipe_id in {"research", "diagnose"})),
+        evidence_heavy=coerce_bool_default(
+            plan.get("evidence_heavy", recipe_id in {"research", "diagnose"}),
+            recipe_id in {"research", "diagnose"},
+            "evidence_heavy",
+        ),
+        parallelizable=coerce_bool_default(
+            plan.get("parallelizable", recipe_id in {"research", "diagnose"}),
+            recipe_id in {"research", "diagnose"},
+            "parallelizable",
+        ),
         clarification_reasons=clarify_reasons,
         confirmation_required=explicit_confirmation,
         confirmation_reasons=confirm_reasons,
         planner_source=str(plan.get("planner_source") or plan.get("planner") or plan.get("source") or "provided"),
         planner_confidence=plan.get("planner_confidence"),
-        degraded=bool(plan.get("degraded", False)),
+        degraded=coerce_bool_default(
+            plan.get("degraded", False), False, "degraded"
+        ),
         degraded_reason=plan.get("degraded_reason") or plan.get("fallback_reason"),
         max_parallel=int(plan.get("max_parallel", 3) or 3),
     )

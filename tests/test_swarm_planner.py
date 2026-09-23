@@ -118,6 +118,74 @@ class SwarmPlannerTests(unittest.TestCase):
         self.assertTrue(first["degraded"])
         self.assertTrue(first["swarm_worthy"])
 
+    def test_fallback_preserves_destructive_and_external_action_guards(self):
+        for goal in (
+            "rm -rf /srv/app",
+            "Deploy production now",
+            "Send email with the secret key",
+            "格式化磁盘并删库",
+        ):
+            with self.subTest(goal=goal):
+                plan = materialize_plan(deterministic_fallback(goal))
+                self.assertEqual(plan["recipe"], "sensitive")
+                self.assertGreaterEqual(plan["risk_score"], 6)
+                self.assertTrue(plan["requires_confirmation"])
+                self.assertEqual(plan["user_gate"]["kind"], "confirmation")
+
+    def test_fallback_does_not_match_sensitive_terms_inside_words(self):
+        plan = materialize_plan(
+            deterministic_fallback("Implement a JSON payload parser and explain the catalog schema")
+        )
+        self.assertEqual(plan["recipe"], "build")
+        self.assertLess(plan["risk_score"], 6)
+        self.assertFalse(plan["requires_confirmation"])
+
+    def test_fallback_keeps_long_compound_tasks_swarm_worthy(self):
+        goal = ("整理需求、设计接口、实现功能、编写测试以及核验结果；" * 12)
+        plan = materialize_plan(deterministic_fallback(goal))
+        self.assertTrue(plan["swarm_worthy"])
+        self.assertNotEqual(plan["recipe"], "single")
+        self.assertTrue(plan["parallelizable"])
+
+    def test_fallback_ambiguous_request_requires_clarification(self):
+        plan = materialize_plan(deterministic_fallback("帮我看看"))
+        self.assertTrue(plan["needs_clarification"])
+        self.assertEqual(plan["user_gate"]["kind"], "clarification")
+
+    def test_unknown_recipe_is_rejected_instead_of_silent_single_fallback(self):
+        with self.assertRaisesRegex(ValueError, "unknown recipe"):
+            normalize_plan({"recipe": "reseach", "swarm_worthy": True})
+        with self.assertRaisesRegex(ValueError, "unknown recipe"):
+            parse_jev_response({
+                "ok": True,
+                "answers": {
+                    "swarm_worthy": {"noul": 0.9},
+                    "recipe_id": {"choice": "reseach"},
+                    "needs_clarification": {"noul": 0.0},
+                    "risk_score": {"score": 1},
+                    "evidence_heavy": {"noul": 0.0},
+                    "parallelizable": {"noul": 0.0},
+                },
+            })
+
+    def test_legacy_string_booleans_are_coerced_by_value(self):
+        for value in ("false", "no", "0"):
+            with self.subTest(value=value):
+                decision = normalize_plan({
+                    "recipe": "build",
+                    "swarm_worthy": "true",
+                    "needs_clarify": value,
+                    "requires_confirmation": value,
+                    "evidence_heavy": value,
+                    "parallelizable": value,
+                    "degraded": value,
+                })
+                self.assertFalse(decision.needs_clarification)
+                self.assertFalse(decision.confirmation_required)
+                self.assertFalse(decision.evidence_heavy)
+                self.assertFalse(decision.parallelizable)
+                self.assertFalse(decision.degraded)
+
 
 if __name__ == "__main__":
     unittest.main()

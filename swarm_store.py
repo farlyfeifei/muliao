@@ -8,6 +8,7 @@ through ``asyncio.to_thread`` by a host that needs non-blocking disk I/O.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -296,7 +297,7 @@ class SwarmStore:
             )
 
             connection.execute("ALTER TABLE events RENAME TO events_v1")
-            connection.executescript(
+            connection.execute(
                 """
                 CREATE TABLE events (
                     db_seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -311,7 +312,7 @@ class SwarmStore:
                     UNIQUE (run_id, run_seq),
                     FOREIGN KEY (run_id, task_id)
                         REFERENCES runs(run_id, task_id) ON DELETE CASCADE
-                );
+                )
                 """
             )
             counters: dict[str, int] = {}
@@ -333,25 +334,56 @@ class SwarmStore:
                 )
             connection.execute("DROP TABLE events_v1")
 
-            capsule_columns = self._columns(connection, "capsules")
-            capsule_additions = {
-                "run_id": "TEXT",
-                "stage_id": "TEXT",
-                "attempt": "INTEGER NOT NULL DEFAULT 1",
-            }
-            for name, declaration in capsule_additions.items():
-                if name not in capsule_columns:
-                    connection.execute(f"ALTER TABLE capsules ADD COLUMN {name} {declaration}")
+            # Rebuild capsules: ALTER TABLE cannot add the v2 CHECK/foreign-key
+            # constraints, and upgraded databases must behave like fresh ones.
+            connection.execute("ALTER TABLE capsules RENAME TO capsules_v1")
             connection.execute(
                 """
-                UPDATE capsules SET status = CASE
-                    WHEN ack_status = 'accepted' THEN 'current'
-                    WHEN ack_status IN ('stale', 'conflicted') THEN ack_status
-                    WHEN ack_status IS NULL THEN 'pending'
-                    ELSE 'rejected'
-                END
+                CREATE TABLE capsules (
+                    capsule_id TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL,
+                    contract_rev INTEGER NOT NULL CHECK (contract_rev >= 1),
+                    run_id TEXT,
+                    stage_id TEXT,
+                    attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+                    from_bee TEXT NOT NULL,
+                    to_bee TEXT NOT NULL,
+                    body_json TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    ack_status TEXT,
+                    ack_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    depends_on_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (task_id, contract_rev)
+                        REFERENCES contracts(task_id, contract_rev),
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                )
                 """
             )
+            connection.execute(
+                """
+                INSERT INTO capsules(
+                    capsule_id, message_id, task_id, contract_rev, run_id,
+                    stage_id, attempt, from_bee, to_bee, body_json, sha256,
+                    ack_status, ack_json, status, depends_on_json, created_at
+                )
+                SELECT
+                    capsule_id, message_id, task_id, contract_rev, NULL,
+                    NULL, 1, from_bee, to_bee, body_json, sha256,
+                    ack_status, ack_json,
+                    CASE
+                        WHEN ack_status = 'accepted' THEN 'current'
+                        WHEN ack_status IN ('stale', 'conflicted') THEN ack_status
+                        WHEN ack_status IS NULL THEN 'pending'
+                        ELSE 'rejected'
+                    END,
+                    depends_on_json, created_at
+                FROM capsules_v1
+                """
+            )
+            connection.execute("DROP TABLE capsules_v1")
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except Exception:
@@ -437,6 +469,148 @@ class SwarmStore:
                 (task_id,),
             ).fetchone()
         return None if row["rev"] is None else int(row["rev"])
+
+    def register_run(
+        self,
+        contract: TaskContract,
+        run_id: str,
+        recipe_id: str,
+        *,
+        status: str = "queued",
+        session_id: str = "",
+        plan: Mapping[str, Any] | None = None,
+        confirmation: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Atomically persist an immutable contract and its run identity."""
+
+        body_json = contract.to_json()
+        body_hash = _body_sha256(contract)
+        if not contract.created_at:
+            raise ValueError("contract created_at is required for persistence")
+        now = utc_now()
+        plan_json = canonical_json(dict(plan or {}))
+        confirmation_json = canonical_json(dict(confirmation or {}))
+        with self.transaction() as connection:
+            existing_run = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing_run is not None:
+                same = (
+                    existing_run["task_id"] == contract.task_id
+                    and existing_run["recipe_id"] == recipe_id
+                    and int(existing_run["contract_rev"]) == contract.contract_rev
+                    and existing_run["session_id"] == session_id
+                    and existing_run["plan_json"] == plan_json
+                )
+                if not same:
+                    raise IdentityConflictError(f"run_id {run_id!r} is already bound")
+                stored_contract = connection.execute(
+                    """
+                    SELECT body_json, body_sha256 FROM contracts
+                    WHERE task_id = ? AND contract_rev = ?
+                    """,
+                    (contract.task_id, contract.contract_rev),
+                ).fetchone()
+                if (
+                    stored_contract is None
+                    or stored_contract["body_json"] != body_json
+                    or stored_contract["body_sha256"] != body_hash
+                ):
+                    raise ImmutableContractError(
+                        f"contract {contract.task_id}@{contract.contract_rev} differs from run"
+                    )
+                return False
+
+            current = connection.execute(
+                """
+                SELECT body_json, body_sha256 FROM contracts
+                WHERE task_id = ? AND contract_rev = ?
+                """,
+                (contract.task_id, contract.contract_rev),
+            ).fetchone()
+            if current is not None:
+                if current["body_json"] != body_json or current["body_sha256"] != body_hash:
+                    raise ImmutableContractError(
+                        f"contract {contract.task_id}@{contract.contract_rev} is immutable"
+                    )
+            else:
+                latest = connection.execute(
+                    "SELECT MAX(contract_rev) AS rev FROM contracts WHERE task_id = ?",
+                    (contract.task_id,),
+                ).fetchone()["rev"]
+                if latest is None and contract.contract_rev != 1:
+                    raise ImmutableContractError("first contract revision must be 1")
+                if latest is not None and contract.contract_rev != int(latest) + 1:
+                    raise ImmutableContractError(
+                        f"contract revision must follow {latest}, got {contract.contract_rev}"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO contracts(
+                        task_id, contract_rev, body_json, body_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        contract.task_id, contract.contract_rev, body_json,
+                        body_hash, contract.created_at,
+                    ),
+                )
+
+            connection.execute(
+                """
+                INSERT INTO runs(
+                    run_id, task_id, recipe_id, status, contract_rev, session_id,
+                    plan_json, confirmation_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id, contract.task_id, recipe_id, status,
+                    contract.contract_rev, session_id, plan_json,
+                    confirmation_json, now, now,
+                ),
+            )
+        return True
+
+    def confirm_run(
+        self,
+        run_id: str,
+        confirmation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Advance one waiting run without mutating its immutable plan."""
+
+        confirmation_json = canonical_json(dict(confirmation))
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT status, terminal_event_id FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"run not found: {run_id}")
+            if row["terminal_event_id"]:
+                raise IdentityConflictError(f"run {run_id!r} is already terminal")
+            if row["status"] not in {"requires_confirmation", "paused", "interrupted"}:
+                raise IdentityConflictError(
+                    f"run {run_id!r} cannot be confirmed from {row['status']}"
+                )
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = 'running', confirmation_json = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (confirmation_json, utc_now(), run_id),
+            )
+        state = self.get_run(run_id)
+        assert state is not None
+        return state
+
+    def next_run_seq(self, run_id: str) -> int:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(run_seq), 0) + 1 AS next FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row["next"])
 
     def create_run(
         self,
@@ -539,27 +713,59 @@ class SwarmStore:
         ts: float = 0.0,
         seq: int | None = None,
     ) -> SwarmEvent:
-        """Append one event while preserving its public run-local sequence."""
+        """Compatibility wrapper around :meth:`record_event`."""
 
-        if event is None:
-            if not all((event_id, run_id, task_id, event_type)):
-                raise ValueError("event_id, run_id, task_id, and event_type are required")
-            with self.connection() as connection:
+        persisted, _ = self.record_event(
+            event,
+            event_id=event_id,
+            run_id=run_id,
+            task_id=task_id,
+            event_type=event_type,
+            payload=payload,
+            ts=ts,
+            seq=seq,
+        )
+        return persisted
+
+    def record_event(
+        self,
+        event: SwarmEvent | None = None,
+        *,
+        event_id: str | None = None,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        event_type: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+        ts: float = 0.0,
+        seq: int | None = None,
+        run_status: str | None = None,
+    ) -> tuple[SwarmEvent, bool]:
+        """Atomically append an event and synchronize its run status.
+
+        The public sequence is contiguous per run. Exact replay is idempotent and
+        returns ``inserted=False``; any reused identity or skipped sequence fails.
+        """
+
+        with self.transaction() as connection:
+            if event is None:
+                if not all((event_id, run_id, task_id, event_type)):
+                    raise ValueError("event_id, run_id, task_id, and event_type are required")
                 if seq is None:
                     row = connection.execute(
                         "SELECT COALESCE(MAX(run_seq), 0) + 1 AS next FROM events WHERE run_id = ?",
                         (run_id,),
                     ).fetchone()
                     seq = int(row["next"])
-            event = SwarmEvent(
-                event_id=str(event_id), seq=int(seq), run_id=str(run_id),
-                task_id=str(task_id), type=str(event_type),
-                payload=dict(payload or {}), ts=float(ts),
-            )
-        payload_json = canonical_json(event.payload)
-        with self.transaction() as connection:
+                event = SwarmEvent(
+                    event_id=str(event_id), seq=int(seq), run_id=str(run_id),
+                    task_id=str(task_id), type=str(event_type),
+                    payload=dict(payload or {}), ts=float(ts),
+                )
+
+            payload_json = canonical_json(event.payload)
             run = connection.execute(
-                "SELECT task_id FROM runs WHERE run_id = ?", (event.run_id,)
+                "SELECT task_id, status, terminal_event_id FROM runs WHERE run_id = ?",
+                (event.run_id,),
             ).fetchone()
             if run is None:
                 raise KeyError(f"run not found: {event.run_id}")
@@ -571,8 +777,13 @@ class SwarmStore:
             ).fetchone()
             if by_id is not None:
                 if self._event_row_matches(by_id, event, payload_json):
-                    return self._event_from_row(by_id)
+                    return self._event_from_row(by_id), False
                 raise EventConflictError(f"event_id {event.event_id!r} has different content")
+            if run["terminal_event_id"]:
+                raise EventConflictError(
+                    f"run {event.run_id!r} is already terminal at {run['terminal_event_id']}"
+                )
+
             by_seq = connection.execute(
                 "SELECT * FROM events WHERE run_id = ? AND run_seq = ?",
                 (event.run_id, event.seq),
@@ -581,6 +792,16 @@ class SwarmStore:
                 raise EventConflictError(
                     f"run {event.run_id!r} sequence {event.seq} is already used"
                 )
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(run_seq), 0) AS latest FROM events WHERE run_id = ?",
+                (event.run_id,),
+            ).fetchone()
+            expected = int(latest["latest"]) + 1
+            if event.seq != expected:
+                raise EventConflictError(
+                    f"run {event.run_id!r} expected sequence {expected}, got {event.seq}"
+                )
+
             connection.execute(
                 """
                 INSERT INTO events(
@@ -593,7 +814,20 @@ class SwarmStore:
                     event.type, payload_json, event.ts, utc_now(),
                 ),
             )
-        return event
+            if run_status is not None:
+                terminal_event_id = event.event_id if run_status in {
+                    "completed", "cancelled", "failed", "skipped"
+                } else None
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, terminal_event_id = COALESCE(?, terminal_event_id),
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (run_status, terminal_event_id, utc_now(), event.run_id),
+                )
+        return event, True
 
     @staticmethod
     def _event_row_matches(row: sqlite3.Row, event: SwarmEvent, payload_json: str) -> bool:
@@ -804,19 +1038,47 @@ class SwarmStore:
                     raise DuplicateMessageError(
                         f"message_id {capsule.message_id!r} belongs to another capsule"
                     )
+                for field, supplied in (
+                    ("run_id", run_id),
+                    ("stage_id", stage_id),
+                ):
+                    stored = existing[field]
+                    if supplied is not None and stored is not None and str(stored) != str(supplied):
+                        raise DuplicateMessageError(
+                            f"message_id {capsule.message_id!r} changed {field}"
+                        )
+                if int(existing["attempt"]) != int(attempt):
+                    raise DuplicateMessageError(
+                        f"message_id {capsule.message_id!r} changed attempt"
+                    )
+
                 if existing["ack_json"]:
                     persisted = CapsuleAck.from_dict(json.loads(existing["ack_json"]))
-                    duplicate = CapsuleAck(
-                        message_id=persisted.message_id,
-                        capsule_id=persisted.capsule_id,
-                        status=persisted.status,
-                        reasons=tuple(persisted.reasons) + ("duplicate message_id",),
-                        missing=persisted.missing,
-                        checked_sha256=persisted.checked_sha256,
+                    if persisted.status == ack.status:
+                        duplicate = CapsuleAck(
+                            message_id=persisted.message_id,
+                            capsule_id=persisted.capsule_id,
+                            status=persisted.status,
+                            reasons=tuple(persisted.reasons) + ("duplicate message_id",),
+                            missing=persisted.missing,
+                            checked_sha256=persisted.checked_sha256,
+                            duplicate=True,
+                            checked_at=persisted.checked_at,
+                        )
+                        return False, duplicate, existing
+                    # Receiver state changed since the previous delivery. Persist
+                    # the fresh verdict; an old accepted ACK must not override a
+                    # new permission, expiry, conflict, or dependency rejection.
+                    ack = CapsuleAck(
+                        message_id=ack.message_id,
+                        capsule_id=ack.capsule_id,
+                        status=ack.status,
+                        reasons=tuple(ack.reasons) + ("duplicate revalidated",),
+                        missing=ack.missing,
+                        checked_sha256=ack.checked_sha256,
                         duplicate=True,
-                        checked_at=persisted.checked_at,
+                        checked_at=ack.checked_at,
                     )
-                    return False, duplicate, existing
                 connection.execute(
                     """
                     UPDATE capsules
@@ -862,28 +1124,60 @@ class SwarmStore:
             if cursor.rowcount != 1:
                 raise KeyError(f"capsule not found for message {ack.message_id!r}")
 
-    def dependency_states(self, dependency_ids: Sequence[str]) -> dict[str, str | None]:
+    def dependency_states(
+        self,
+        dependency_ids: Sequence[str],
+        *,
+        task_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, str | None]:
         states: dict[str, str | None] = {}
+        check_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         with self.connection() as connection:
             for dependency_id in dependency_ids:
                 fact = connection.execute(
-                    "SELECT state FROM facts WHERE fact_id = ?", (dependency_id,)
+                    "SELECT state, task_id, expires_at FROM facts WHERE fact_id = ?",
+                    (dependency_id,),
                 ).fetchone()
                 if fact is not None:
+                    if task_id is not None and str(fact["task_id"]) != str(task_id):
+                        states[dependency_id] = "forbidden"
+                        continue
+                    expires_at = fact["expires_at"]
+                    if expires_at:
+                        try:
+                            normalized = str(expires_at)
+                            if normalized.endswith("Z"):
+                                normalized = normalized[:-1] + "+00:00"
+                            expiry = datetime.fromisoformat(normalized)
+                            if expiry.tzinfo is None:
+                                expiry = expiry.replace(tzinfo=timezone.utc)
+                            if expiry.astimezone(timezone.utc) <= check_time:
+                                states[dependency_id] = "stale"
+                                continue
+                        except (TypeError, ValueError):
+                            states[dependency_id] = "incompatible"
+                            continue
                     states[dependency_id] = str(fact["state"])
                     continue
                 artifact = connection.execute(
-                    "SELECT status FROM artifacts WHERE artifact_id = ?", (dependency_id,)
+                    "SELECT status, task_id FROM artifacts WHERE artifact_id = ?",
+                    (dependency_id,),
                 ).fetchone()
                 if artifact is not None:
-                    states[dependency_id] = str(artifact["status"])
+                    if task_id is not None and str(artifact["task_id"]) != str(task_id):
+                        states[dependency_id] = "forbidden"
+                    else:
+                        states[dependency_id] = str(artifact["status"])
                     continue
                 capsule = connection.execute(
-                    "SELECT status, ack_status FROM capsules WHERE capsule_id = ?",
+                    "SELECT status, ack_status, task_id FROM capsules WHERE capsule_id = ?",
                     (dependency_id,),
                 ).fetchone()
                 if capsule is None:
                     states[dependency_id] = None
+                elif task_id is not None and str(capsule["task_id"]) != str(task_id):
+                    states[dependency_id] = "forbidden"
                 elif capsule["ack_status"] == "accepted":
                     states[dependency_id] = str(capsule["status"])
                 else:
@@ -902,11 +1196,26 @@ class SwarmStore:
                 (utc_now(), fact_id),
             )
 
+            invalidated_facts: set[str] = {fact_id}
             stale_artifacts: set[str] = set()
             stale_capsules: set[str] = set()
             frontier = {fact_id}
             while frontier:
                 next_frontier: set[str] = set()
+                for row in connection.execute(
+                    "SELECT fact_id, depends_on_json, state FROM facts"
+                ).fetchall():
+                    dependent_id = str(row["fact_id"])
+                    dependencies = set(json.loads(row["depends_on_json"]))
+                    if dependencies & frontier and dependent_id not in invalidated_facts:
+                        invalidated_facts.add(dependent_id)
+                        next_frontier.add(dependent_id)
+                        if row["state"] != "invalidated":
+                            connection.execute(
+                                "UPDATE facts SET state = 'invalidated', updated_at = ? WHERE fact_id = ?",
+                                (utc_now(), dependent_id),
+                            )
+
                 for row in connection.execute(
                     "SELECT artifact_id, depends_on_json, status FROM artifacts"
                 ).fetchall():
@@ -937,7 +1246,7 @@ class SwarmStore:
                 frontier = next_frontier
 
         return {
-            "facts": [fact_id],
+            "facts": sorted(invalidated_facts),
             "artifacts": sorted(stale_artifacts),
             "capsules": sorted(stale_capsules),
         }

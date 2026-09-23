@@ -36,6 +36,13 @@ from swarm_planner import (
 
 
 _TERMINAL_STATUSES = {"cancelled", "completed", "failed", "skipped"}
+_STREAM_TERMINAL_EVENTS = {
+    "swarm.done",
+    "swarm.error",
+    "swarm.cancelled",
+    "swarm.waiting_user",
+    "swarm.skipped",
+}
 
 
 class SwarmBackendUnavailable(RuntimeError):
@@ -258,6 +265,7 @@ class SwarmService:
             return
 
         self._update_run(run_id, status="running", started_at=time.time())
+        terminal_seen = False
         try:
             backend = await self._get_backend()
             handler = _find_run_handler(backend)
@@ -281,6 +289,7 @@ class SwarmService:
                     break
                 seq += 1
                 event = _normalize_event(raw_event, run_id, seq)
+                terminal_seen = terminal_seen or event["type"] in _STREAM_TERMINAL_EVENTS
                 self._record_event(run_id, event)
                 yield event
 
@@ -295,10 +304,25 @@ class SwarmService:
                 )
                 self._record_event(run_id, event)
                 yield event
-            else:
-                current = self.status(run_id).get("status")
-                if current not in {"failed", "cancelled", "paused", "requires_confirmation"}:
-                    self._update_run(run_id, status="completed", finished_at=time.time())
+            elif not terminal_seen:
+                self._update_run(
+                    run_id,
+                    status="failed",
+                    error="backend stream ended without a terminal event",
+                    finished_at=time.time(),
+                )
+                seq += 1
+                event = self._service_event(
+                    run_id,
+                    seq,
+                    "swarm.error",
+                    {
+                        "code": "missing_terminal",
+                        "error": "backend stream ended without a terminal event",
+                    },
+                )
+                self._record_event(run_id, event)
+                yield event
         except asyncio.CancelledError:
             self._update_run(run_id, status="cancelled", finished_at=time.time())
             raise
@@ -624,8 +648,10 @@ def _normalize_event(raw_event: Any, run_id: str, seq: int) -> dict[str, Any]:
     event_type = event.get("type") or event.get("event_type") or event.get("event") or "swarm.event"
     event["type"] = str(event_type)
     event.setdefault("event_id", f"evt_{uuid.uuid4().hex}")
-    event.setdefault("seq", seq)
-    event.setdefault("run_id", run_id)
+    # The service owns stream identity. Backend-supplied run/sequence values may
+    # come from a cached or foreign run and must never escape into this stream.
+    event["seq"] = int(seq)
+    event["run_id"] = str(run_id)
     event.setdefault("ts", time.time())
     event.setdefault("payload", {})
     return dict(_json_safe(event))
