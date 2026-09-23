@@ -40,15 +40,39 @@ function saveSessions() {
   try { localStorage.setItem(LS, JSON.stringify(sessions.slice(0, 60))); } catch {}
 }
 function cur() { return sessions.find((s) => s.id === curId); }
+function syncComposerDraft(session = cur()) {
+  const input = $("input");
+  if (!input) return;
+  input.value = session?.draft || "";
+  autoGrow(input);
+}
+function saveVisibleDraft() {
+  const session = cur();
+  const input = $("input");
+  if (session && input) session.draft = input.value;
+}
+function recoverSessionDraft(sessionId, text) {
+  const session = sessions.find((item) => item.id === sessionId);
+  const value = String(text || "");
+  if (!session || !value.trim()) return false;
+  const existing = String(session.draft || "");
+  session.draft = existing.trim() && existing !== value ? `${value}\n\n${existing}` : value;
+  saveSessions();
+  if (cur()?.id === sessionId) syncComposerDraft(session);
+  return true;
+}
 function newSession() {
-  const s = { id: "s" + Date.now(), title: "新会话", msgs: [], created: Date.now() };
+  saveVisibleDraft();
+  const s = { id: "s" + Date.now(), title: "新会话", msgs: [], draft: "", created: Date.now() };
   sessions.unshift(s); curId = s.id;
-  saveSessions(); renderSessions(); clearThread();
+  saveSessions(); renderSessions(); clearThread(); syncComposerDraft(s);
   $("topTitle").textContent = "新会话";
   gotoTab("insp");
   $("input").focus();
 }
 function titleFrom(text) { return text.replace(/\s+/g, " ").slice(0, 18) || "新会话"; }
+
+window.MuliaoDrafts = { recover: recoverSessionDraft };
 
 /* ================= 左栏 ================= */
 function renderSessions(filter = "") {
@@ -60,7 +84,14 @@ function renderSessions(filter = "") {
        <span class="nm">${esc(s.title)}</span><span class="cnt">${s.msgs.length}</span>
      </button>`).join("") || `<div class="sess-none">${f ? "没有匹配的会话" : "暂无会话"}</div>`;
   box.querySelectorAll(".sess[data-id]").forEach((el) => {
-    el.onclick = () => { curId = el.dataset.id; renderSessions($("search").value); renderThread(); gotoTab("insp"); };
+    el.onclick = () => {
+      saveVisibleDraft();
+      curId = el.dataset.id;
+      renderSessions($("search").value);
+      renderThread();
+      syncComposerDraft();
+      gotoTab("insp");
+    };
   });
 }
 
@@ -151,7 +182,7 @@ function clearThread() {
   $("judgebar").innerHTML = "";
   $("insp").innerHTML = `<div class="insp-empty">发送消息后，这里显示这一回合的逐项判断与置信度，以及答完后的复核结论。</div>`;
   $("cachePane").innerHTML = `<div class="insp-empty">发送消息后，这里显示 prompt 缓存命中率（稳态 ≥90% 为达标）。</div>`;
-  setBusy(false, "就绪");
+  if (!window.MuliaoRunControl?.current) setBusy(false, "就绪");
 }
 
 function renderThread() {
@@ -269,10 +300,11 @@ function renderJudgePanel(j) {
   const sec = document.createElement("div");
   sec.className = "insp-section";
   if (!j || !j.ok) {
+    const title = judgeFailure(j?.code, "Jev 判断未完成");
     sec.innerHTML = `<div class="sec-title">回合前 · 快判断</div>
-      <div class="chk"><div class="ct"><b>Jev 未返回</b><span class="gate esc">降级</span></div>
-      <div class="ans">${esc(j?.err || "判断引擎不可用")}</div>
-      <div class="conf-line" style="color:var(--dimmer);font-size:11px">本回合按「无判断」继续作答，不影响对话。</div></div>`;
+      <div class="chk"><div class="ct"><b>${esc(title)}</b><span class="gate esc">降级</span></div>
+      <div class="ans">${esc(judgeErrorText(j, "判断引擎暂时不可用"))}</div>
+      <div class="conf-line" style="color:var(--dimmer);font-size:11px">本回合按「无判断」继续作答；瞬时错误会自动重试一次。</div></div>`;
     return sec;
   }
   sec.innerHTML = `<div class="sec-title">回合前 · 快判断 <span class="ms">${j.ms}ms · ${j.model || "jev"}</span></div>`;
@@ -297,7 +329,7 @@ function renderReview(rv, usage) {
   if (!sec) { sec = document.createElement("div"); sec.className = "insp-section review-section"; $("insp").appendChild(sec); }
   if (!rv || !rv.ok) {
     sec.innerHTML = `<div class="sec-title">回合后 · 复核</div>
-      <div class="review-box"><div class="verdict flag">✕ Jev 复核未完成：${esc(rv?.err || "判断引擎不可用")}</div></div>`;
+      <div class="review-box"><div class="verdict flag">✕ ${esc(judgeErrorText(rv, "Jev 复核未完成"))}</div></div>`;
     return;
   }
   const a = rv.answers || {};
@@ -374,7 +406,10 @@ function renderCache(c) {
 }
 
 /* ================= 状态轮询 ================= */
+let statusPollInFlight = false;
 async function pollStatus() {
+  if (statusPollInFlight) return;
+  statusPollInFlight = true;
   try {
     const s = await (await fetch("/api/status")).json();
     $("val-llm").textContent = s.model || "—";
@@ -398,6 +433,7 @@ async function pollStatus() {
       hideTopup();
     }
   } catch {}
+  finally { statusPollInFlight = false; }
 }
 
 function showTopup(url, err, isError) {
@@ -426,7 +462,81 @@ const TOOL_CN = {
   get_running_processes: "读进程列表", get_recent_notifications: "读系统通知",
   get_browser_history: "读浏览器历史", get_recent_files: "读文件清单",
   search_ai_logs: "检索 AI 对话",
+  // 电脑控制能力（执行动作）
+  list_windows: "列出窗口", focus_window: "聚焦窗口", close_window: "关闭窗口",
+  open_application: "打开应用", click_element: "点击控件", type_text: "输入文字",
+  press_keys: "发送按键",
 };
+
+// 按 tool_call id 精确定位工具行（同名工具多次调用不会错行）；退化到 data-name。
+function findToolRow(box, callId, name) {
+  if (!box) return null;
+  if (callId) {
+    const byId = box.querySelector(`.toolrow[data-callid="${callId}"]`);
+    if (byId) return byId;
+  }
+  const rows = box.querySelectorAll(`.toolrow[data-name="${name}"]`);
+  return rows[rows.length - 1] || null;
+}
+
+/* ---- 高风险动作确认弹窗（Jev 门控判定 confirm 时弹出）---- */
+let openConfirmId = null;          // 当前打开的 confirm_id，供暂停/断流时按拒绝收尾
+let confirmCountdown = null;
+
+function openConfirmDialog(ev) {
+  const ov = $("confirmOverlay");
+  if (!ov) return;
+  openConfirmId = ev.confirm_id;
+  $("confirmTool").textContent = ev.cn || TOOL_CN[ev.name] || ev.name || "未知动作";
+  const risk = Number(ev.risk ?? 0);
+  $("confirmRisk").textContent = `${risk.toFixed(1)} / 10（≥6 需确认）`;
+  $("confirmReason").textContent = ev.reason || "Jev 判定为高风险动作";
+  let argsText = "—";
+  try { argsText = JSON.stringify(ev.args ?? {}, null, 2); } catch { argsText = String(ev.args ?? ""); }
+  $("confirmArgs").textContent = argsText.slice(0, 1200);
+  ov.hidden = false;
+  // 倒计时（纯提示；真正的超时以服务端 _CONFIRM_TIMEOUT 为准）
+  const totalMs = Number(ev.timeout_ms || 120000);
+  let remain = Math.round(totalMs / 1000);
+  const allowBtn = $("confirmAllow");
+  const denyBtn = $("confirmDeny");
+  allowBtn.disabled = false; denyBtn.disabled = false;
+  allowBtn.textContent = `允许执行（${remain}s）`;
+  if (confirmCountdown) clearInterval(confirmCountdown);
+  confirmCountdown = setInterval(() => {
+    remain -= 1;
+    if (remain <= 0) { clearInterval(confirmCountdown); confirmCountdown = null; }
+    else allowBtn.textContent = `允许执行（${remain}s）`;
+  }, 1000);
+  allowBtn.focus();
+}
+
+function closeConfirmDialog() {
+  const ov = $("confirmOverlay");
+  if (ov) ov.hidden = true;
+  if (confirmCountdown) { clearInterval(confirmCountdown); confirmCountdown = null; }
+  openConfirmId = null;
+}
+
+async function submitConfirm(decision) {
+  const confirmId = openConfirmId;
+  const allowBtn = $("confirmAllow"), denyBtn = $("confirmDeny");
+  if (allowBtn) allowBtn.disabled = true;
+  if (denyBtn) denyBtn.disabled = true;
+  if (!confirmId) { closeConfirmDialog(); return; }
+  try {
+    await fetch("/api/chat/confirm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm_id: confirmId, decision }),
+    });
+  } catch { /* 流可能已断；服务端会按断流兜底拒绝 */ }
+  closeConfirmDialog();
+}
+
+// 暂停/断流时，若有打开的确认框，按拒绝收掉（不静默放行控制动作）。
+function denyOpenConfirm() {
+  if (openConfirmId) { submitConfirm("deny"); }
+}
 
 async function loadNotifications(light) {
   const list = $("notifyList"), btn = $("notifyRefresh");
@@ -553,32 +663,134 @@ function stopNotifyAuto() { if (notifyTimer) { clearInterval(notifyTimer); notif
 
 /* ================= 发送一个回合 ================= */
 let busy = false;
+let activeChat = null;
 
-async function sendTurn(text) {
-  if (busy || !text.trim()) return;
-  busy = true; $("send").disabled = true;
+function judgeFailure(code, fallback = "Jev 判断暂时不可用") {
+  const labels = {
+    timeout: "Jev 请求超时",
+    rate_limit: "Jev 暂时限流",
+    auth: "Jev 鉴权失败",
+    quota: "Jev 额度不足",
+    network: "Jev 网络异常",
+    bad_response: "Jev 返回格式异常",
+    upstream: "Jev 上游异常",
+  };
+  return labels[code] || fallback;
+}
+
+function judgeErrorText(result, fallback) {
+  const title = judgeFailure(result?.code, fallback);
+  const detail = String(result?.err || "").trim();
+  return detail && detail !== title ? `${title}：${detail}` : title;
+}
+
+function snapshotTurn(session) {
+  return {
+    length: session.msgs.length,
+    title: session.title,
+    lastJudge: session.lastJudge,
+    lastReview: session.lastReview,
+    lastCache: session.lastCache,
+    lastUsage: session.lastUsage,
+  };
+}
+
+function restoreTurn(session, snapshot) {
+  session.msgs.splice(snapshot.length);
+  session.title = snapshot.title;
+  for (const key of ["lastJudge", "lastReview", "lastCache", "lastUsage"]) {
+    if (snapshot[key] === undefined) delete session[key];
+    else session[key] = snapshot[key];
+  }
+}
+
+async function sendTurn(text, options = {}) {
+  const value = String(text || "");
+  if (busy || !value.trim()) return false;
   if (!cur()) newSession();
   const s = cur();
-  if (s.msgs.length === 0) { s.title = titleFrom(text); $("topTitle").textContent = s.title; renderSessions($("search").value); }
+  if (!s) return false;
+
+  const snapshot = snapshotTurn(s);
+  const controller = new AbortController();
+  const run = {
+    controller,
+    operation: options.operation || null,
+    sessionId: s.id,
+    stopRequested: false,
+    serverDone: false,
+  };
+  const stopRun = async () => {
+    if (activeChat !== run) return false;
+    run.stopRequested = true;
+    // 暂停时若确认框开着，按拒绝收掉——绝不静默放行控制动作。
+    denyOpenConfirm();
+    setBusy(true, "正在暂停本次运行…");
+    controller.abort();
+    return true;
+  };
+  run.stop = stopRun;
+
+  if (run.operation) {
+    if (!window.MuliaoRunControl?.isActive(run.operation)) return false;
+    window.MuliaoRunControl.update(run.operation, { kind: "chat", onStop: stopRun });
+  } else {
+    run.operation = window.MuliaoRunControl?.begin("chat", stopRun) || null;
+    if (!run.operation) return false;
+  }
+
+  busy = true;
+  activeChat = run;
+  if (s.msgs.length === 0) {
+    s.title = titleFrom(value);
+    if (cur()?.id === s.id) $("topTitle").textContent = s.title;
+    renderSessions($("search").value);
+  }
+  s.draft = "";
+  if (cur()?.id === s.id) syncComposerDraft(s);
+  delete s.lastJudge;
+  delete s.lastReview;
+  delete s.lastCache;
+  delete s.lastUsage;
 
   $("empty").style.display = "none";
   $("insp").innerHTML = "";
   setBusy(true, "幕僚处理中…");
 
-  s.msgs.push({ role: "user", text });
-  $("thread").appendChild(msgEl("user", text)); scrollBottom();
+  s.msgs.push({ role: "user", text: value });
+  $("thread").appendChild(msgEl("user", value));
+  scrollBottom();
 
-  // ① 回合前快判断（不阻塞作答，并行触发）
   renderJudgeLoading();
   const judgeP = fetch("/api/judge", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ state: text, kind: "judge" }),
-  }).then((r) => r.json()).then((j) => {
-    s.lastJudge = j; renderJudgeBar(j); $("insp").appendChild(renderJudgePanel(j));
-    return j;
-  }).catch(() => null);
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state: value, kind: "judge" }),
+    signal: controller.signal,
+  }).then(async (response) => {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  }).then((judge) => {
+    if (activeChat !== run || run.stopRequested) return null;
+    s.lastJudge = judge;
+    if (cur()?.id === run.sessionId) {
+      renderJudgeBar(judge);
+      $("insp").appendChild(renderJudgePanel(judge));
+    }
+    return judge;
+  }).catch((error) => {
+    if (error?.name === "AbortError") return null;
+    const judge = { ok: false, code: "network", err: `本地判断请求失败：${error?.message || error}` };
+    if (activeChat === run && !run.stopRequested) {
+      s.lastJudge = judge;
+      if (cur()?.id === run.sessionId) {
+        renderJudgeBar(judge);
+        $("insp").appendChild(renderJudgePanel(judge));
+      }
+    }
+    return judge;
+  });
 
-  // ② 模型流式作答
   const aEl = msgEl("assistant", "", { think: "" });
   $("thread").appendChild(aEl);
   const body = aEl.querySelector(".msg-body");
@@ -586,34 +798,45 @@ async function sendTurn(text) {
   const tk = aEl._think;
   tk.querySelector(".think-head").onclick = () => { tk.dataset.userToggled = "1"; tk.classList.toggle("open"); };
 
-  // 不拼 system（后端注入稳定 SYSTEM_PROMPT，保证前缀逐字节一致）；历史严格只增不删
   const payload = { messages: s.msgs.map((m) => ({ role: m.role, content: m.text })), session_id: s.id };
-
   let acc = "", think = "", thinkStart = null, usage = null;
-  let toolBox = null;                 // 工具调用可视化容器（首次调用时创建）
+  let emptyResponse = false;
+  let streamError = null;
+  let toolBox = null;
   const ensureToolBox = () => {
     if (!toolBox) {
       toolBox = document.createElement("div");
       toolBox.className = "toolbox";
-      tk.after(toolBox);              // 放在思考块之后、正文之前
+      tk.after(toolBox);
     }
     return toolBox;
   };
+
   try {
     const resp = await fetch("/api/chat", {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.body) throw new Error("对话事件流不可用");
+    const contentType = resp.headers?.get?.("content-type") || "";
+    if (contentType && !contentType.includes("text/event-stream")) throw new Error("对话事件流格式错误");
+
     const reader = resp.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value: chunk } = await reader.read();
       if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split("\n"); buf = lines.pop();
+      buf += dec.decode(chunk, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
       for (const line of lines) {
         if (!line.startsWith("data:")) continue;
-        let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (activeChat !== run || run.stopRequested) continue;
         if (ev.type === "reasoning") {
           if (thinkStart === null) { thinkStart = performance.now(); setBusy(true, "模型思考中…"); }
           think += ev.text;
@@ -621,74 +844,158 @@ async function sendTurn(text) {
           scrollBottom();
         } else if (ev.type === "delta") {
           if (!thinkStart) thinkStart = performance.now();
-          acc += ev.text; body.textContent = acc; scrollBottom();
+          acc += ev.text;
+          body.textContent = acc;
+          scrollBottom();
           setBusy(true, "幕僚作答中…");
         } else if (ev.type === "tool_call") {
-          // 幕僚正在读你的电脑——这是「授权真的生效」最直观的证据
           const box = ensureToolBox();
           const row = document.createElement("div");
           row.className = "toolrow";
           row.dataset.name = ev.name;
+          row.dataset.callid = ev.id || "";
           row.innerHTML = `<span class="tr-ico spin"><svg><use href="#i-bolt"/></svg></span>
             <span class="tr-name">${esc(TOOL_CN[ev.name] || ev.name)}</span>
-            <span class="tr-state">读取中…</span>`;
+            <span class="tr-state">Jev 门控中…</span>`;
           box.appendChild(row);
           setBusy(true, "读取本机数据…");
           scrollBottom();
+        } else if (ev.type === "tool_gate") {
+          // Jev 对这次动作的裁决——「Jev 参与每次行为」的可见证据
+          const box = ensureToolBox();
+          const row = findToolRow(box, ev.id, ev.name);
+          if (row) {
+            const st = row.querySelector(".tr-state");
+            row.classList.remove("gated-allow", "gated-confirm", "gated-deny");
+            const riskTxt = `风险 ${Number(ev.risk ?? 0).toFixed(1)}`;
+            if (ev.action === "allow") {
+              row.classList.add("gated-allow");
+              if (st) st.textContent = ev.source === "fallback" ? `Jev 不可用 · 降级放行 · ${riskTxt}` : `Jev 放行 · ${riskTxt}`;
+            } else if (ev.action === "confirm") {
+              row.classList.add("gated-confirm");
+              if (st) st.textContent = `Jev ${riskTxt} · 待确认`;
+            } else {
+              row.classList.add("gated-deny");
+              row.querySelector(".tr-ico")?.classList.remove("spin");
+              if (st) st.textContent = ev.source === "fail_closed" ? `Jev 不可用 · 已拒绝` : `Jev 拒绝`;
+            }
+          }
+        } else if (ev.type === "tool_confirm") {
+          openConfirmDialog(ev);
         } else if (ev.type === "tool_result") {
           const box = ensureToolBox();
-          const rows = box.querySelectorAll(`.toolrow[data-name="${ev.name}"]`);
-          const row = rows[rows.length - 1];
+          const row = findToolRow(box, ev.id, ev.name);
           if (row) {
             row.querySelector(".tr-ico").classList.remove("spin");
             const st = row.querySelector(".tr-state");
             st.textContent = ev.denied ? "未授权 · 已拒绝" : `${ev.ms}ms · ${(ev.bytes / 1024).toFixed(1)}KB`;
-            row.classList.add(ev.denied ? "denied" : "ok");
+            if (!row.classList.contains("gated-confirm") && !row.classList.contains("gated-deny")) {
+              row.classList.add(ev.denied ? "denied" : "ok");
+            } else if (ev.denied) {
+              row.classList.add("denied");
+            }
           }
         } else if (ev.type === "notice") {
           const box = ensureToolBox();
-          const n = document.createElement("div");
-          n.className = "toolnotice";
-          n.textContent = "ⓘ " + ev.message;
-          box.appendChild(n);
-        } else if (ev.type === "cache") { s.lastCache = ev.cache; renderCache(ev.cache); }
-        else if (ev.type === "usage") { usage = ev.usage; }
-        else if (ev.type === "empty_response") {
+          const notice = document.createElement("div");
+          notice.className = "toolnotice";
+          notice.textContent = "ⓘ " + ev.message;
+          box.appendChild(notice);
+        } else if (ev.type === "cache") {
+          s.lastCache = ev.cache;
+          if (cur()?.id === run.sessionId) renderCache(ev.cache);
+        } else if (ev.type === "usage") {
+          usage = ev.usage;
+        } else if (ev.type === "empty_response") {
+          emptyResponse = true;
           if (!acc.trim()) body.textContent = "（模型这次没有返回内容，请重发一次）";
-        } else if (ev.type === "error") { acc += `\n[出错] ${ev.message}`; body.textContent = acc; }
+        } else if (ev.type === "error") {
+          streamError = new Error(ev.message || "对话上游出错");
+          body.textContent = `[出错] ${streamError.message}`;
+        } else if (ev.type === "done") {
+          run.serverDone = true;
+          try { await reader.cancel(); } catch {}
+          buf = "";
+          break;
+        }
       }
+      if (run.serverDone) break;
     }
-  } catch (e) {
-    acc += `\n[连接失败] ${e.message}`; body.textContent = acc;
+    if (!run.serverDone) throw streamError || new Error("对话事件流意外中断");
+  } catch (error) {
+    if (!run.serverDone && !(error?.name === "AbortError" && run.stopRequested)) {
+      streamError = error;
+      body.textContent = `[连接失败] ${error?.message || error}`;
+    }
   }
+
   body.classList.remove("cursor");
   const thinkMs = thinkStart ? Math.round(performance.now() - thinkStart) : 0;
   setThinkDone(tk, think, thinkMs);
-  if (!acc.trim()) body.textContent = "（无回复）";
 
-  const last = s.msgs[s.msgs.length - 1];
-  if (last.role === "assistant") { last.text = acc; last.think = think; last.thinkMs = thinkMs; }
-  else s.msgs.push({ role: "assistant", text: acc, think, thinkMs });
-  s.lastUsage = usage;
+  try {
+  if (!run.serverDone) {
+      controller.abort();
+      restoreTurn(s, snapshot);
+      recoverSessionDraft(run.sessionId, value);
+      saveSessions();
+      renderSessions($("search").value);
+      updateCounts();
+      if (cur()?.id === s.id) renderThread();
+      setBusy(false, run.stopRequested ? "本次运行已暂停" : `运行中断：${streamError?.message || "未收到完成信号"}`);
+      return false;
+    }
 
-  await judgeP;
+    if (!acc.trim()) body.textContent = emptyResponse ? "（模型这次没有返回内容，请重发一次）" : "（无回复）";
+    s.msgs.push({ role: "assistant", text: acc, think, thinkMs });
+    s.lastUsage = usage;
+    window.MuliaoRunControl?.update(run.operation, { kind: "chat-review", onStop: stopRun });
 
-  // ③ 回合后复核
-  if (acc.trim() && text.trim()) {
-    setBusy(true, "Jev 复核中…");
-    try {
-      const rv = await (await fetch("/api/judge", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ state: `用户问题：${text.slice(0, 500)}\n\n幕僚回复：${acc.slice(0, 1200)}`, kind: "review" }),
-      })).json();
-      s.lastReview = rv; renderReview(rv, usage);
-    } catch {}
+    await judgeP;
+    if (!run.stopRequested && acc.trim() && value.trim()) {
+      setBusy(true, "Jev 复核中…");
+      try {
+        const response = await fetch("/api/judge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ state: `用户问题：${value.slice(0, 500)}\n\n幕僚回复：${acc.slice(0, 1200)}`, kind: "review" }),
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const review = await response.json();
+        if (activeChat === run && !run.stopRequested) {
+          s.lastReview = review;
+          if (cur()?.id === run.sessionId) renderReview(review, usage);
+        }
+      } catch (error) {
+        if (error?.name !== "AbortError" && activeChat === run) {
+          const review = { ok: false, code: "network", err: `本地复核请求失败：${error?.message || error}` };
+          s.lastReview = review;
+          if (cur()?.id === run.sessionId) renderReview(review, usage);
+        }
+      }
+    }
+
+    saveSessions();
+    renderSessions($("search").value);
+    updateCounts();
+    setBusy(false, run.stopRequested ? "回复已完成，复核已暂停" : "就绪");
+    return true;
+  } finally {
+    if (activeChat === run) activeChat = null;
+    busy = false;
+    // 回合结束（成功/暂停/错误）都兜底关掉确认框，绝不留下悬挂弹窗。
+    closeConfirmDialog();
+    window.MuliaoRunControl?.finish(run.operation);
+    $("input").focus();
   }
-
-  saveSessions(); renderSessions($("search").value); updateCounts();
-  setBusy(false, "就绪");
-  busy = false; $("send").disabled = false; $("input").focus();
 }
+
+window.MuliaoChat = {
+  sendTurn,
+  cancelActive: () => activeChat?.stop?.() ?? false,
+  get active() { return activeChat; },
+};
 
 /* ================= 输入框 ================= */
 function autoGrow(el) { el.style.height = "auto"; el.style.height = Math.min(190, el.scrollHeight) + "px"; }
@@ -697,9 +1004,12 @@ function autoGrow(el) { el.style.height = "auto"; el.style.height = Math.min(190
 const PERM_ICON = {
   notifications: "i-bell", processes: "i-cpu", windows: "i-monitor",
   browser: "i-globe", ai_logs: "i-brain", files: "i-doc", system: "i-gauge",
+  computer_control: "i-cursor", voice_control: "i-bolt",
 };
 let permSources = [];
+let permCaps = [];
 let permSel = {};
+let capSel = {};
 let permWasAgreed = false;
 
 async function openPermOverlay() {
@@ -713,11 +1023,15 @@ async function openPermOverlay() {
   try {
     const d = await (await fetch("/api/permissions")).json();
     permSources = d.sources || [];
+    permCaps = d.capabilities || [];
     permWasAgreed = !!d.consent?.agreed;
     $("permLater").innerHTML = permWasAgreed ? `取消<span class="hint">不保存本次改动</span>` : `稍后再说<span class="hint">仅用对话，不采集</span>`;
     permSel = {};
     for (const s of permSources) permSel[s.id] = !!s.granted;
+    capSel = {};
+    for (const c of permCaps) capSel[c.id] = !!c.granted;
     renderPermList();
+    renderPermCaps();
     $("permAgree").checked = permWasAgreed;
     syncPermActions();
   } catch (e) {
@@ -756,6 +1070,57 @@ function renderPermList() {
     };
   });
   syncPermActions();
+}
+
+function renderPermCaps() {
+  const list = $("permCapList");
+  if (!list) return;
+  if (!permCaps.length) { list.innerHTML = ""; return; }
+  list.innerHTML = permCaps.map((c) => {
+    const on = !!capSel[c.id];
+    const avail = c.available !== false;
+    const icon = PERM_ICON[c.id] || "i-bolt";
+    return `<button type="button" class="perm-item cap ${on ? "on" : ""} ${avail ? "" : "unavail"}" data-id="${c.id}"
+      role="switch" aria-checked="${on}" ${avail ? "" : "disabled"}>
+      <span class="pi-ico"><svg><use href="#${icon}"/></svg></span>
+      <span class="pi-txt">
+        <span class="pi-name">${esc(c.name)}
+          ${c.sensitive ? `<i class="pi-tag">敏感</i>` : ""}
+          ${avail ? `<i class="pi-tag ok">本机可用</i>` : `<i class="pi-tag">本机不可用</i>`}
+        </span>
+        <span class="pi-desc">${esc(c.desc)}</span>
+        <span class="pi-detail">${esc(c.detail || "")}</span>
+        ${c.note ? `<span class="pi-note">⚠ ${esc(c.note)}</span>` : ""}
+      </span>
+      <span class="switch" aria-hidden="true"></span>
+    </button>`;
+  }).join("");
+  list.querySelectorAll(".perm-item").forEach((el) => {
+    el.onclick = async () => {
+      const cap = permCaps.find((x) => x.id === el.dataset.id);
+      if (!cap || cap.available === false) return;   // 本机不可用的能力不让开
+      const next = !capSel[el.dataset.id];
+      el.disabled = true;
+      try {
+        // 能力开关走 /scope（agree 只接受数据类 scope），即时生效。
+        const r = await fetch("/api/permissions/scope", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope: cap.id, on: next }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        capSel[el.dataset.id] = next;
+        cap.granted = next;
+        el.classList.toggle("on", next);
+        el.setAttribute("aria-checked", String(next));
+        pollStatus();
+        updatePermHint();
+      } catch (e) {
+        alert(`切换失败：${e.message}`);
+      } finally {
+        el.disabled = !(cap.available !== false);
+      }
+    };
+  });
 }
 
 function syncPermActions() {
@@ -814,7 +1179,21 @@ function initPerm() {
     afterGrant();
   };
   $("privacyBtn").onclick = openPermOverlay;
+
+  // 高风险动作确认弹窗
+  const allowBtn = $("confirmAllow"), denyBtn = $("confirmDeny"), cov = $("confirmOverlay");
+  if (allowBtn) allowBtn.onclick = () => submitConfirm("allow");
+  if (denyBtn) denyBtn.onclick = () => submitConfirm("deny");
+  if (cov) cov.addEventListener("mousedown", (e) => { if (e.target === cov) submitConfirm("deny"); });
 }
+
+// Esc 拒绝确认弹窗（仅当弹窗打开时）
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $("confirmOverlay") && !$("confirmOverlay").hidden) {
+    e.preventDefault();
+    submitConfirm("deny");
+  }
+});
 
 // 授权完成后：刷新引擎状态、按授权情况决定通知面板能否抓
 function afterGrant() {
@@ -840,7 +1219,7 @@ function updatePermHint() {
 /* ================= 启动 ================= */
 loadSessions();
 if (!sessions.length) newSession(); else { curId = sessions[0].id; renderSessions(); renderThread(); }
-pollStatus(); setInterval(pollStatus, 2500);
+pollStatus(); setInterval(pollStatus, 10000);
 updateCounts(); setInterval(updateCounts, 3000);
 
 initTabs();
@@ -848,10 +1227,36 @@ initNotify();
 initPerm();
 
 $("newChat").onclick = newSession;
-$("send").onclick = () => { const v = $("input").value; $("input").value = ""; autoGrow($("input")); sendTurn(v); };
-$("input").addEventListener("input", (e) => autoGrow(e.target));
+async function dispatchGoal(text) {
+  const value = String(text || "");
+  if (!value.trim()) return false;
+  if (window.MuliaoSwarm?.planGoal) return window.MuliaoSwarm.planGoal(value);
+  return sendTurn(value);
+}
+$("send").onclick = async () => {
+  const control = window.MuliaoRunControl;
+  if (control && control.mode !== "send") {
+    try { await control.stop(); } catch (error) { setBusy(false, `暂停失败：${error?.message || error}`); }
+    return;
+  }
+  const value = $("input").value;
+  if (!value.trim()) return;
+  const session = cur();
+  if (session) session.draft = "";
+  $("input").value = "";
+  autoGrow($("input"));
+  await dispatchGoal(value);
+};
+$("input").addEventListener("input", (e) => {
+  autoGrow(e.target);
+  if (cur()) cur().draft = e.target.value;
+});
 $("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send").click(); }
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (!window.MuliaoRunControl || window.MuliaoRunControl.mode === "send") $("send").click();
+  }
 });
 $("search").addEventListener("input", (e) => renderSessions(e.target.value));
 $("topTitleBtn").onclick = () => {
@@ -859,7 +1264,10 @@ $("topTitleBtn").onclick = () => {
   if (t != null && t.trim() && cur()) { cur().title = t.trim().slice(0, 40); $("topTitle").textContent = cur().title; saveSessions(); renderSessions($("search").value); }
 };
 document.querySelectorAll(".seed").forEach((b) => {
-  b.onclick = () => { const t = b.querySelector("span").textContent; sendTurn(t); };
+  b.onclick = async () => {
+    if (window.MuliaoRunControl && window.MuliaoRunControl.mode !== "send") return;
+    await dispatchGoal(b.querySelector("span").textContent);
+  };
 });
 
 // 快捷键：Ctrl/Cmd+N 新建会话，Ctrl/Cmd+K 聚焦搜索

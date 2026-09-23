@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import importlib
 import inspect
 import json
 import time
@@ -22,98 +21,34 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
-ROLE_POOL: tuple[str, ...] = (
-    "compiler",
-    "investigator",
-    "extractor",
-    "builder",
-    "verifier",
-    "integrator",
+from capsule import build_handoff_capsule
+from swarm_models import CapsuleAck, SwarmEvent, TaskContract, WorkCapsule
+from swarm_persistence import SwarmLedger
+from swarm_store import SwarmStore
+
+from swarm_planner import (
+    RECIPES,
+    RECIPE_STAGES,
+    ROLE_POOL,
+    SWARM_PLAN_QUESTIONS,
+    deterministic_fallback,
+    evaluate_user_gate,
+    materialize_plan,
+    normalize_plan,
+    parse_jev_response,
+    plan_for_recipe,
+    recipe_stages,
+    risk_gate,
 )
 
-# 每个元组是一阶段；同一阶段中的蜂并行。仅使用固定角色池。
-_RECIPE_STAGES: dict[str, tuple[tuple[str, ...], ...]] = {
-    "single": (("integrator",),),
-    "research": (
-        ("compiler",),
-        ("investigator", "extractor"),
-        ("verifier",),
-        ("integrator",),
-    ),
-    # 固定角色池里没有 code_diagnoser，因此 builder 在第二阶段承担代码诊断职责。
-    "diagnose": (
-        ("compiler",),
-        ("investigator", "builder"),
-        ("verifier",),
-        ("integrator",),
-    ),
-    "build": (
-        ("compiler",),
-        ("investigator",),
-        ("builder",),
-        ("verifier",),
-        ("integrator",),
-    ),
-    "sensitive": (
-        ("compiler",),
-        ("investigator",),
-        ("builder",),
-        ("verifier",),
-        ("integrator",),
-    ),
-}
-
-RECIPES: dict[str, dict[str, Any]] = {
-    recipe_id: {
-        "id": recipe_id,
-        "stages": [list(stage) for stage in stages],
-    }
-    for recipe_id, stages in _RECIPE_STAGES.items()
-}
-
-SWARM_PLAN_QUESTIONS: dict[str, dict[str, Any]] = {
-    "swarm_worthy": {
-        "type": "noul",
-        "instructions": "Is this task worth a multi-bee run instead of one direct response?",
-    },
-    "task_type": {
-        "type": "choice",
-        "instructions": "Which fixed Ghost swarm recipe best matches this task?",
-        "criteria": {
-            "single": "A short, low-complexity question or creation task",
-            "research": "Multi-source research, extraction, comparison, or evidence gathering",
-            "diagnose": "Failure, error, notification, log, or application diagnosis",
-            "build": "Create code, a report, a plan, or another structured artifact",
-            "sensitive": "Deletion, external transmission, system change, or irreversible action",
-        },
-    },
-    "needs_clarify": {
-        "type": "noul",
-        "instructions": "Must the user clarify the goal before any bee starts?",
-    },
-    "risk_level": {
-        "type": "score",
-        "instructions": "Rate execution risk from 1 (harmless) to 9 (irreversible or harmful).",
-        "criteria": [
-            "1 harmless read-only", "2 minor", "3 minor", "4 moderate", "5 moderate",
-            "6 requires explicit confirmation", "7 serious", "8 severe", "9 irreversible",
-        ],
-    },
-    "evidence_heavy": {
-        "type": "noul",
-        "instructions": "Does this task need independent investigation and source evidence?",
-    },
-    "parallelizable": {
-        "type": "noul",
-        "instructions": "Can independent parts of this task run in parallel?",
-    },
-}
+_RECIPE_STAGES = RECIPE_STAGES
 
 _ALLOWED_CORRECTIONS = {"accept", "retry", "need_context", "pause", "escalate"}
 _STREAM_EVENT_TYPES = {"bee.reasoning", "bee.delta", "bee.tool_call", "bee.tool_result"}
 
 BeeRunner = Callable[[str, dict[str, Any]], Awaitable[Any] | AsyncIterator[Any]]
 JevChecker = Callable[[str, dict[str, Any]], Awaitable[Mapping[str, Any]]]
+HandoffExchange = Callable[..., Awaitable[Any] | Any]
 
 
 def _canonical_json(value: Any) -> str:
@@ -126,20 +61,11 @@ def _stable_id(prefix: str, value: Any, size: int = 20) -> str:
 
 
 def _risk_gate(risk_level: float) -> str:
-    if risk_level >= 6.0:
-        return "confirm"
-    if risk_level >= 3.5:
-        return "review"
-    return "auto"
+    return risk_gate(float(risk_level))
 
 
 def _recipe_stages(recipe: str) -> list[dict[str, Any]]:
-    if recipe not in _RECIPE_STAGES:
-        raise ValueError(f"unknown recipe: {recipe}")
-    return [
-        {"id": f"stage_{index + 1}", "index": index, "bees": list(bees)}
-        for index, bees in enumerate(_RECIPE_STAGES[recipe])
-    ]
+    return recipe_stages(recipe)
 
 
 def _plan_for_recipe(
@@ -150,73 +76,20 @@ def _plan_for_recipe(
     degraded: bool = False,
     needs_clarification: bool = False,
 ) -> dict[str, Any]:
-    if recipe not in RECIPES:
-        raise ValueError(f"unknown recipe: {recipe}")
-    if risk_level is None:
-        risk_level = 7.0 if recipe == "sensitive" else 1.0
-    risk_level = max(0.0, min(10.0, float(risk_level)))
-    stages = _recipe_stages(recipe)
-    bees = [bee for stage in stages for bee in stage["bees"]]
-    return {
-        "recipe": recipe,
-        "bees": bees,
-        "stages": stages,
-        "max_parallel": 3,
-        "risk_level": risk_level,
-        "risk_gate": _risk_gate(risk_level),
-        "requires_confirmation": recipe == "sensitive" or risk_level >= 6.0,
-        "needs_clarification": bool(needs_clarification),
-        "planner": source,
-        "degraded": bool(degraded),
-    }
+    decision = plan_for_recipe(
+        recipe,
+        source=source,
+        risk_score=risk_level,
+        degraded=degraded,
+        needs_clarification=needs_clarification,
+    )
+    return materialize_plan(decision)
 
 
 def deterministic_fallback_plan(goal: str) -> dict[str, Any]:
-    """Return a deterministic, side-effect-free plan when Jev is unavailable.
+    """Return the canonical deterministic fallback with legacy compatibility fields."""
 
-    The heuristic intentionally stays conservative and finite: it can only select one of
-    the five fixed recipes and never invents a role or topology.
-    """
-
-    text = " ".join(str(goal or "").strip().lower().split())
-    sensitive_terms = (
-        "删除", "清空", "卸载", "外发", "发送给", "发布", "上传", "系统设置", "注册表",
-        "delete", "remove all", "wipe", "uninstall", "send to", "publish", "upload",
-        "registry", "system setting",
-    )
-    diagnose_terms = (
-        "故障", "报错", "错误", "失败", "崩溃", "异常", "日志", "通知", "诊断", "排查",
-        "bug", "error", "failed", "failure", "crash", "exception", "log", "diagnose",
-        "troubleshoot",
-    )
-    research_terms = (
-        "研究", "调查", "分析", "多个来源", "多来源", "资料", "证据", "核验", "比较", "对比",
-        "research", "investigate", "analyze", "multiple sources", "evidence", "verify",
-        "compare", "sources",
-    )
-    build_terms = (
-        "实现", "编写", "生成", "创建", "构建", "开发", "代码", "报告", "方案", "修复",
-        "implement", "write", "generate", "create", "build", "develop", "code", "report",
-        "fix",
-    )
-
-    if any(term in text for term in sensitive_terms):
-        recipe, risk = "sensitive", 7.0
-    elif any(term in text for term in diagnose_terms):
-        recipe, risk = "diagnose", 2.5
-    elif any(term in text for term in research_terms):
-        recipe, risk = "research", 1.5
-    elif any(term in text for term in build_terms):
-        recipe, risk = "build", 2.0
-    else:
-        recipe, risk = "single", 0.5
-
-    return _plan_for_recipe(
-        recipe,
-        source="deterministic_fallback",
-        risk_level=risk,
-        degraded=True,
-    )
+    return materialize_plan(deterministic_fallback(goal))
 
 
 def _permission_tools(permission_snapshot: Any) -> list[str]:
@@ -286,16 +159,29 @@ def build_contract(goal: str, plan: Mapping[str, Any], permission_snapshot: Any)
     acceptance_tests = copy.deepcopy(normalized_plan.get("acceptance_tests") or [])
     scope = copy.deepcopy(normalized_plan.get("scope") or {"included": [], "excluded": []})
     snapshot = copy.deepcopy(permission_snapshot)
+    unique_bees = {bee for stage in stages for bee in stage["bees"]}
+    requested_parallel = int(normalized_plan.get("max_parallel", 3))
+    max_parallel = max(1, min(requested_parallel, max(len(stage["bees"]) for stage in stages)))
+    risk_gate_value = _risk_gate(risk_level)
+    budgets = {
+        "max_bees": max(1, len(unique_bees)),
+        "max_parallel": max_parallel,
+        "max_stages": len(stages),
+        "max_jev_calls": 5,
+        "max_retries_per_bee": 1,
+    }
     identity = {
         "goal": str(goal),
         "recipe": recipe,
         "stages": stages,
         "permission_snapshot": snapshot,
         "constraints": constraints,
+        "scope": scope,
+        "acceptance_tests": acceptance_tests,
+        "risk_level": risk_level,
+        "risk_gate": risk_gate_value,
+        "budgets": budgets,
     }
-    unique_bees = {bee for stage in stages for bee in stage["bees"]}
-    requested_parallel = int(normalized_plan.get("max_parallel", 3))
-    max_parallel = max(1, min(requested_parallel, max(len(stage["bees"]) for stage in stages)))
 
     return {
         "task_id": _stable_id("tsk", identity),
@@ -307,15 +193,9 @@ def build_contract(goal: str, plan: Mapping[str, Any], permission_snapshot: Any)
         "acceptance_tests": acceptance_tests,
         "allowed_tools": _permission_tools(snapshot),
         "permission_snapshot": snapshot,
-        "risk_gate": _risk_gate(risk_level),
-        "budgets": {
-            "max_bees": max(1, len(unique_bees)),
-            "max_parallel": max_parallel,
-            "max_stages": len(stages),
-            "max_jev_calls": 5,
-            "max_retries_per_bee": 1,
-        },
-        # 纯函数不能写入墙钟时间；持久化层负责补充存储时间。
+        "risk_gate": risk_gate_value,
+        "budgets": budgets,
+        # 纯函数不写墙钟时间；SwarmLedger 在首次持久化时补真实 UTC 时间。
         "created_at": None,
     }
 
@@ -396,47 +276,11 @@ def _float_or(value: Any, default: float) -> float:
 
 
 def _jev_plan(goal: str, response: Mapping[str, Any]) -> dict[str, Any] | None:
-    if response.get("ok") is False:
+    del goal
+    try:
+        return materialize_plan(parse_jev_response(response))
+    except (TypeError, ValueError, RuntimeError):
         return None
-    answers: Mapping[str, Any]
-    raw_answers = response.get("answers")
-    answers = raw_answers if isinstance(raw_answers, Mapping) else response
-
-    raw_recipe = answers.get("task_type", answers.get("recipe"))
-    recipe = str(_answer_value(raw_recipe) or "").strip().lower()
-    if recipe not in RECIPES:
-        return None
-
-    confidence = _answer_confidence(raw_recipe)
-    needs_clarification = _as_bool(answers.get("needs_clarify", False))
-    if confidence is not None and confidence < 0.35:
-        needs_clarification = True
-    elif confidence is not None and confidence < 0.60:
-        # 中等集中度只做推荐，仍由用户确认。
-        needs_clarification = True
-
-    swarm_worthy_raw = answers.get("swarm_worthy")
-    if swarm_worthy_raw is not None and recipe != "sensitive":
-        worthy = _answer_value(swarm_worthy_raw)
-        if isinstance(worthy, (int, float)) and not isinstance(worthy, bool):
-            if float(worthy) <= 0.60:
-                recipe = "single"
-        elif not _as_bool(worthy):
-            recipe = "single"
-
-    risk = _float_or(answers.get("risk_level", 7.0 if recipe == "sensitive" else 1.0), 1.0)
-    plan = _plan_for_recipe(
-        recipe,
-        source="jev",
-        risk_level=risk,
-        degraded=False,
-        needs_clarification=needs_clarification,
-    )
-    plan["jev"] = {
-        "model": response.get("model"),
-        "confidence": confidence,
-    }
-    return plan
 
 
 def _json_safe(value: Any) -> Any:
@@ -460,6 +304,17 @@ def _result_summary(result: Any) -> Any:
     return safe
 
 
+def _final_text(result: Any) -> str | None:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, Mapping):
+        for key in ("text", "output", "summary"):
+            value = result.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
 def _stream_item(item: Any, bee_id: str) -> tuple[str, dict[str, Any]] | None:
     if isinstance(item, str):
         return "bee.delta", {"bee_id": bee_id, "text": item}
@@ -477,6 +332,142 @@ def _stream_item(item: Any, bee_id: str) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def _as_plain_mapping(value: Any, *, label: str) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        converted = to_dict()
+        if isinstance(converted, Mapping):
+            return dict(converted)
+    raise TypeError(f"{label} must be a mapping or expose to_dict()")
+
+
+def _contract_model(contract: Mapping[str, Any]) -> TaskContract:
+    return TaskContract.from_dict(_as_plain_mapping(contract, label="contract"))
+
+
+def _capsule_model(capsule: Any) -> WorkCapsule:
+    if isinstance(capsule, WorkCapsule):
+        return capsule
+    return WorkCapsule.from_dict(_as_plain_mapping(capsule, label="capsule"))
+
+
+def _ack_mapping(ack: Any) -> dict[str, Any]:
+    if isinstance(ack, CapsuleAck):
+        return ack.to_dict()
+    if isinstance(ack, str):
+        return {"status": ack}
+    data = _as_plain_mapping(ack, label="handoff acknowledgement")
+    status = data.get("status", data.get("ack"))
+    if status is not None:
+        data["status"] = str(status)
+    return data
+
+
+def _handoff_result(
+    value: Any,
+    *,
+    fallback_capsule: WorkCapsule | None = None,
+) -> tuple[WorkCapsule, dict[str, Any]]:
+    capsule: Any = None
+    ack: Any = None
+    if isinstance(value, tuple) and len(value) >= 2:
+        capsule, ack = value[0], value[1]
+    elif isinstance(value, CapsuleAck):
+        capsule, ack = fallback_capsule, value
+    elif isinstance(value, Mapping):
+        if "capsule" in value:
+            capsule = value.get("capsule")
+            ack = value.get("ack", value.get("acknowledgement"))
+        elif "status" in value or "ack" in value:
+            capsule = fallback_capsule
+            ack = value.get("ack") if isinstance(value.get("ack"), (str, CapsuleAck, Mapping)) else value
+    else:
+        capsule = getattr(value, "capsule", None)
+        ack = getattr(value, "ack", getattr(value, "acknowledgement", None))
+        if ack is None and hasattr(value, "status"):
+            capsule, ack = fallback_capsule, value
+    if capsule is None or ack is None:
+        raise TypeError("handoff exchange must return an acknowledgement")
+    return _capsule_model(capsule), _ack_mapping(ack)
+
+
+def _accepted_status(ack: Mapping[str, Any]) -> str:
+    return str(ack.get("status", ack.get("ack", ""))).strip().lower()
+
+
+class _CancelRequested(Exception):
+    """Internal signal for cooperative cancel_event cancellation."""
+
+
+async def _await_external(value: Any, cancel_event: asyncio.Event | None) -> Any:
+    if cancel_event is not None and cancel_event.is_set():
+        raise _CancelRequested
+    if not inspect.isawaitable(value):
+        if cancel_event is not None and cancel_event.is_set():
+            raise _CancelRequested
+        return value
+    task = asyncio.ensure_future(value)
+    if cancel_event is None:
+        return await task
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_task in done and cancel_event.is_set():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise _CancelRequested
+        result = await task
+        if cancel_event.is_set():
+            raise _CancelRequested
+        return result
+    finally:
+        cancel_task.cancel()
+        await asyncio.gather(cancel_task, return_exceptions=True)
+
+
+def _validate_handoff_exchange(
+    requested: WorkCapsule,
+    returned: WorkCapsule,
+    ack: Mapping[str, Any],
+) -> None:
+    fields = (
+        "task_id",
+        "contract_rev",
+        "from_bee",
+        "to_bee",
+        "message_id",
+        "capsule_id",
+    )
+    mismatches = [
+        name for name in fields if getattr(returned, name) != getattr(requested, name)
+    ]
+    if returned.payload != requested.payload or returned.to_dict() != requested.to_dict():
+        mismatches.append("body")
+    if mismatches:
+        raise ValueError(
+            "handoff exchange returned a foreign capsule: " + ", ".join(mismatches)
+        )
+    if str(ack.get("message_id") or "") != requested.message_id:
+        raise ValueError("handoff acknowledgement message_id does not match capsule")
+    if str(ack.get("capsule_id") or "") != requested.capsule_id:
+        raise ValueError("handoff acknowledgement capsule_id does not match capsule")
+    status = _accepted_status(ack)
+    if status not in {
+        "accepted",
+        "need_context",
+        "stale",
+        "forbidden",
+        "incompatible",
+        "conflicted",
+    }:
+        raise ValueError(f"unsupported handoff acknowledgement: {status or '<empty>'}")
+
+
 class BeeExecutionError(RuntimeError):
     def __init__(self, bee_id: str, stage_id: str, cause: BaseException):
         super().__init__(f"bee {bee_id} failed in {stage_id}: {cause}")
@@ -490,73 +481,6 @@ class SwarmGateError(RuntimeError):
         super().__init__(f"Jev gate requested {action} for {bee_id}")
         self.action = action
         self.bee_id = bee_id
-
-
-def _optional_capsule_builder() -> Callable[..., Any] | None:
-    """Resolve a future capsule helper lazily; absence or API drift is harmless."""
-
-    module_names = ["capsule"]
-    if __package__:
-        module_names.insert(0, f"{__package__}.capsule")
-    for module_name in module_names:
-        try:
-            module = importlib.import_module(module_name)
-        except (ImportError, ModuleNotFoundError):
-            continue
-        for name in ("build_capsule", "create_capsule", "make_capsule"):
-            candidate = getattr(module, name, None)
-            if callable(candidate):
-                return candidate
-    return None
-
-
-def _fallback_capsule(
-    *,
-    run_id: str,
-    contract: Mapping[str, Any],
-    from_bee: str,
-    to_bee: str,
-    stage_id: str,
-    result: Any,
-) -> dict[str, Any]:
-    identity = [run_id, contract["task_id"], contract["contract_rev"], stage_id, from_bee, to_bee]
-    required = []
-    for item in contract.get("required_constraints", []):
-        if isinstance(item, Mapping):
-            required.append(str(item.get("id") or item.get("text") or ""))
-        else:
-            required.append(str(item))
-    return {
-        "protocol": "GCTX/0.1",
-        "message_id": _stable_id("msg", identity),
-        "capsule_id": _stable_id("cap", identity),
-        "task_id": contract["task_id"],
-        "contract_rev": contract["contract_rev"],
-        "from_bee": from_bee,
-        "to_bee": to_bee,
-        "required_constraints": required,
-        "facts": [],
-        "artifacts": [],
-        "open_questions": [],
-        "side_effects": [],
-        "loss_manifest": [],
-        "depends_on": [],
-        "payload": _result_summary(result),
-        "sender_claims": {"required_payload_complete": True},
-    }
-
-
-def _build_handoff_capsule(**kwargs: Any) -> dict[str, Any]:
-    builder = _optional_capsule_builder()
-    if builder is not None:
-        try:
-            built = builder(**kwargs)
-            if isinstance(built, Mapping):
-                return _json_safe(built)
-        except (TypeError, ValueError, KeyError):
-            # 并行开发中的 capsule API 尚未稳定时，继续使用协议兼容 fallback。
-            pass
-    return _fallback_capsule(**kwargs)
 
 
 def _stage_questions(bees: Sequence[str]) -> dict[str, dict[str, Any]]:
@@ -639,6 +563,9 @@ class SwarmOrchestrator:
         *,
         max_parallel: int = 3,
         max_jev_calls: int = 5,
+        handoff_exchange: HandoffExchange | None = None,
+        ledger: SwarmLedger | None = None,
+        store: SwarmStore | None = None,
     ) -> None:
         if not callable(bee_runner):
             raise TypeError("bee_runner must be callable")
@@ -648,10 +575,90 @@ class SwarmOrchestrator:
             raise ValueError("max_parallel must be at least 1")
         if int(max_jev_calls) < 0:
             raise ValueError("max_jev_calls cannot be negative")
+        if handoff_exchange is not None and not callable(handoff_exchange):
+            raise TypeError("handoff_exchange must be callable or None")
+        if ledger is not None and store is not None:
+            raise ValueError("inject ledger or store, not both")
         self.bee_runner = bee_runner
         self.jev_checker = jev_checker
         self.max_parallel = int(max_parallel)
         self.max_jev_calls = int(max_jev_calls)
+        self.handoff_exchange = handoff_exchange
+        self.ledger = ledger
+        self.store = store
+        self._cancel_event: asyncio.Event | None = None
+
+    async def _call_handoff_exchange(
+        self,
+        exchange: HandoffExchange,
+        *,
+        capsule: WorkCapsule,
+        run_id: str,
+        stage_id: str,
+        attempt: int,
+        permission_snapshot: Any,
+    ) -> tuple[WorkCapsule, dict[str, Any]]:
+        kwargs = {
+            "capsule": capsule,
+            "run_id": run_id,
+            "stage_id": stage_id,
+            "attempt": attempt,
+            "current_permission_snapshot": permission_snapshot,
+            "receiver_permissions": tuple(capsule.required_permissions),
+            "receiver_bee": capsule.to_bee,
+        }
+        try:
+            signature = inspect.signature(exchange)
+        except (TypeError, ValueError):
+            call = exchange(**kwargs)
+        else:
+            positional: list[Any] = []
+            keyword: dict[str, Any] = {}
+            missing: list[str] = []
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            capsule_bound = False
+            for name, parameter in signature.parameters.items():
+                if parameter.kind in {
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                }:
+                    continue
+                value = kwargs.get(name)
+                if name == "capsule":
+                    value = capsule
+                elif name not in kwargs:
+                    if parameter.default is inspect.Parameter.empty:
+                        missing.append(name)
+                    continue
+                if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                    positional.append(value)
+                else:
+                    keyword[name] = value
+                capsule_bound = capsule_bound or name == "capsule"
+            if missing:
+                raise TypeError(
+                    "handoff exchange has unsupported required parameters: "
+                    + ", ".join(missing)
+                )
+            if not capsule_bound:
+                positional.insert(0, capsule)
+            if accepts_kwargs:
+                keyword.update(
+                    {
+                        name: value
+                        for name, value in kwargs.items()
+                        if name not in keyword and name != "capsule"
+                    }
+                )
+            call = exchange(*positional, **keyword)
+        if inspect.isawaitable(call):
+            call = await _await_external(call, self._cancel_event)
+        returned_capsule, ack = _handoff_result(call, fallback_capsule=capsule)
+        _validate_handoff_exchange(capsule, returned_capsule, ack)
+        return returned_capsule, ack
 
     async def _call_jev(
         self,
@@ -669,8 +676,11 @@ class SwarmOrchestrator:
             return None
         jev_state["calls"] += 1
         try:
-            response = await self.jev_checker(state, questions)
-        except asyncio.CancelledError:
+            response = await _await_external(
+                self.jev_checker(state, questions),
+                self._cancel_event,
+            )
+        except (_CancelRequested, asyncio.CancelledError):
             raise
         except Exception as exc:  # checker failure must degrade, not fabricate an answer
             jev_state["degraded"] = True
@@ -730,7 +740,7 @@ class SwarmOrchestrator:
         goal: str,
         plan: Mapping[str, Any],
         contract: Mapping[str, Any],
-        inputs: Sequence[Mapping[str, Any]],
+        inputs: Sequence[Mapping[str, Any]] | Mapping[str, Sequence[Mapping[str, Any]]],
         correction_by_bee: Mapping[str, Any],
         cancel_event: asyncio.Event,
         queue: asyncio.Queue[tuple[str, dict[str, Any]]],
@@ -768,6 +778,9 @@ class SwarmOrchestrator:
                             "attempt": attempt,
                         },
                     ))
+                    bee_inputs = (
+                        inputs.get(bee_id, ()) if isinstance(inputs, Mapping) else inputs
+                    )
                     context = {
                         "goal": goal,
                         "recipe": plan["recipe"],
@@ -778,7 +791,7 @@ class SwarmOrchestrator:
                         "stage": stage["id"],
                         "stage_index": stage["index"],
                         "attempt": attempt,
-                        "inputs": copy.deepcopy(list(inputs)),
+                        "inputs": copy.deepcopy(list(bee_inputs)),
                         "correction": copy.deepcopy(correction_by_bee.get(bee_id)),
                         "cancel_event": cancel_event,
                     }
@@ -872,6 +885,8 @@ class SwarmOrchestrator:
         if not goal:
             raise ValueError("goal cannot be empty")
         cancel_event = cancel_event or asyncio.Event()
+        self._cancel_event = cancel_event
+        cancel_requested_at_start = cancel_event.is_set()
         run_id = str(run_id or f"run_{uuid.uuid4().hex}")
         seq = 0
         task_id = _stable_id("tsk", [goal, recipe, permission_snapshot])
@@ -879,81 +894,156 @@ class SwarmOrchestrator:
         if self.jev_checker is None:
             jev_state["reason"] = "checker_unavailable"
 
+        active_ledger: SwarmLedger | None = self.ledger
+        owned_ledger: SwarmLedger | None = None
+        run_registered = False
+
+        if active_ledger is None:
+            active_ledger = SwarmLedger(self.store) if self.store is not None else SwarmLedger()
+            owned_ledger = active_ledger
+
         def emit(event_type: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
             nonlocal seq, task_id
             seq += 1
-            return make_event(
+            envelope = make_event(
                 event_type,
                 payload,
                 run_id=run_id,
                 task_id=task_id,
                 seq=seq,
             )
-
-        if cancel_event.is_set():
-            yield emit("swarm.cancelled", {"status": "cancelled", "reason": "cancel_requested"})
-            return
+            if active_ledger is not None and run_registered:
+                persisted = active_ledger.persist_event(SwarmEvent.from_dict(envelope))
+                envelope = persisted.to_dict()
+            return envelope
 
         try:
             if plan is not None:
-                selected_plan = copy.deepcopy(dict(plan))
-                selected_plan.setdefault("planner", "provided")
-                selected_plan.setdefault("degraded", self.jev_checker is None)
+                original_plan = copy.deepcopy(dict(plan))
+                decision = normalize_plan(original_plan)
+                if self.jev_checker is None and not decision.degraded:
+                    original_plan["degraded"] = True
+                    original_plan["degraded_reason"] = "checker_unavailable"
+                    decision = normalize_plan(original_plan)
+                selected_plan = {**original_plan, **materialize_plan(decision, confirmed=confirmed)}
             elif recipe is not None:
-                selected_plan = _plan_for_recipe(
+                decision = plan_for_recipe(
                     str(recipe),
                     source="explicit",
                     degraded=self.jev_checker is None,
+                    degraded_reason="checker_unavailable" if self.jev_checker is None else None,
                 )
+                selected_plan = materialize_plan(decision, confirmed=confirmed)
             else:
                 plan_response = await self._call_jev(goal, SWARM_PLAN_QUESTIONS, jev_state)
                 selected_plan = _jev_plan(goal, plan_response) if plan_response is not None else None
                 if selected_plan is None:
                     jev_state["degraded"] = True
                     jev_state.setdefault("reason", "invalid_planner_response")
-                    selected_plan = deterministic_fallback_plan(goal)
+                    selected_plan = materialize_plan(
+                        deterministic_fallback(goal, degraded_reason=jev_state.get("reason")),
+                        confirmed=confirmed,
+                    )
+                else:
+                    selected_plan = materialize_plan(
+                        normalize_plan(selected_plan),
+                        confirmed=confirmed,
+                    )
 
-            recipe_id = str(selected_plan.get("recipe") or "")
-            if recipe_id not in RECIPES:
-                raise ValueError(f"unknown recipe: {recipe_id}")
+            decision = normalize_plan(selected_plan)
+            recipe_id = decision.recipe_id
             selected_plan["stages"] = _normalize_stages(selected_plan)
-            risk_level = max(
-                0.0,
-                min(10.0, float(selected_plan.get("risk_level", 7.0 if recipe_id == "sensitive" else 1.0))),
-            )
-            if recipe_id == "sensitive":
-                risk_level = max(6.0, risk_level)
-            selected_plan["risk_level"] = risk_level
-            selected_plan["risk_gate"] = _risk_gate(risk_level)
-            selected_plan["requires_confirmation"] = recipe_id == "sensitive" or risk_level >= 6.0
-            selected_plan["needs_clarification"] = bool(selected_plan.get("needs_clarification", False))
-            selected_plan["degraded"] = bool(selected_plan.get("degraded", False) or jev_state["degraded"])
-            selected_plan["degraded_reason"] = jev_state.get("reason") if selected_plan["degraded"] else None
+            selected_plan["degraded"] = bool(decision.degraded or jev_state["degraded"])
+            selected_plan["degraded_reason"] = (
+                decision.degraded_reason or jev_state.get("reason")
+            ) if selected_plan["degraded"] else None
             selected_plan["bees"] = [
                 bee for stage in selected_plan["stages"] for bee in stage["bees"]
             ]
+            risk_level = decision.risk_score
 
             contract = build_contract(goal, selected_plan, permission_snapshot)
+            contract_model = _contract_model(contract)
             task_id = contract["task_id"]
-            yield emit("swarm.plan", {
-                "plan": copy.deepcopy(selected_plan),
-                "recipe": recipe_id,
-                "bees": list(selected_plan["bees"]),
-                "stages": copy.deepcopy(selected_plan["stages"]),
-                "degraded": selected_plan["degraded"],
-                "degraded_reason": selected_plan.get("degraded_reason"),
-            })
-            yield emit("contract.created", {"contract": copy.deepcopy(contract)})
+            if active_ledger is None:  # pragma: no cover - construction above is total
+                raise RuntimeError("swarm ledger is unavailable")
+            session_id = str(selected_plan.get("session_id") or run_id)
+            existing_run = active_ledger.status(run_id)
+            resuming = bool(
+                existing_run is not None
+                and confirmed
+                and existing_run.get("status") == "requires_confirmation"
+            )
+            if resuming:
+                if str(existing_run.get("task_id")) != task_id:
+                    raise ValueError("confirmed run task_id differs from existing run")
+                existing_contract = active_ledger.store.get_contract(
+                    task_id,
+                    int(existing_run["contract_rev"]),
+                )
+                if existing_contract is None:
+                    raise ValueError("confirmed run contract is unavailable")
+                contract_model = existing_contract
+                contract = contract_model.to_dict()
+                selected_plan = copy.deepcopy(existing_run.get("plan") or selected_plan)
+                selected_plan.update(materialize_plan(decision, confirmed=True))
+                selected_plan["stages"] = _normalize_stages(selected_plan)
+                selected_plan["bees"] = [
+                    bee for stage in selected_plan["stages"] for bee in stage["bees"]
+                ]
+                active_ledger.confirm_run(
+                    run_id,
+                    {
+                        "satisfied": True,
+                        "confirmed_at": time.time(),
+                        "source": "orchestrator",
+                    },
+                )
+                seq = active_ledger.next_seq(run_id) - 1
+                run_registered = True
+                yield emit("swarm.confirmed", {
+                    "status": "confirmed",
+                    "gate": "confirmation",
+                })
+            else:
+                contract_model = active_ledger.begin_run(
+                    run_id,
+                    session_id,
+                    goal,
+                    selected_plan,
+                    contract_model,
+                )
+                contract = contract_model.to_dict()
+                run_registered = True
+            if cancel_requested_at_start:
+                yield emit("swarm.cancelled", {
+                    "status": "cancelled",
+                    "reason": "cancel_requested",
+                })
+                return
+            if not resuming:
+                yield emit("swarm.plan", {
+                    "plan": copy.deepcopy(selected_plan),
+                    "recipe": recipe_id,
+                    "bees": list(selected_plan["bees"]),
+                    "stages": copy.deepcopy(selected_plan["stages"]),
+                    "degraded": selected_plan["degraded"],
+                    "degraded_reason": selected_plan.get("degraded_reason"),
+                })
+                yield emit("contract.created", {"contract": copy.deepcopy(contract)})
 
-            waiting_reason = None
-            if selected_plan["needs_clarification"]:
-                waiting_reason = "clarification_required"
-            elif selected_plan["requires_confirmation"]:
-                waiting_reason = "high_risk_confirmation_required"
-            if waiting_reason and not confirmed:
+            gate = evaluate_user_gate(decision, confirmed=confirmed)
+            if gate.required:
+                waiting_reason = (
+                    "clarification_required"
+                    if gate.kind == "clarification"
+                    else "high_risk_confirmation_required"
+                )
                 yield emit("swarm.waiting_user", {
                     "status": "waiting_user",
                     "reason": waiting_reason,
+                    "gate": gate.kind,
+                    "reasons": list(gate.reasons),
                     "risk_level": risk_level,
                     "risk_gate": selected_plan["risk_gate"],
                 })
@@ -971,7 +1061,9 @@ class SwarmOrchestrator:
                     int(contract["budgets"]["max_parallel"]),
                 ),
             )
-            stage_inputs: list[dict[str, Any]] = []
+            stage_inputs: Sequence[Mapping[str, Any]] | Mapping[
+                str, Sequence[Mapping[str, Any]]
+            ] = []
             all_results: dict[str, Any] = {}
             retries: dict[str, int] = {bee: 0 for bee in ROLE_POOL}
             stages = selected_plan["stages"]
@@ -1012,6 +1104,8 @@ class SwarmOrchestrator:
                     "results": {bee: _result_summary(stage_results.get(bee)) for bee in bees},
                 })
                 check_response = await self._call_jev(stage_state, _stage_questions(bees), jev_state)
+                if cancel_event.is_set():
+                    raise _CancelRequested
                 checks = _stage_actions(check_response, bees) if check_response is not None else None
                 if checks is None:
                     selected_plan["degraded"] = True
@@ -1087,6 +1181,8 @@ class SwarmOrchestrator:
                         _stage_questions(retry_bees),
                         jev_state,
                     )
+                    if cancel_event.is_set():
+                        raise _CancelRequested
                     retry_checks = _stage_actions(retry_response, retry_bees) if retry_response is not None else None
                     if retry_checks is None:
                         selected_plan["degraded"] = True
@@ -1113,47 +1209,144 @@ class SwarmOrchestrator:
                             terminal_action = "retry_exhausted" if action == "retry" else action
                             raise SwarmGateError(terminal_action, bee)
 
-                # 交给下一阶段；接收方回执由未来 capsule.py 可替换，目前为 accepted fallback。
                 next_stage = stages[stage_index + 1] if stage_index + 1 < len(stages) else None
-                next_inputs: list[dict[str, Any]] = []
+                inputs_by_bee: dict[str, list[dict[str, Any]]] = {
+                    str(bee): [] for bee in (next_stage or {}).get("bees", ())
+                }
                 if next_stage is not None:
                     for from_bee in bees:
                         for to_bee in next_stage["bees"]:
-                            capsule = _build_handoff_capsule(
-                                run_id=run_id,
-                                contract=contract,
-                                from_bee=from_bee,
-                                to_bee=to_bee,
-                                stage_id=str(stage["id"]),
-                                result=stage_results.get(from_bee),
-                            )
-                            next_inputs.append(capsule)
+                            attempt = retries[from_bee] + 1
+                            exchange_kwargs = {
+                                "run_id": run_id,
+                                "stage_id": str(stage["id"]),
+                                "contract": contract_model,
+                                "from_bee": from_bee,
+                                "to_bee": to_bee,
+                                "result": stage_results.get(from_bee),
+                                "current_permission_snapshot": contract_model.permission_snapshot,
+                                "receiver_permissions": tuple(contract_model.allowed_tools),
+                                "attempt": attempt,
+                            }
+                            if self.handoff_exchange is None:
+                                exchanged = active_ledger.exchange_handoff(**exchange_kwargs)
+                                exchanged_capsule, ack = _handoff_result(exchanged)
+                                requested_capsule = build_handoff_capsule(
+                                    run_id=run_id,
+                                    contract=contract_model,
+                                    from_bee=from_bee,
+                                    to_bee=to_bee,
+                                    stage_id=str(stage["id"]),
+                                    result=stage_results.get(from_bee),
+                                    attempt=attempt,
+                                )
+                                _validate_handoff_exchange(
+                                    requested_capsule,
+                                    exchanged_capsule,
+                                    ack,
+                                )
+                            else:
+                                capsule = build_handoff_capsule(
+                                    run_id=run_id,
+                                    contract=contract_model,
+                                    from_bee=from_bee,
+                                    to_bee=to_bee,
+                                    stage_id=str(stage["id"]),
+                                    result=stage_results.get(from_bee),
+                                    attempt=attempt,
+                                )
+                                exchanged_capsule, ack = await self._call_handoff_exchange(
+                                    self.handoff_exchange,
+                                    capsule=capsule,
+                                    run_id=run_id,
+                                    stage_id=str(stage["id"]),
+                                    attempt=attempt,
+                                    permission_snapshot=contract_model.permission_snapshot,
+                                )
+                            if cancel_event.is_set():
+                                raise _CancelRequested
+                            capsule_payload = exchanged_capsule.to_dict()
                             yield emit("handoff.created", {
-                                "from": from_bee,
-                                "to": to_bee,
-                                "capsule_id": capsule.get("capsule_id"),
-                                "message_id": capsule.get("message_id"),
-                                "capsule": capsule,
+                                "from": exchanged_capsule.from_bee,
+                                "to": exchanged_capsule.to_bee,
+                                "capsule_id": exchanged_capsule.capsule_id,
+                                "message_id": exchanged_capsule.message_id,
+                                "capsule": capsule_payload,
                             })
+                            ack_status = _accepted_status(ack)
+                            ack_payload = _json_safe(ack)
                             yield emit("handoff.ack", {
-                                "from": from_bee,
-                                "to": to_bee,
-                                "capsule_id": capsule.get("capsule_id"),
-                                "message_id": capsule.get("message_id"),
-                                "ack": "accepted",
+                                "from": exchanged_capsule.from_bee,
+                                "to": exchanged_capsule.to_bee,
+                                "capsule_id": exchanged_capsule.capsule_id,
+                                "message_id": exchanged_capsule.message_id,
+                                "ack": ack_status,
+                                "ack_status": ack_status,
+                                "acknowledgement": ack_payload,
                             })
-                stage_inputs = next_inputs
+                            if ack_status == "accepted":
+                                inputs_by_bee[to_bee].append(capsule_payload)
+                                continue
+                            if ack_status == "need_context":
+                                yield emit("swarm.waiting_user", {
+                                    "status": "waiting_user",
+                                    "reason": "handoff_need_context",
+                                    "from": exchanged_capsule.from_bee,
+                                    "to": exchanged_capsule.to_bee,
+                                    "capsule_id": exchanged_capsule.capsule_id,
+                                    "message_id": exchanged_capsule.message_id,
+                                    "ack": _json_safe(ack),
+                                })
+                                return
+                            if ack_status in {"stale", "forbidden", "incompatible", "conflicted"}:
+                                yield emit("swarm.error", {
+                                    "status": "error",
+                                    "code": f"handoff_{ack_status}",
+                                    "handoff_status": ack_status,
+                                    "from": exchanged_capsule.from_bee,
+                                    "to": exchanged_capsule.to_bee,
+                                    "capsule_id": exchanged_capsule.capsule_id,
+                                    "message_id": exchanged_capsule.message_id,
+                                    "ack": _json_safe(ack),
+                                    "message": f"handoff rejected: {ack_status}",
+                                })
+                                return
+                            raise ValueError(f"unsupported handoff acknowledgement: {ack_status or '<empty>'}")
+                stage_inputs = inputs_by_bee
 
+            if cancel_event.is_set():
+                yield emit("swarm.cancelled", {
+                    "status": "cancelled",
+                    "reason": "cancel_requested",
+                })
+                return
+            integrator_result = all_results.get("integrator")
             yield emit("swarm.done", {
                 "status": "completed",
                 "recipe": recipe_id,
                 "results": _json_safe(all_results),
+                "final_text": _final_text(integrator_result),
                 "degraded": bool(selected_plan.get("degraded")),
                 "degraded_reason": selected_plan.get("degraded_reason"),
                 "jev_calls": jev_state["calls"],
                 "retries": {bee: count for bee, count in retries.items() if count},
             })
+        except _CancelRequested:
+            if run_registered:
+                yield emit("swarm.cancelled", {
+                    "status": "cancelled",
+                    "reason": "cancel_requested",
+                })
+            return
         except asyncio.CancelledError:
+            if run_registered:
+                try:
+                    yield emit("swarm.cancelled", {
+                        "status": "cancelled",
+                        "reason": "task_cancelled",
+                    })
+                except Exception:
+                    pass
             raise
         except BeeExecutionError as exc:
             yield emit("swarm.error", {
@@ -1165,13 +1358,30 @@ class SwarmOrchestrator:
                 "error_type": type(exc.cause).__name__,
             })
         except SwarmGateError as exc:
-            yield emit("swarm.error", {
-                "status": "error",
-                "code": "jev_gate",
-                "action": exc.action,
-                "bee_id": exc.bee_id,
-                "message": str(exc),
-            })
+            if exc.action in {"need_context", "escalate"}:
+                yield emit("swarm.waiting_user", {
+                    "status": "waiting_user",
+                    "reason": f"jev_{exc.action}",
+                    "action": exc.action,
+                    "bee_id": exc.bee_id,
+                    "message": str(exc),
+                })
+            elif exc.action == "pause":
+                yield emit("swarm.paused", {
+                    "status": "paused",
+                    "reason": "jev_pause",
+                    "action": exc.action,
+                    "bee_id": exc.bee_id,
+                    "message": str(exc),
+                })
+            else:
+                yield emit("swarm.error", {
+                    "status": "error",
+                    "code": "jev_gate",
+                    "action": exc.action,
+                    "bee_id": exc.bee_id,
+                    "message": str(exc),
+                })
         except Exception as exc:
             yield emit("swarm.error", {
                 "status": "error",
@@ -1179,6 +1389,9 @@ class SwarmOrchestrator:
                 "message": str(exc),
                 "error_type": type(exc).__name__,
             })
+        finally:
+            if owned_ledger is not None:
+                owned_ledger.close()
 
 
 async def orchestrate(
@@ -1191,6 +1404,9 @@ async def orchestrate(
     permission_snapshot: Any = None,
     max_parallel: int = 3,
     max_jev_calls: int = 5,
+    handoff_exchange: HandoffExchange | None = None,
+    ledger: SwarmLedger | None = None,
+    store: SwarmStore | None = None,
     cancel_event: asyncio.Event | None = None,
     confirmed: bool = False,
     run_id: str | None = None,
@@ -1202,6 +1418,9 @@ async def orchestrate(
         jev_checker,
         max_parallel=max_parallel,
         max_jev_calls=max_jev_calls,
+        handoff_exchange=handoff_exchange,
+        ledger=ledger,
+        store=store,
     )
     async for item in orchestrator.run(
         goal,
@@ -1223,6 +1442,7 @@ __all__ = [
     "RECIPES",
     "SWARM_PLAN_QUESTIONS",
     "BeeExecutionError",
+    "HandoffExchange",
     "SwarmGateError",
     "SwarmOrchestrator",
     "build_contract",

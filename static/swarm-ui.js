@@ -8,6 +8,8 @@
 
   const EVENT_LABELS = {
     "swarm.plan": "蜂群计划",
+    "swarm.confirmed": "执行已确认",
+    "swarm.notice": "蜂群提示",
     "contract.created": "契约建立",
     "swarm.waiting_user": "等待用户",
     "bee.queued": "蜂已排队",
@@ -63,6 +65,7 @@
     queued: "queued",
     start: "running",
     started: "running",
+    running: "running",
     active: "running",
     working: "running",
     in_progress: "running",
@@ -81,9 +84,14 @@
     corrected: "running",
     created: "ready",
     ready: "ready",
+    accepted: "acknowledged",
     ack: "acknowledged",
     acked: "acknowledged",
     acknowledged: "acknowledged",
+    rejected: "error",
+    forbidden: "error",
+    incompatible: "error",
+    need_context: "blocked",
     complete: "done",
     completed: "done",
     success: "done",
@@ -115,6 +123,12 @@
     return {
       version: 1,
       plan: null,
+      confirmed: false,
+      stream: {
+        runId: "",
+        seenEventIds: {},
+        gaps: [],
+      },
       connection: connection || { status: "unknown", detail: "", updatedAt: null },
       swarm: {
         id: "",
@@ -125,6 +139,8 @@
         message: "",
         error: "",
         phaseId: "",
+        lastSeq: null,
+        terminalType: "",
         startedAt: null,
         updatedAt: null,
         finishedAt: null,
@@ -137,6 +153,7 @@
       conflicts: [],
       artifacts: [],
       budget: {
+        hasData: false,
         limit: null,
         used: null,
         unit: "tokens",
@@ -144,6 +161,7 @@
         currency: "USD",
       },
       usage: {
+        hasData: false,
         inputTokens: 0,
         outputTokens: 0,
         reasoningTokens: 0,
@@ -217,6 +235,15 @@
     return timestampOf(valueAt(data, ["ts", "timestamp", "time", "created_at", "createdAt", "updated_at", "updatedAt"], null))
       || timestampOf(valueAt(event, ["ts", "timestamp", "time", "created_at", "createdAt"], null))
       || Date.now();
+  }
+
+  function eventSeq(event, data) {
+    return firstNumber(event, ["seq", "sequence", "event_seq", "eventSeq"])
+      ?? firstNumber(data, ["seq", "sequence", "event_seq", "eventSeq"]);
+  }
+
+  function isTerminalEvent(type) {
+    return ["swarm.cancelled", "swarm.done", "swarm.skipped", "swarm.error"].includes(type);
   }
 
   function normalizeStatus(value, fallback) {
@@ -353,6 +380,46 @@
     state = initialState(connection ? Object.assign({}, connection) : undefined);
   }
 
+  function runIdOf(event, data) {
+    return text(valueAt(event, ["run_id", "runId"], valueAt(data, ["run_id", "runId"], "")), "");
+  }
+
+  function eventIdOf(event, data) {
+    return text(valueAt(event, ["event_id", "eventId"], valueAt(data, ["event_id", "eventId"], "")), "");
+  }
+
+  function gapMessage(from, to) {
+    return from === to ? "事件流缺少 seq " + from : "事件流缺少 seq " + from + "–" + to;
+  }
+
+  function acceptEnvelope(event, data, seq, type) {
+    const runId = runIdOf(event, data);
+    const eventId = eventIdOf(event, data);
+    const trackedRunId = state.stream.runId;
+    if (runId && trackedRunId && runId !== trackedRunId) return false;
+    if (runId && !state.stream.runId) state.stream.runId = runId;
+    if (eventId && state.stream.seenEventIds[eventId]) return false;
+    const lastSeq = state.swarm.lastSeq;
+    if (seq !== null && lastSeq !== null && seq <= lastSeq) return false;
+    if (seq !== null && lastSeq !== null && seq > lastSeq + 1) {
+      const from = lastSeq + 1;
+      const to = seq - 1;
+      state.stream.gaps.push({ from, to, before: seq });
+      state.swarm.message = gapMessage(from, to);
+    }
+    if (eventId) state.stream.seenEventIds[eventId] = true;
+    if (seq !== null) state.swarm.lastSeq = seq;
+    if (isTerminalEvent(type) && runId && !state.stream.runId) state.stream.runId = runId;
+    return true;
+  }
+
+  function canonicalAck(item) {
+    if (!isObject(item)) return {};
+    if (isObject(item.ack)) return item.ack;
+    if (isObject(item.acknowledgement)) return item.acknowledgement;
+    return {};
+  }
+
   function normalizeContract(raw, index) {
     const item = isObject(raw) ? raw : { title: raw };
     const acceptance = toArray(valueAt(item, ["acceptance", "acceptance_criteria", "acceptance_tests", "criteria", "checks"], []));
@@ -407,15 +474,27 @@
 
   function normalizeHandoff(raw, index) {
     const item = isObject(raw) ? raw : { summary: raw };
+    const ack = canonicalAck(item);
+    const legacyAck = typeof item.ack === "string" ? item.ack : "";
+    const acceptedText = text(valueAt(item, ["ack_status", "ackStatus"], legacyAck), "");
+    const reasons = toArray(valueAt(ack, ["reasons"], valueAt(item, ["reasons"], [])))
+      .map((entry) => short(entry, 160)).filter(Boolean);
+    const missing = toArray(valueAt(ack, ["missing"], valueAt(item, ["missing"], [])))
+      .map((entry) => short(entry, 160)).filter(Boolean);
     return {
       id: text(valueAt(item, ["capsule_id", "capsuleId", "message_id", "messageId", "id", "handoff_id", "handoffId", "key", "slug"], "")) || "handoff-" + String(index + 1),
       from: text(valueAt(item, ["from", "from_bee", "fromBee", "source", "sender"], "")),
       to: text(valueAt(item, ["to", "to_bee", "toBee", "target", "receiver"], "")),
       summary: text(valueAt(item, ["summary", "description", "message", "context"], "")),
       artifact: text(valueAt(item, ["artifact", "artifact_id", "artifactId", "output"], "")),
-      status: normalizeStatus(valueAt(item, ["status", "state"], "pending"), "pending"),
+      status: normalizeStatus(valueAt(ack, ["status", "state"], valueAt(item, ["status", "state"], acceptedText || "pending")), "pending"),
+      ackStatus: text(valueAt(ack, ["status", "state"], valueAt(item, ["ack_status", "ackStatus"], acceptedText)), ""),
+      reasons,
+      missing,
+      duplicate: valueAt(ack, ["duplicate"], valueAt(item, ["duplicate"], null)),
+      checkedSha256: text(valueAt(ack, ["checked_sha256", "checkedSha256"], valueAt(item, ["checked_sha256", "checkedSha256"], "")), ""),
       createdAt: timestampOf(valueAt(item, ["created_at", "createdAt", "ts"], null)),
-      ackAt: timestampOf(valueAt(item, ["ack_at", "ackAt", "acknowledged_at", "acknowledgedAt"], null)),
+      ackAt: timestampOf(valueAt(ack, ["checked_at", "checkedAt"], valueAt(item, ["ack_at", "ackAt", "acknowledged_at", "acknowledgedAt"], null))),
     };
   }
 
@@ -474,6 +553,7 @@
     const limit = firstNumber(raw, ["limit", "token_limit", "tokenLimit", "total", "total_tokens", "totalTokens", "max_tokens", "maxTokens", "budget_tokens", "budgetTokens"]);
     const used = firstNumber(raw, ["used", "used_tokens", "usedTokens", "spent", "spent_tokens", "spentTokens", "consumed"]);
     const costLimit = firstNumber(raw, ["cost_limit", "costLimit", "max_cost", "maxCost", "budget_usd", "budgetUsd"]);
+    if (limit !== null || used !== null || costLimit !== null) state.budget.hasData = true;
     if (limit !== null) state.budget.limit = limit;
     if (used !== null) state.budget.used = used;
     if (costLimit !== null) state.budget.costLimit = costLimit;
@@ -490,6 +570,7 @@
     const cost = firstNumber(raw, ["cost", "cost_usd", "costUsd", "spent"]);
     const elapsed = firstNumber(raw, ["elapsed_ms", "elapsedMs", "duration_ms", "durationMs", "ms"]);
     const toolCalls = firstNumber(raw, ["tool_calls", "toolCalls"]);
+    if ([input, output, reasoning, total, cost, elapsed, toolCalls].some((value) => value !== null)) state.usage.hasData = true;
     if (input !== null) state.usage.inputTokens = input;
     if (output !== null) state.usage.outputTokens = output;
     if (reasoning !== null) state.usage.reasoningTokens = reasoning;
@@ -507,7 +588,9 @@
     const nested = isObject(raw.plan) ? Object.assign({}, raw, raw.plan) : raw;
     if (replace) resetTask(true);
 
-    state.swarm.id = text(valueAt(nested, ["swarm_id", "swarmId", "task_id", "taskId", "id"], state.swarm.id));
+    const explicitRunId = text(valueAt(nested, ["run_id", "runId"], ""));
+    state.swarm.id = text(valueAt(nested, ["swarm_id", "swarmId", "run_id", "runId", "task_id", "taskId", "id"], state.swarm.id));
+    if (explicitRunId && !state.stream.runId) state.stream.runId = explicitRunId;
     state.swarm.title = text(valueAt(nested, ["title", "name", "task", "mission"], state.swarm.title || "蜂群任务"));
     state.swarm.summary = text(valueAt(nested, ["summary", "description", "brief"], state.swarm.summary));
     state.swarm.objective = text(valueAt(nested, ["objective", "goal", "instruction", "request"], state.swarm.objective));
@@ -522,7 +605,8 @@
     const rawPhases = valueAt(nested, ["phases", "stages", "steps"], []);
     toArray(rawPhases).forEach((item, index) => {
       const phase = upsert(state.phases, normalizePhase(item, index));
-      const phaseBees = valueAt(item, ["bees", "agents", "workers"], []);
+      const phaseSource = isObject(item) ? item : {};
+      const phaseBees = valueAt(phaseSource, ["bees", "agents", "workers"], []);
       toArray(phaseBees).forEach((bee, beeIndex) => upsert(state.bees, normalizeBee(bee, state.bees.length + beeIndex, phase.id)));
     });
 
@@ -587,6 +671,11 @@
     const message = valueAt(data, ["message", "summary", "description", "reason", "question", "text", "delta"], "");
     switch (type) {
       case "swarm.plan": return short(valueAt(data, ["summary", "title", "objective", "goal"], "计划已载入"), 150);
+      case "swarm.confirmed": {
+        const reasons = toArray(valueAt(data, ["confirmation_reasons", "confirmationReasons", "reasons"], [])).map((entry) => short(entry, 60)).filter(Boolean);
+        return short("用户已确认执行" + (reasons.length ? " · " + reasons.join("、") : ""), 150);
+      }
+      case "swarm.notice": return short(message || "蜂群提示已更新", 150);
       case "contract.created": return short(valueAt(data, ["title", "name", "description"], "执行契约已建立"), 150);
       case "swarm.waiting_user": return short(message || "需要用户确认后继续", 150);
       case "bee.queued": return short((beeName ? beeName + " · " : "") + text(valueAt(data, ["task", "objective"], "进入队列")), 150);
@@ -598,7 +687,21 @@
       case "bee.check": return short((beeName ? beeName + " · " : "") + text(message || valueAt(data, ["verdict", "result"], "检查完成")), 150);
       case "bee.correct": return short((beeName ? beeName + " · " : "") + text(message || "按检查结果纠偏"), 150);
       case "handoff.created": return short(text(valueAt(data, ["from", "from_bee", "fromBee"], "?")) + " → " + text(valueAt(data, ["to", "to_bee", "toBee"], "?")) + (message ? " · " + text(message) : ""), 150);
-      case "handoff.ack": return short(text(valueAt(data, ["to", "to_bee", "toBee"], beeName || "接收方")) + " 已确认交接", 150);
+      case "handoff.ack": {
+        const ack = canonicalAck(data);
+        const legacyAck = typeof data.ack === "string" ? data.ack : "";
+        const ackStatus = text(valueAt(ack, ["status", "state"], valueAt(data, ["ack_status", "ackStatus"], legacyAck || "acknowledged")));
+        const reasons = toArray(valueAt(ack, ["reasons"], valueAt(data, ["reasons"], []))).map((entry) => short(entry, 50)).filter(Boolean);
+        const missing = toArray(valueAt(ack, ["missing"], valueAt(data, ["missing"], []))).map((entry) => short(entry, 50)).filter(Boolean);
+        const duplicate = valueAt(ack, ["duplicate"], valueAt(data, ["duplicate"], null));
+        const checked = text(valueAt(ack, ["checked_sha256", "checkedSha256"], valueAt(data, ["checked_sha256", "checkedSha256"], "")));
+        const details = [ackStatus];
+        if (reasons.length) details.push("原因 " + reasons.join("、"));
+        if (missing.length) details.push("缺失 " + missing.join("、"));
+        if (duplicate !== null && duplicate !== undefined) details.push(duplicate ? "重复" : "非重复");
+        if (checked) details.push("SHA256 " + checked);
+        return short(text(valueAt(data, ["to", "to_bee", "toBee"], beeName || "接收方")) + " 交接回执 · " + details.join(" · "), 300);
+      }
       case "fact.conflicted": return short(valueAt(data, ["statement", "fact", "claim", "title", "message"], "发现事实冲突"), 150);
       case "fact.invalidated": return short(valueAt(data, ["statement", "fact", "claim", "title", "message"], "事实已失效"), 150);
       case "artifact.created": return short(valueAt(data, ["name", "title", "filename", "path"], "新产物已生成"), 150);
@@ -614,7 +717,13 @@
   function eventStatus(type, data) {
     if (type === "swarm.error") return "error";
     if (type === "swarm.cancelled") return "cancelled";
-    if (type === "swarm.done" || type === "artifact.created" || type === "handoff.ack") return "done";
+    if (type === "handoff.ack") {
+      const ack = canonicalAck(data);
+      const legacyAck = typeof data.ack === "string" ? data.ack : "";
+      return normalizeStatus(valueAt(ack, ["status", "state"], valueAt(data, ["ack_status", "ackStatus"], legacyAck || "acknowledged")), "acknowledged");
+    }
+    if (type === "swarm.done" || type === "swarm.skipped" || type === "swarm.confirmed" || type === "artifact.created") return "done";
+    if (type === "swarm.notice") return normalizeStatus(valueAt(data, ["status", "state"], state.swarm.status), state.swarm.status || "pending");
     if (type === "fact.conflicted") return "conflict";
     if (type === "fact.invalidated") return "invalidated";
     if (type === "artifact.stale") return "stale";
@@ -655,18 +764,43 @@
     if (!type) return getState();
     const data = payloadOf(event);
     const ts = eventTime(event, data);
+    const seq = eventSeq(event, data);
+    if (!acceptEnvelope(event, data, seq, type)) return getState();
+    const terminalBefore = Boolean(state.swarm.terminalType);
+    if (terminalBefore) {
+      // 首个终态唯一；合法的迟到事件只进入时间线和用量，不再改写任务主体。
+      updateUsageFromEvent(data);
+      state.swarm.updatedAt = Math.max(state.swarm.updatedAt || 0, ts);
+      recordEvent(type, event, data, ts);
+      render();
+      return getState();
+    }
     let bee;
 
     switch (type) {
       case "swarm.plan": {
         const incoming = isObject(data.plan) ? data.plan : data;
-        const incomingId = text(valueAt(incoming, ["swarm_id", "swarmId", "task_id", "taskId", "id"], ""));
+        const incomingId = text(valueAt(incoming, ["swarm_id", "swarmId", "run_id", "runId", "task_id", "taskId", "id"], ""));
         const replace = !state.swarm.id || (incomingId && incomingId !== state.swarm.id);
         applyPlan(incoming, replace);
         state.plan = clone(incoming);
-        state.swarm.status = normalizeStatus(valueAt(incoming, ["status", "state"], "planned"), "planned");
+        if (state.confirmed) {
+          state.swarm.status = "running";
+          state.swarm.startedAt = state.swarm.startedAt || ts;
+        } else {
+          state.swarm.status = normalizeStatus(valueAt(incoming, ["status", "state"], "planned"), "planned");
+        }
         break;
       }
+      case "swarm.confirmed":
+        state.confirmed = true;
+        state.swarm.status = "running";
+        state.swarm.message = text(valueAt(data, ["message", "summary"], "执行已确认，蜂群开始运行"));
+        state.swarm.startedAt = state.swarm.startedAt || ts;
+        break;
+      case "swarm.notice":
+        state.swarm.message = text(valueAt(data, ["message", "summary", "notice", "detail"], "蜂群提示已更新"));
+        break;
       case "contract.created": {
         const contract = normalizeContract(sourceEntity(data, "contract"), state.contracts.length);
         contract.status = normalizeStatus(valueAt(data, ["status", "state"], contract.status), contract.status);
@@ -698,22 +832,28 @@
         state.swarm.startedAt = state.swarm.startedAt || ts;
         touchPhase(data, "running");
         break;
-      case "bee.reasoning":
+      case "bee.reasoning": {
+        const existed = state.bees.some((entry) => entry.id === beeIdFrom(data));
         bee = ensureBee(data, "reasoning");
+        if (!existed) bee.reasoning = "";
         bee.status = "reasoning";
         bee.reasoning = appendStream(bee.reasoning, valueAt(data, ["reasoning", "text", "delta", "message"], ""));
         bee.updatedAt = ts;
         state.swarm.status = "running";
         touchPhase(data, "running");
         break;
-      case "bee.delta":
+      }
+      case "bee.delta": {
+        const existed = state.bees.some((entry) => entry.id === beeIdFrom(data));
         bee = ensureBee(data, "running");
+        if (!existed) bee.output = "";
         bee.status = "running";
         bee.output = appendStream(bee.output, valueAt(data, ["delta", "text", "output", "message"], ""));
         bee.updatedAt = ts;
         state.swarm.status = "running";
         touchPhase(data, "running");
         break;
+      }
       case "bee.tool_call":
         bee = ensureBee(data, "running");
         bee.status = "running";
@@ -725,6 +865,7 @@
         bee.toolCalls += 1;
         bee.updatedAt = ts;
         state.usage.toolCalls += 1;
+        state.usage.hasData = true;
         break;
       case "bee.tool_result":
         bee = ensureBee(data, "running");
@@ -768,9 +909,12 @@
         const raw = sourceEntity(data, "handoff");
         const id = text(valueAt(raw, ["capsule_id", "capsuleId", "message_id", "messageId", "handoff_id", "handoffId", "id"], ""));
         let handoff = id ? state.handoffs.find((entry) => entry.id === id) : null;
-        if (!handoff) handoff = upsert(state.handoffs, normalizeHandoff(raw, state.handoffs.length));
-        handoff.status = "acknowledged";
-        handoff.ackAt = ts;
+        const normalized = normalizeHandoff(raw, handoff ? handoff.order || 0 : state.handoffs.length);
+        if (!handoff) handoff = upsert(state.handoffs, normalized);
+        else Object.assign(handoff, normalized, { order: handoff.order });
+        handoff.status = normalized.status === "pending" ? "acknowledged" : normalized.status;
+        handoff.ackStatus = normalized.ackStatus || text(valueAt(raw, ["ack_status", "ackStatus"], typeof raw.ack === "string" ? raw.ack : "acknowledged"));
+        handoff.ackAt = normalized.ackAt || ts;
         break;
       }
       case "fact.conflicted": {
@@ -851,6 +995,7 @@
     }
 
     updateUsageFromEvent(data);
+    if (isTerminalEvent(type)) state.swarm.terminalType = type;
     state.swarm.updatedAt = ts;
     recordEvent(type, event, data, ts);
     render();
@@ -907,10 +1052,9 @@
   }
 
   function dispatchHostEvent(name, detail) {
-    if (typeof document === "undefined" || typeof CustomEvent !== "function") return false;
-    return document.dispatchEvent(new CustomEvent(name, {
+    if (typeof window === "undefined" || typeof window.dispatchEvent !== "function" || typeof CustomEvent !== "function") return false;
+    return window.dispatchEvent(new CustomEvent(name, {
       detail: clone(detail),
-      bubbles: false,
       cancelable: true,
     }));
   }
@@ -965,7 +1109,7 @@
     );
     append(command, metrics, progressBar(completion, "蜂群任务完成度"));
 
-    if (["planning", "planned", "pending"].includes(normalizeStatus(state.swarm.status, "idle")) && state.plan) {
+    if (state.plan && !state.confirmed && ["planning", "planned", "pending", "waiting"].includes(normalizeStatus(state.swarm.status, "idle"))) {
       const actions = create("div", "swarm-plan-actions");
       append(actions,
         actionButton("确认蜂群", "is-primary", "muliao-swarm-confirm", () => ({ plan: clone(state.plan) })),
@@ -1137,6 +1281,13 @@
       append(row, route);
       if (handoff.summary) append(row, setOptionalTitle(create("p", "swarm-row-desc", short(handoff.summary, 180)), handoff.summary));
       if (handoff.artifact) append(row, create("div", "swarm-path", "产物 · " + handoff.artifact));
+      const ackMeta = create("div", "swarm-inline-meta");
+      if (handoff.ackStatus) append(ackMeta, create("span", "", "ACK · " + handoff.ackStatus));
+      if (handoff.reasons.length) append(ackMeta, setOptionalTitle(create("span", "", "原因 " + handoff.reasons.length + " 项"), handoff.reasons.join("；")));
+      if (handoff.missing.length) append(ackMeta, setOptionalTitle(create("span", "", "缺失 " + handoff.missing.length + " 项"), handoff.missing.join("；")));
+      if (handoff.duplicate !== null && handoff.duplicate !== undefined) append(ackMeta, create("span", "", handoff.duplicate ? "重复回执" : "非重复"));
+      if (handoff.checkedSha256) append(ackMeta, setOptionalTitle(create("span", "", "SHA256 · " + short(handoff.checkedSha256, 18)), handoff.checkedSha256));
+      if (ackMeta.childNodes.length) append(row, ackMeta);
       append(list, row);
     });
     append(node, list);
@@ -1190,33 +1341,40 @@
 
   function renderBudget() {
     const node = section("预算 / 用量", null, "swarm-sec-budget");
-    const used = state.budget.used !== null ? state.budget.used : state.usage.totalTokens;
+    if (!state.budget.hasData && !state.usage.hasData) {
+      append(node, emptyRow("尚无预算或用量数据"));
+      return node;
+    }
+    const used = state.budget.used !== null ? state.budget.used : (state.usage.hasData ? state.usage.totalTokens : null);
     const limit = state.budget.limit;
     const ratio = limit && used !== null ? used / limit * 100 : 0;
     const card = create("div", "swarm-budget-card");
-    const numbers = create("div", "swarm-budget-numbers");
-    append(numbers,
-      metaItem("输入", formatCompact(state.usage.inputTokens), true),
-      metaItem("输出", formatCompact(state.usage.outputTokens), true),
-      metaItem("思考", formatCompact(state.usage.reasoningTokens), true)
-    );
-    append(card, numbers);
+    if (state.usage.hasData) {
+      const numbers = create("div", "swarm-budget-numbers");
+      append(numbers,
+        metaItem("输入", formatCompact(state.usage.inputTokens), true),
+        metaItem("输出", formatCompact(state.usage.outputTokens), true),
+        metaItem("思考", formatCompact(state.usage.reasoningTokens), true)
+      );
+      append(card, numbers);
+    }
 
-    const budgetHead = create("div", "swarm-budget-head");
-    append(budgetHead,
-      create("span", "", "总用量"),
-      create("b", "", formatInteger(used) + (limit !== null ? " / " + formatInteger(limit) : " tok"))
-    );
-    append(card, budgetHead, progressBar(ratio, "蜂群预算使用率"));
+    if (used !== null || limit !== null) {
+      const budgetHead = create("div", "swarm-budget-head");
+      append(budgetHead,
+        create("span", "", "总用量"),
+        create("b", "", (used !== null ? formatInteger(used) : "—") + (limit !== null ? " / " + formatInteger(limit) : " tok"))
+      );
+      append(card, budgetHead);
+      if (limit !== null && used !== null) append(card, progressBar(ratio, "蜂群预算使用率"));
+    }
 
     const foot = create("div", "swarm-budget-foot");
-    append(foot,
-      create("span", "", "工具 " + formatInteger(state.usage.toolCalls)),
-      create("span", "", "耗时 " + formatDuration(state.usage.elapsedMs))
-    );
+    if (state.usage.hasData && state.usage.toolCalls) append(foot, create("span", "", "工具 " + formatInteger(state.usage.toolCalls)));
+    if (state.usage.hasData && state.usage.elapsedMs !== null) append(foot, create("span", "", "耗时 " + formatDuration(state.usage.elapsedMs)));
     if (state.usage.cost !== null) append(foot, create("span", "", "费用 " + formatCost(state.usage.cost, state.budget.currency)));
     if (state.budget.costLimit !== null) append(foot, create("span", "", "上限 " + formatCost(state.budget.costLimit, state.budget.currency)));
-    append(card, foot);
+    if (foot.childNodes.length) append(card, foot);
     append(node, card);
     return node;
   }
@@ -1260,6 +1418,8 @@
       content,
       root,
       summary: document.getElementById("swarmSummary"),
+      seq: document.getElementById("swarmSeq"),
+      badge: document.getElementById("swarmBadge"),
       cancel: document.getElementById("swarmCancel"),
       pause: document.getElementById("swarmPause"),
       tab: document.querySelector('[data-tab="swarm"]'),
@@ -1271,6 +1431,15 @@
     const active = ["planning", "planned", "pending", "queued", "running", "reasoning", "waiting", "paused", "correcting"].includes(swarmStatus);
     const activeBees = state.bees.filter((bee) => ["running", "reasoning", "correcting"].includes(bee.status)).length;
     const doneBees = state.bees.filter((bee) => bee.status === "done").length;
+    const badgeState = ["error", "blocked", "conflict", "invalidated", "stale"].includes(swarmStatus)
+      ? { text: "失败", status: "issue" }
+      : ["done", "cancelled"].includes(swarmStatus)
+        ? { text: swarmStatus === "cancelled" ? "取消" : "完成", status: swarmStatus === "cancelled" ? "muted" : "done" }
+        : ["waiting", "paused", "queued", "planned", "pending"].includes(swarmStatus)
+          ? { text: "等待", status: "waiting" }
+          : ["planning", "running", "reasoning", "correcting"].includes(swarmStatus)
+            ? { text: "运行", status: "running" }
+            : { text: "", status: "neutral" };
 
     if (dom.summary) {
       const parts = [statusLabel(swarmStatus)];
@@ -1281,10 +1450,26 @@
       dom.summary.setAttribute("data-status", statusClass(swarmStatus));
     }
 
+    if (dom.seq) {
+      const lastGap = state.stream.gaps[state.stream.gaps.length - 1];
+      const sequence = state.swarm.lastSeq === null ? "seq —" : "seq " + String(state.swarm.lastSeq);
+      dom.seq.textContent = lastGap ? sequence + " · 缺 " + (lastGap.from === lastGap.to ? lastGap.from : lastGap.from + "–" + lastGap.to) : sequence;
+      if (lastGap) dom.seq.setAttribute("title", gapMessage(lastGap.from, lastGap.to));
+      else dom.seq.setAttribute("title", "");
+    }
+
+    if (dom.badge) {
+      dom.badge.textContent = badgeState.text;
+      dom.badge.setAttribute("data-status", badgeState.status);
+      dom.badge.setAttribute("aria-label", badgeState.text ? "蜂群" + badgeState.text : "");
+      dom.badge.hidden = !badgeState.text;
+    }
+
     if (dom.cancel) {
-      dom.cancel.disabled = !active || swarmStatus === "cancelled";
-      dom.cancel.setAttribute("aria-disabled", String(dom.cancel.disabled));
+      const cancelVisualDisabled = !active || swarmStatus === "cancelled" || dom.cancel.disabled;
+      dom.cancel.setAttribute("aria-disabled", String(cancelVisualDisabled));
       dom.cancel.setAttribute("data-status", statusClass(swarmStatus));
+      dom.cancel.setAttribute("data-swarm-actionable", String(!cancelVisualDisabled));
       if (!dom.cancel.getAttribute("title")) dom.cancel.setAttribute("title", "取消当前蜂群任务");
       if (dom.cancel.dataset.swarmBound !== "true") {
         dom.cancel.dataset.swarmBound = "true";
@@ -1298,20 +1483,18 @@
     }
 
     if (dom.pause) {
-      const pauseable = ["running", "reasoning", "correcting", "paused", "waiting"].includes(swarmStatus);
-      dom.pause.disabled = !pauseable;
-      dom.pause.setAttribute("aria-disabled", String(dom.pause.disabled));
-      dom.pause.setAttribute("aria-pressed", String(swarmStatus === "paused"));
-      dom.pause.setAttribute("data-status", statusClass(swarmStatus));
-      if (!dom.pause.getAttribute("title")) dom.pause.setAttribute("title", "暂停或继续蜂群任务");
+      dom.pause.disabled = true;
+      dom.pause.setAttribute("aria-disabled", "true");
+      dom.pause.setAttribute("aria-pressed", "false");
+      dom.pause.setAttribute("data-status", "neutral");
+      dom.pause.setAttribute("title", "暂停暂未实现，仅支持取消任务");
       if (dom.pause.dataset.swarmBound !== "true") {
         dom.pause.dataset.swarmBound = "true";
         dom.pause.addEventListener("click", () => {
-          dispatchHostEvent("muliao-swarm-toggle-pause", {
-            swarmId: state.swarm.id,
-            paused: state.swarm.status === "paused",
-            status: state.swarm.status,
-          });
+          if (!dom.pause.disabled) {
+            state.swarm.message = "暂停暂未实现；当前仅支持取消任务。";
+            render();
+          }
         });
       }
     }
@@ -1389,6 +1572,20 @@
     return getState();
   }
 
+  function markConfirmed(runId) {
+    state.confirmed = true;
+    const id = text(runId, "");
+    if (id) {
+      state.swarm.id = id;
+      state.stream.runId = id;
+    }
+    state.swarm.status = "running";
+    state.swarm.startedAt = state.swarm.startedAt || Date.now();
+    state.swarm.updatedAt = Date.now();
+    render();
+    return getState();
+  }
+
   function setConnection(status) {
     state.connection = normalizeConnection(status);
     render();
@@ -1402,6 +1599,7 @@
   const api = Object.freeze({
     reset,
     renderPlan,
+    markConfirmed,
     handleEvent,
     setConnection,
     getState,

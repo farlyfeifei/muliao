@@ -16,12 +16,12 @@ from swarm_api import SWARM_PLAN_QUESTIONS, SwarmService  # noqa: E402
 
 
 SAFE_ANSWERS = {
-    "swarm_worthy": {"choice": "yes"},
-    "task_type": {"choice": "research"},
-    "needs_clarify": {"choice": "no"},
-    "risk_level": {"choice": "low"},
-    "evidence_heavy": {"choice": "yes"},
-    "parallelizable": {"choice": "yes"},
+    "swarm_worthy": {"noul": 0.95},
+    "recipe_id": {"choice": "research"},
+    "needs_clarification": {"noul": 0.05},
+    "risk_score": {"score": 1.5},
+    "evidence_heavy": {"noul": 0.95},
+    "parallelizable": {"noul": 0.95},
 }
 
 
@@ -53,9 +53,9 @@ class SwarmServicePlanTests(unittest.TestCase):
             set(questions),
             {
                 "swarm_worthy",
-                "task_type",
-                "needs_clarify",
-                "risk_level",
+                "recipe_id",
+                "needs_clarification",
+                "risk_score",
                 "evidence_heavy",
                 "parallelizable",
             },
@@ -82,9 +82,9 @@ class SwarmServicePlanTests(unittest.TestCase):
         self.assertEqual(calls, 2)
         for field in (
             "swarm_worthy",
-            "task_type",
-            "needs_clarify",
-            "risk_level",
+            "recipe_id",
+            "needs_clarification",
+            "risk_score",
             "evidence_heavy",
             "parallelizable",
         ):
@@ -98,7 +98,7 @@ class SwarmServicePlanTests(unittest.TestCase):
     def test_high_risk_plan_requires_confirmation(self):
         def high_risk_jev(state, questions):
             answers = {key: dict(value) for key, value in SAFE_ANSWERS.items()}
-            answers["risk_level"] = {"choice": "high"}
+            answers["risk_score"] = {"score": 7}
             return {"ok": True, "answers": answers}
 
         service = SwarmService(orchestrator=_ExplodingOrchestrator())
@@ -171,6 +171,17 @@ class _BlockingOrchestrator:
             await asyncio.sleep(0.005)
 
 
+class _ForeignIdentityOrchestrator:
+    async def stream_run(self, **kwargs):
+        yield {
+            "event_id": "foreign-event",
+            "seq": 77,
+            "run_id": "foreign-run",
+            "type": "swarm.done",
+            "payload": {"final_text": "done"},
+        }
+
+
 class SwarmServiceStreamTests(unittest.TestCase):
     def test_stream_events_are_json_serializable_and_normalized(self):
         service = SwarmService(orchestrator=_EventOrchestrator())
@@ -191,7 +202,7 @@ class SwarmServiceStreamTests(unittest.TestCase):
             asyncio.Event(),
         )))
 
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 3)
         self.assertEqual(events[0]["type"], "bee.tool_result")
         self.assertEqual(events[0]["run_id"], "run-normalize")
         self.assertEqual(events[0]["seq"], 1)
@@ -199,8 +210,34 @@ class SwarmServiceStreamTests(unittest.TestCase):
         self.assertEqual(events[0]["payload"]["labels"], ["alpha", "beta"])
         self.assertEqual(events[0]["payload"]["raw"], "ok")
         self.assertEqual(events[1]["type"], "swarm.event")
+        self.assertEqual(events[2]["type"], "swarm.error")
+        self.assertEqual(events[2]["payload"]["code"], "missing_terminal")
         json.dumps(events, ensure_ascii=False)
-        self.assertEqual(service.status("run-normalize")["status"], "completed")
+        self.assertEqual(service.status("run-normalize")["status"], "failed")
+
+    def test_backend_event_identity_is_rebound_to_current_run(self):
+        service = SwarmService(orchestrator=_ForeignIdentityOrchestrator())
+        plan = {
+            "run_id": "run-current",
+            "swarm_worthy": True,
+            "needs_clarify": False,
+            "risk_level": "low",
+        }
+        events = asyncio.run(_collect(service.stream_run(
+            plan,
+            "identity-safe",
+            "session-current",
+            {},
+            None,
+            None,
+            asyncio.Event(),
+        )))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["run_id"], "run-current")
+        self.assertEqual(events[0]["seq"], 1)
+        self.assertEqual(events[0]["type"], "swarm.done")
+        self.assertEqual(service.status("run-current")["status"], "completed")
+        self.assertEqual(service.status("foreign-run")["status"], "unknown")
 
     def test_cancel_stops_an_active_stream_and_updates_status(self):
         async def scenario():

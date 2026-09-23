@@ -7,11 +7,13 @@
 import asyncio
 import copy
 import json
+import math
 import os
 import re
 import sys
 import time
 import threading
+import uuid
 import webbrowser
 from urllib.parse import urlsplit
 
@@ -121,6 +123,7 @@ import notifier
 import permissions
 import collectors
 import machine_tools
+import action_gate
 from swarm import RECIPES, ROLE_POOL, SwarmOrchestrator, deterministic_fallback_plan
 from swarm_api import SWARM_PLAN_QUESTIONS, SwarmService
 from swarm_models import BeeSpec
@@ -271,29 +274,216 @@ def sse(obj):
 
 
 # ============ Jev 调用 ============
+_JEV_RETRY_STATUSES = {429}
+_jev_log_lock = threading.Lock()
+
+
+def _jev_error_code(status: int | None) -> str:
+    if status == 402:
+        return "quota"
+    if status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "rate_limit"
+    return "upstream"
+
+
+def _log_jev_failure(*, code: str, status: int | None, attempts: int, ms: int,
+                     error_type: str, retrying: bool) -> None:
+    """写脱敏诊断：不记录 state、question 内容、API key 或响应正文。"""
+    line = (
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] JEV "
+        f"code={code} status={status if status is not None else '-'} "
+        f"attempt={attempts} ms={ms} error={error_type} retrying={int(retrying)}\n"
+    )
+    try:
+        with _jev_log_lock:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(_LOG_PATH, "a", encoding="utf-8") as log_file:
+                log_file.write(line)
+    except OSError:
+        pass
+
+
 async def jev_ask(state: str, questions: dict, timeout: float = 25.0) -> dict:
-    """调 Jev /v1/systemone。返回 {ok, answers, model, ms, usage, err, need_topup}。"""
+    """调 Jev；只有「请求尚未发出」的连接失败与 429 限流会重试一次。
+
+    读超时/5xx/529 说明请求可能已被上游处理，自动重发会重复计费，
+    因此只报告诊断码（timeout/upstream），由用户决定是否重试。
+    """
     body = {"state": str(state)[:24000], "model": JEV_MODEL, "questions": questions}
     headers = {"Authorization": f"Bearer {JEV_KEY}", "Content-Type": "application/json"}
-    t = time.time()
+    started = time.monotonic()
+    max_attempts = 2
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(JEV_URL, json=body, headers=headers)
-        ms = round((time.time() - t) * 1000)
-        if r.status_code == 200:
-            j = r.json()
-            return {"ok": True, "answers": j.get("answers", {}), "model": j.get("model"),
-                    "usage": j.get("usage"), "ms": ms, "err": None, "need_topup": False}
-        # 401/403 = key 或额度问题；429/529 = 限流/过载（可重试）
-        msg = r.text[:300]
-        need_topup = r.status_code in (401, 402, 403)
-        return {"ok": False, "answers": {}, "model": None, "usage": None, "ms": ms,
-                "err": f"HTTP {r.status_code}: {msg}", "need_topup": need_topup,
-                "status": r.status_code}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "answers": {}, "model": None, "usage": None,
-                "ms": round((time.time() - t) * 1000), "err": f"{type(e).__name__}: {e}",
-                "need_topup": False}
+            for attempt in range(1, max_attempts + 1):
+                status = None
+                code = "upstream"
+                error_type = "upstream"
+                message = "Jev 上游异常"
+                retryable = False
+                try:
+                    response = await client.post(JEV_URL, json=body, headers=headers)
+                    status = response.status_code
+                    if status == 200:
+                        try:
+                            payload = response.json()
+                        except (TypeError, ValueError) as exc:
+                            ms = round((time.monotonic() - started) * 1000)
+                            _log_jev_failure(
+                                code="bad_response", status=200, attempts=attempt, ms=ms,
+                                error_type=type(exc).__name__, retrying=False,
+                            )
+                            return {
+                                "ok": False, "answers": {}, "model": None, "usage": None,
+                                "ms": ms, "err": "Jev 返回的 JSON 无法解析",
+                                "need_topup": False, "code": "bad_response", "status": 200,
+                                "attempts": attempt,
+                            }
+                        answers = payload.get("answers") if isinstance(payload, dict) else None
+                        if not isinstance(answers, dict):
+                            ms = round((time.monotonic() - started) * 1000)
+                            _log_jev_failure(
+                                code="bad_response", status=200, attempts=attempt, ms=ms,
+                                error_type="missing_answers", retrying=False,
+                            )
+                            return {
+                                "ok": False, "answers": {}, "model": None, "usage": None,
+                                "ms": ms, "err": "Jev 返回缺少 answers",
+                                "need_topup": False, "code": "bad_response", "status": 200,
+                                "attempts": attempt,
+                            }
+                        expected_keys = set(questions)
+                        missing_keys = sorted(expected_keys.difference(answers))
+                        malformed_keys = []
+                        for answer_id in expected_keys.intersection(answers):
+                            question = questions.get(answer_id) or {}
+                            answer = answers.get(answer_id)
+                            answer_type = question.get("type") if isinstance(question, dict) else None
+                            value_key = {"noul": "noul", "choice": "choice", "score": "score"}.get(answer_type)
+                            if not isinstance(answer, dict) or value_key not in answer:
+                                malformed_keys.append(answer_id)
+                                continue
+                            if answer.get("type") is not None and answer.get("type") != answer_type:
+                                malformed_keys.append(answer_id)
+                                continue
+                            raw_value = answer.get(value_key)
+                            if answer_type == "choice":
+                                allowed = question.get("criteria") if isinstance(question.get("criteria"), dict) else {}
+                                if not isinstance(raw_value, str) or not raw_value.strip() or raw_value not in allowed:
+                                    malformed_keys.append(answer_id)
+                            elif answer_type == "noul":
+                                if isinstance(raw_value, bool):
+                                    pass
+                                elif not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool) or not math.isfinite(float(raw_value)) or not 0.0 <= float(raw_value) <= 1.0:
+                                    malformed_keys.append(answer_id)
+                            elif answer_type == "score":
+                                if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool) or not math.isfinite(float(raw_value)) or not 0.0 <= float(raw_value) <= 10.0:
+                                    malformed_keys.append(answer_id)
+                            else:
+                                malformed_keys.append(answer_id)
+                        if missing_keys or malformed_keys:
+                            ms = round((time.monotonic() - started) * 1000)
+                            detail = []
+                            if missing_keys:
+                                detail.append("missing=" + ",".join(missing_keys))
+                            if malformed_keys:
+                                detail.append("malformed=" + ",".join(sorted(malformed_keys)))
+                            _log_jev_failure(
+                                code="bad_response", status=200, attempts=attempt, ms=ms,
+                                error_type="invalid_answers", retrying=False,
+                            )
+                            return {
+                                "ok": False, "answers": {}, "model": None, "usage": None,
+                                "ms": ms, "err": "Jev answers 不完整（" + "; ".join(detail) + "）",
+                                "need_topup": False, "code": "bad_response", "status": 200,
+                                "attempts": attempt,
+                            }
+                        return {
+                            "ok": True,
+                            "answers": answers,
+                            "model": payload.get("model"),
+                            "usage": payload.get("usage"),
+                            "ms": round((time.monotonic() - started) * 1000),
+                            "err": None,
+                            "need_topup": False,
+                            "code": None,
+                            "status": 200,
+                            "attempts": attempt,
+                        }
+
+                    code = _jev_error_code(status)
+                    error_type = f"HTTP_{status}"
+                    message = f"HTTP {status}: {response.text[:300]}"
+                    retryable = status in _JEV_RETRY_STATUSES
+                    retry_delay = 0.45
+                    if status == 429:
+                        try:
+                            retry_delay = min(2.0, max(0.1, float(response.headers.get("retry-after", retry_delay))))
+                        except (AttributeError, TypeError, ValueError):
+                            pass
+                except asyncio.CancelledError:
+                    raise
+                except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+                    code = "network"
+                    error_type = type(exc).__name__
+                    message = f"{type(exc).__name__}: Jev 连接建立失败"
+                    retryable = True
+                    retry_delay = 0.45
+                except httpx.TimeoutException as exc:
+                    code = "timeout"
+                    error_type = type(exc).__name__
+                    message = f"{type(exc).__name__}: Jev 请求超时（为避免重复计费未自动重试）"
+                    retryable = False
+                    retry_delay = 0.0
+                except httpx.TransportError as exc:
+                    code = "network"
+                    error_type = type(exc).__name__
+                    message = f"{type(exc).__name__}: Jev 传输中断（为避免重复计费未自动重试）"
+                    retryable = False
+                    retry_delay = 0.0
+                except Exception as exc:  # noqa: BLE001
+                    code = "upstream"
+                    error_type = type(exc).__name__
+                    message = f"{type(exc).__name__}: {machine_tools.sanitize_error(exc)}"
+                    retry_delay = 0.0
+
+                ms = round((time.monotonic() - started) * 1000)
+                should_retry = retryable and attempt < max_attempts
+                _log_jev_failure(
+                    code=code, status=status, attempts=attempt, ms=ms,
+                    error_type=error_type, retrying=should_retry,
+                )
+                if should_retry:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                return {
+                    "ok": False,
+                    "answers": {},
+                    "model": None,
+                    "usage": None,
+                    "ms": ms,
+                    "err": message,
+                    "need_topup": status in (401, 402, 403),
+                    "code": code,
+                    "status": status,
+                    "attempts": attempt,
+                }
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        ms = round((time.monotonic() - started) * 1000)
+        _log_jev_failure(
+            code="network", status=None, attempts=1, ms=ms,
+            error_type=type(exc).__name__, retrying=False,
+        )
+        return {
+            "ok": False, "answers": {}, "model": None, "usage": None,
+            "ms": ms, "err": f"{type(exc).__name__}: Jev 客户端初始化失败",
+            "need_topup": False, "code": "network", "status": None, "attempts": 1,
+        }
 
 
 async def jev_health(force=False) -> dict:
@@ -421,6 +611,7 @@ async def perm_status():
     return _json({
         "consent": permissions.status(),
         "sources": collectors.sources(),
+        "capabilities": collectors.capabilities(),
     })
 
 
@@ -573,13 +764,14 @@ async def judge(req: Request):
     if not res["ok"]:
         return _json({
             "engine": "Jev", "ok": False, "kind": kind, "answers": {},
-            "err": res.get("err"), "need_topup": res.get("need_topup"),
+            "err": res.get("err"), "code": res.get("code"), "status": res.get("status"),
+            "attempts": res.get("attempts"), "need_topup": res.get("need_topup"),
             "console": JEV_CONSOLE, "ms": res.get("ms"),
         }, 200)
     return _json({
         "engine": "Jev", "ok": True, "kind": kind,
         "ms": res.get("ms"), "model": res.get("model"), "usage": res.get("usage"),
-        "answers": res.get("answers", {}),
+        "attempts": res.get("attempts"), "answers": res.get("answers", {}),
     })
 
 
@@ -782,6 +974,70 @@ def _turn_lock(sid: str) -> asyncio.Lock:
 
 def _permission_version() -> int:
     return _permission_epoch
+
+
+# ============ 动作门控 + 高风险确认（让 Jev 参与每一次工具行为）============
+# 每个工具执行前先过 action_gate.evaluate：
+#   allow   → 直接执行
+#   confirm → 发 tool_confirm 事件，挂起等待用户经 /api/chat/confirm 拍板，再决定执行/拒绝
+#   deny    → 拒绝执行，回灌拒绝占位结果（不真正调用工具）
+# 确认用 asyncio.Future 在「流生成器」与「确认 POST 端点」之间搭桥：
+# 二者跑在同一事件循环，POST 端点 set_result 即可唤醒挂起的生成器。
+_pending_confirms: dict[str, asyncio.Future] = {}
+_pending_confirms_lock = threading.Lock()
+_CONFIRM_TIMEOUT = float(os.environ.get("MULIAO_CONFIRM_TIMEOUT", "120"))
+
+
+def _register_confirm(confirm_id: str) -> asyncio.Future:
+    """登记一个待确认动作，返回供生成器 await 的 Future。"""
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    with _pending_confirms_lock:
+        _pending_confirms[confirm_id] = fut
+    return fut
+
+
+def _resolve_confirm(confirm_id: str, decision: str) -> bool:
+    """确认端点调用：把用户决定送达挂起的生成器。未知/已决的 id 返回 False。"""
+    with _pending_confirms_lock:
+        fut = _pending_confirms.pop(confirm_id, None)
+    if fut is None:
+        return False
+    if not fut.done():
+        fut.set_result(decision)
+    return True
+
+
+def _discard_confirm(confirm_id: str) -> None:
+    """客户端断流/取消时清理：未决的确认一律按拒绝处理，避免 Future 悬挂。"""
+    with _pending_confirms_lock:
+        fut = _pending_confirms.pop(confirm_id, None)
+    if fut is not None and not fut.done():
+        fut.set_result("deny")
+
+
+async def _await_confirmation(confirm_id: str, timeout: float) -> str:
+    """挂起等待用户决定。超时/取消一律视为拒绝（fail-safe）。"""
+    fut = _register_confirm(confirm_id)
+    try:
+        decision = await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        decision = "deny"
+    except asyncio.CancelledError:
+        _discard_confirm(confirm_id)
+        raise
+    finally:
+        with _pending_confirms_lock:
+            _pending_confirms.pop(confirm_id, None)
+    return decision if decision in ("allow", "deny") else "deny"
+
+
+# 控制类工具中文名（前端弹窗与 tool_gate 展示用；前端也自带一份映射）
+_CONTROL_TOOL_CN = {
+    "list_windows": "列出窗口", "focus_window": "聚焦窗口", "close_window": "关闭窗口",
+    "open_application": "打开应用", "click_element": "点击控件", "type_text": "输入文字",
+    "press_keys": "发送按键",
+}
 
 
 # ============ Ghost 蜂群：真实运行时装配与 API 适配 ============
@@ -1374,7 +1630,7 @@ async def chat(req: Request):
     # 会话对齐与 user 追加在流生成器拿到该 session 的独占锁后完成。
     # 这样同一会话的并发请求不会交错，失败/断流也可以整体回滚。
 
-    turn_state = {"committed": False, "epoch": None}
+    turn_state = {"committed": False, "epoch": None, "confirm_id": None}
 
     async def gen_turn():
         _sess_realign(session_id, client_messages, last_user)
@@ -1519,11 +1775,57 @@ async def chat(req: Request):
                                                    "hint": "工具参数不完整，已拒绝执行，请不要重试。"},
                                                   ensure_ascii=False)
                         else:
-                            tool_out = await asyncio.to_thread(machine_tools.execute_tool,
-                                                               c["name"], args)
+                            # ── Jev 动作门控：每个工具执行前先裁决 ──
+                            is_control = machine_tools.is_control_tool(c["name"])
+                            gate = await action_gate.evaluate(
+                                tool_name=c["name"], args=args, user_text=last_user,
+                                control=is_control, jev_ask=jev_ask,
+                                permission_snapshot=_swarm_permission_snapshot(),
+                            )
+                            gate_ms = round((time.time() - t0) * 1000)
+                            yield sse({
+                                "type": "tool_gate", "id": c["id"], "name": c["name"],
+                                "action": gate.action, "risk": round(gate.risk, 2),
+                                "reason": gate.reason, "source": gate.source,
+                                "needs_confirmation": gate.needs_confirmation,
+                                "jev_ok": gate.jev_ok, "ms": gate_ms,
+                            })
+                            execute = False
+                            if gate.action == "allow":
+                                execute = True
+                            elif gate.action == "deny":
+                                tool_out = json.dumps({
+                                    "error": "blocked_by_jev",
+                                    "hint": f"Jev 门控拒绝执行此动作：{gate.reason}。不要重试。",
+                                }, ensure_ascii=False)
+                            else:  # confirm
+                                confirm_id = uuid.uuid4().hex
+                                turn_state["confirm_id"] = confirm_id
+                                yield sse({
+                                    "type": "tool_confirm", "confirm_id": confirm_id,
+                                    "id": c["id"], "name": c["name"],
+                                    "cn": _CONTROL_TOOL_CN.get(c["name"], c["name"]),
+                                    "args": args, "risk": round(gate.risk, 2),
+                                    "reason": gate.reason,
+                                    "timeout_ms": int(_CONFIRM_TIMEOUT * 1000),
+                                })
+                                decision = await _await_confirmation(confirm_id, _CONFIRM_TIMEOUT)
+                                turn_state["confirm_id"] = None
+                                if decision == "allow":
+                                    execute = True
+                                else:
+                                    tool_out = json.dumps({
+                                        "error": "denied_by_user",
+                                        "hint": "用户拒绝了此动作。不要重试，请询问用户意图。",
+                                    }, ensure_ascii=False)
+                            if execute:
+                                tool_out = await asyncio.to_thread(machine_tools.execute_tool,
+                                                                   c["name"], args)
                         ms = round((time.time() - t0) * 1000)
                         denied = (args is None or "未获用户授权" in tool_out
-                                  or "unavailable_tool" in tool_out)
+                                  or "unavailable_tool" in tool_out
+                                  or "blocked_by_jev" in tool_out
+                                  or "denied_by_user" in tool_out)
                         tools_used.append({"name": c["name"], "ms": ms, "denied": denied,
                                            "bytes": len(tool_out)})
                         yield sse({"type": "tool_result", "id": c["id"], "name": c["name"],
@@ -1588,12 +1890,43 @@ async def chat(req: Request):
                 async for item in gen_turn():
                     yield item
             finally:
+                # 客户端断流/取消时，若有挂起的确认，一律按拒绝收掉，避免 Future 悬挂、
+                # 也避免控制类动作在无人确认的情况下被放行。
+                cid = turn_state.get("confirm_id")
+                if cid:
+                    _discard_confirm(cid)
+                    turn_state["confirm_id"] = None
                 if (not turn_state["committed"]
                         and turn_state["epoch"] == _permission_version()):
                     _sess_restore(session_id, snapshot)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/chat/confirm")
+async def chat_confirm(req: Request):
+    """用户对一次高风险动作的裁决：body {confirm_id, decision: "allow"|"deny"}。
+
+    把决定送达正挂起等待的 /api/chat 流生成器。未知/已决/已过期的 confirm_id
+    返回 ok:false（前端据此关闭弹窗并提示）。
+    """
+    try:
+        b = await req.json()
+    except Exception:
+        return _json({"ok": False, "err": "请求体不是合法 JSON"}, 400)
+    if not isinstance(b, dict):
+        return _json({"ok": False, "err": "请求体必须是 JSON 对象"}, 400)
+    confirm_id = str(b.get("confirm_id") or "").strip()
+    decision = b.get("decision")
+    if not confirm_id:
+        return _json({"ok": False, "err": "confirm_id 不能为空"}, 422)
+    if decision not in ("allow", "deny"):
+        return _json({"ok": False, "err": "decision 必须是 allow 或 deny"}, 422)
+    delivered = _resolve_confirm(confirm_id, decision)
+    if not delivered:
+        return _json({"ok": False, "err": "该确认已失效或不存在（可能已超时/已取消）"}, 404)
+    return _json({"ok": True, "confirm_id": confirm_id, "decision": decision})
 
 
 async def _swarm_json_body(req: Request):
@@ -1606,6 +1939,25 @@ async def _swarm_json_body(req: Request):
     return body, None
 
 
+async def _wait_for_request_disconnect(req: Request) -> None:
+    while not await req.is_disconnected():
+        await asyncio.sleep(0.05)
+
+
+async def _cancel_task(task: asyncio.Task) -> None:
+    if task.done():
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+        return
+    task.cancel()
+    # Request.is_disconnected() may be waiting on the ASGI receive channel in
+    # synchronous TestClient transports. Do not hold the response open while
+    # waiting for that listener to acknowledge cancellation.
+    await asyncio.sleep(0)
+
+
 @app.post("/api/swarm/plan")
 async def swarm_plan(req: Request):
     body, error = await _swarm_json_body(req)
@@ -1616,14 +1968,39 @@ async def swarm_plan(req: Request):
     if not goal:
         return _json({"ok": False, "err": "goal 不能为空"}, 400)
     permissions_snapshot = _swarm_permission_snapshot()
+    planner_state = json.dumps(
+        {
+            "goal": goal,
+            "session_id": session_id,
+            "permissions_snapshot": permissions_snapshot,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    plan_task = asyncio.create_task(jev_ask(planner_state, copy.deepcopy(SWARM_PLAN_QUESTIONS)))
+    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(req))
     try:
-        raw_plan = await asyncio.to_thread(
-            _swarm_service.plan,
+        done, _ = await asyncio.wait(
+            {plan_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect_task in done and plan_task not in done:
+            await _cancel_task(plan_task)
+            raise asyncio.CancelledError()
+        await _cancel_task(disconnect_task)
+        jev_response = await plan_task
+        raw_plan = _swarm_service.plan(
             goal,
             session_id,
             permissions_snapshot,
-            jev_ask,
+            lambda _state, _questions: jev_response,
         )
+        if await req.is_disconnected():
+            raw_run_id = str(raw_plan.get("run_id") or "") if isinstance(raw_plan, dict) else ""
+            if raw_run_id:
+                _swarm_service.cancel(raw_run_id)
+            raise asyncio.CancelledError()
         plan = _normalize_swarm_plan(
             raw_plan,
             permissions_snapshot,
@@ -1644,8 +2021,14 @@ async def swarm_plan(req: Request):
             permission_version=permissions_snapshot["permission_version"],
         )
         return _json({"ok": True, "plan": plan})
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001
         return _json({"ok": False, "err": machine_tools.sanitize_error(exc)}, 500)
+    finally:
+        await _cancel_task(disconnect_task)
+        if not plan_task.done():
+            await _cancel_task(plan_task)
 
 
 @app.post("/api/swarm/run")

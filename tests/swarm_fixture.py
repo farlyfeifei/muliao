@@ -146,7 +146,7 @@ class MockJev:
     ) -> dict[str, Any]:
         del state, timeout
         question_ids = tuple(questions)
-        if "swarm_worthy" in questions and "task_type" in questions:
+        if "swarm_worthy" in questions and ({"recipe_id", "task_type"} & set(questions)):
             self.plan_calls += 1
             if self.fail_planning:
                 return {
@@ -159,18 +159,32 @@ class MockJev:
                     "need_topup": False,
                 }
             is_swarm = self.recipe != "single"
-            answers = {
-                "swarm_worthy": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
-                "task_type": {
-                    "type": "choice",
-                    "choice": self.recipe,
-                    "confidence": 0.96,
-                },
-                "needs_clarify": {"type": "noul", "noul": 0.0},
-                "risk_level": {"type": "score", "score": 2.0},
-                "evidence_heavy": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
-                "parallelizable": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
-            }
+            if "recipe_id" in questions:
+                answers = {
+                    "swarm_worthy": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
+                    "recipe_id": {
+                        "type": "choice",
+                        "choice": self.recipe,
+                        "confidence": 0.96,
+                    },
+                    "needs_clarification": {"type": "noul", "noul": 0.0},
+                    "risk_score": {"type": "score", "score": 2.0},
+                    "evidence_heavy": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
+                    "parallelizable": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
+                }
+            else:
+                answers = {
+                    "swarm_worthy": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
+                    "task_type": {
+                        "type": "choice",
+                        "choice": self.recipe,
+                        "confidence": 0.96,
+                    },
+                    "needs_clarify": {"type": "noul", "noul": 0.0},
+                    "risk_level": {"type": "score", "score": 2.0},
+                    "evidence_heavy": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
+                    "parallelizable": {"type": "noul", "noul": 1.0 if is_swarm else 0.0},
+                }
             return {
                 "ok": True,
                 "answers": answers,

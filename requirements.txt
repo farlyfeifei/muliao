@@ -23,3 +23,8 @@ psutil==7.2.2
 # Windows 窗口枚举（collectors.windows 用 win32gui / win32process）
 # 仅 Windows 需要；macOS / Linux 上该采集源自动降级、不影响其余功能。
 pywin32==312 ; sys_platform == "win32"
+
+# Windows 桌面控制（machine_control 用 pywinauto 的 uia backend 做点击/输入/组合键）
+# 仅 Windows 需要；缺库或非 Win 时 machine_control 各函数降级返回 control_unavailable。
+# comtypes 为 pywinauto 的传递依赖，pip 自动带入，无需单列。
+pywinauto==0.6.9 ; sys_platform == "win32"

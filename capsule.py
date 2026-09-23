@@ -18,7 +18,6 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from swarm_models import (
-    ACK_STATUSES,
     FACT_STATES,
     AckStatus,
     CapsuleAck,
@@ -27,6 +26,7 @@ from swarm_models import (
     TaskContract,
     WorkCapsule,
     canonical_json,
+    json_value,
 )
 from swarm_store import DuplicateMessageError, SwarmStore
 
@@ -74,8 +74,10 @@ def build_capsule(
     loss_manifest: Sequence[JSONValue] = (),
     depends_on: Sequence[str] = (),
     sender_claims: Mapping[str, JSONValue] | None = None,
+    payload: JSONValue = None,
     permission_snapshot: JSONValue = None,
     required_permissions: Sequence[str] = (),
+    created_at: str | None = None,
     expires_at: str | None = None,
     message_id: str | None = None,
     capsule_id: str | None = None,
@@ -97,16 +99,122 @@ def build_capsule(
         loss_manifest=tuple(loss_manifest),
         depends_on=tuple(depends_on),
         sender_claims=dict(sender_claims or {}),
+        payload=payload,
         permission_snapshot=permission_snapshot,
         required_permissions=tuple(required_permissions),
+        **({"created_at": created_at} if created_at is not None else {}),
         expires_at=expires_at,
     )
 
 
-def _parse_timestamp(value: str) -> datetime:
+def _handoff_items(
+    result: Mapping[str, Any], name: str, *, mappings: bool = False
+) -> tuple[Any, ...]:
+    value = result.get(name, ())
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise TypeError(f"result {name} must be a sequence")
+    if mappings:
+        if any(not isinstance(item, Mapping) for item in value):
+            raise TypeError(f"result {name} entries must be mappings")
+        return tuple(dict(item) for item in value)
+    return tuple(value)
+
+
+def _constraint_identifier(constraint: Any) -> str:
+    if isinstance(constraint, str) and constraint:
+        return constraint
+    if isinstance(constraint, Mapping):
+        for name in ("id", "text", "string"):
+            value = constraint.get(name)
+            if isinstance(value, str) and value:
+                return value
+    return canonical_json(constraint)
+
+
+def _handoff_created_at(created_at: Any, identity: Mapping[str, Any]) -> str:
+    if isinstance(created_at, str) and created_at:
+        return created_at
+    digest = hashlib.sha256(canonical_json(identity).encode("utf-8")).digest()
+    seconds = int.from_bytes(digest[:4], "big") % (200 * 365 * 24 * 60 * 60)
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def build_handoff_capsule(
+    *,
+    run_id: str,
+    stage_id: str,
+    contract: TaskContract | Mapping[str, Any],
+    from_bee: str,
+    to_bee: str,
+    result: Any,
+    attempt: int = 1,
+) -> WorkCapsule:
+    """Build a deterministic, lossless capsule for one stage handoff."""
+
+    if not run_id or not stage_id or not from_bee or not to_bee:
+        raise ValueError("run_id, stage_id, from_bee, and to_bee are required")
+    if attempt < 1:
+        raise ValueError("attempt must be at least 1")
+
+    contract_created_at = (
+        contract.created_at
+        if isinstance(contract, TaskContract)
+        else contract.get("created_at")
+    )
+    task_contract = (
+        contract if isinstance(contract, TaskContract) else TaskContract.from_dict(contract)
+    )
+    safe_result = json_value(result)
+    structured = safe_result if isinstance(safe_result, Mapping) else {}
+    identity = {
+        "run_id": run_id,
+        "task_id": task_contract.task_id,
+        "contract_rev": task_contract.contract_rev,
+        "stage_id": stage_id,
+        "from_bee": from_bee,
+        "to_bee": to_bee,
+        "attempt": attempt,
+    }
+    digest = json_sha256(identity)[:20]
+    required_constraints = tuple(
+        _constraint_identifier(item) for item in task_contract.required_constraints
+    )
+
+    return build_capsule(
+        task_id=task_contract.task_id,
+        contract_rev=task_contract.contract_rev,
+        from_bee=from_bee,
+        to_bee=to_bee,
+        required_constraints=required_constraints,
+        facts=_handoff_items(structured, "facts", mappings=True),
+        artifacts=_handoff_items(structured, "artifacts", mappings=True),
+        open_questions=_handoff_items(structured, "open_questions"),
+        side_effects=_handoff_items(structured, "side_effects"),
+        loss_manifest=_handoff_items(structured, "loss_manifest"),
+        depends_on=_handoff_items(structured, "depends_on"),
+        sender_claims={"required_payload_complete": True},
+        payload=safe_result,
+        permission_snapshot=task_contract.permission_snapshot,
+        required_permissions=task_contract.allowed_tools,
+        created_at=_handoff_created_at(
+            contract_created_at,
+            identity,
+        ),
+        message_id=f"msg_{digest}",
+        capsule_id=f"cap_{digest}",
+    )
+
+
+def _parse_timestamp(value: str, *, require_timezone: bool = False) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError("timestamp must be non-empty text")
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None:
+        if require_timezone:
+            raise ValueError("timestamp must include a timezone")
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
@@ -178,6 +286,7 @@ def verify_capsule(
     *,
     current_permission_snapshot: JSONValue,
     receiver_permissions: Collection[str] = (),
+    receiver_bee: str | None = None,
     artifact_loader: ArtifactLoader | None = None,
     now: datetime | None = None,
 ) -> CapsuleAck:
@@ -194,6 +303,16 @@ def verify_capsule(
             capsule,
             AckStatus.INCOMPATIBLE,
             reasons=(f"unsupported protocol: {capsule.protocol}",),
+        )
+
+    if receiver_bee is not None and receiver_bee != capsule.to_bee:
+        return _ack(
+            capsule,
+            AckStatus.FORBIDDEN,
+            reasons=(
+                f"receiver {receiver_bee!r} does not match capsule recipient "
+                f"{capsule.to_bee!r}",
+            ),
         )
 
     current_contract = store.current_contract(capsule.task_id)
@@ -255,7 +374,9 @@ def verify_capsule(
             missing=tuple(f"permission:{item}" for item in missing_permissions),
         )
 
-    contract_constraints = set(current_contract.required_constraint_ids)
+    contract_constraints = {
+        _constraint_identifier(item) for item in current_contract.required_constraints
+    }
     capsule_constraints = set(capsule.required_constraints)
     missing_constraints = sorted(contract_constraints - capsule_constraints)
     if missing_constraints:
@@ -277,11 +398,37 @@ def verify_capsule(
                 reasons=("artifact is missing artifact_id",),
                 missing=("artifact_id",),
             )
+        artifact_status = artifact.get("status", "current")
+        if artifact_status == "stale":
+            return _ack(
+                capsule,
+                AckStatus.STALE,
+                reasons=(f"artifact {artifact_id} is stale",),
+            )
+        if artifact_status != "current":
+            return _ack(
+                capsule,
+                AckStatus.INCOMPATIBLE,
+                reasons=(
+                    f"artifact {artifact_id} has unsupported status: "
+                    f"{artifact_status}",
+                ),
+            )
         if artifact_id in artifacts and not _same_json(artifacts[artifact_id], artifact):
             return _ack(
                 capsule,
                 AckStatus.CONFLICTED,
                 reasons=(f"artifact {artifact_id} has conflicting manifests",),
+            )
+        stored_artifact = store.get_artifact(artifact_id)
+        if stored_artifact is not None and stored_artifact["task_id"] != capsule.task_id:
+            return _ack(
+                capsule,
+                AckStatus.CONFLICTED,
+                reasons=(
+                    f"artifact {artifact_id} belongs to task "
+                    f"{stored_artifact['task_id']!r}, not {capsule.task_id!r}",
+                ),
             )
         artifacts[artifact_id] = artifact
 
@@ -300,11 +447,30 @@ def verify_capsule(
                     reasons=(f"referenced artifact {artifact_id} is unavailable",),
                     missing=(f"artifact:{artifact_id}",),
                 )
-            if stored["status"] == "stale":
+            if stored["task_id"] != capsule.task_id:
+                return None, _ack(
+                    capsule,
+                    AckStatus.CONFLICTED,
+                    reasons=(
+                        f"artifact {artifact_id} belongs to task {stored['task_id']!r}, "
+                        f"not {capsule.task_id!r}",
+                    ),
+                )
+            stored_status = stored["status"]
+            if stored_status == "stale":
                 return None, _ack(
                     capsule,
                     AckStatus.STALE,
                     reasons=(f"artifact {artifact_id} is stale",),
+                )
+            if stored_status != "current":
+                return None, _ack(
+                    capsule,
+                    AckStatus.INCOMPATIBLE,
+                    reasons=(
+                        f"artifact {artifact_id} has unsupported status: "
+                        f"{stored_status}",
+                    ),
                 )
             manifest = _row_artifact(stored)
         expected_hash = manifest.get("sha256")
@@ -317,7 +483,7 @@ def verify_capsule(
             )
         try:
             actual_hash = sha256_bytes(artifact_loader(manifest))
-        except (OSError, ValueError, TypeError) as exc:
+        except Exception as exc:  # External loaders may raise provider-specific errors.
             return None, _ack(
                 capsule,
                 AckStatus.NEED_CONTEXT,
@@ -364,6 +530,28 @@ def verify_capsule(
             )
         inline_facts[fact_id] = fact
 
+        fact_expires_at = fact.get("expires_at")
+        if fact_expires_at is not None:
+            try:
+                parsed_fact_expiry = _parse_timestamp(
+                    fact_expires_at, require_timezone=True
+                )
+            except (TypeError, ValueError):
+                return _ack(
+                    capsule,
+                    AckStatus.INCOMPATIBLE,
+                    reasons=(
+                        f"fact {fact_id} expires_at is not a valid ISO-8601 "
+                        "timestamp with timezone",
+                    ),
+                )
+            if parsed_fact_expiry <= check_time:
+                return _ack(
+                    capsule,
+                    AckStatus.STALE,
+                    reasons=(f"fact {fact_id} has expired",),
+                )
+
         if state == "invalidated":
             return _ack(
                 capsule,
@@ -379,6 +567,36 @@ def verify_capsule(
 
         stored_fact = store.get_fact(fact_id)
         if stored_fact is not None:
+            if stored_fact["task_id"] != capsule.task_id:
+                return _ack(
+                    capsule,
+                    AckStatus.CONFLICTED,
+                    reasons=(
+                        f"fact {fact_id} belongs to task {stored_fact['task_id']!r}, "
+                        f"not {capsule.task_id!r}",
+                    ),
+                )
+            stored_expires_at = stored_fact["expires_at"]
+            if stored_expires_at is not None:
+                try:
+                    parsed_stored_expiry = _parse_timestamp(
+                        stored_expires_at, require_timezone=True
+                    )
+                except (TypeError, ValueError):
+                    return _ack(
+                        capsule,
+                        AckStatus.INCOMPATIBLE,
+                        reasons=(
+                            f"stored fact {fact_id} expires_at is not a valid "
+                            "ISO-8601 timestamp with timezone",
+                        ),
+                    )
+                if parsed_stored_expiry <= check_time:
+                    return _ack(
+                        capsule,
+                        AckStatus.STALE,
+                        reasons=(f"stored fact {fact_id} has expired",),
+                    )
             if stored_fact["state"] == "invalidated":
                 return _ack(
                     capsule,
@@ -433,7 +651,29 @@ def verify_capsule(
                         reasons=(f"fact {fact_id} source sha256 mismatch",),
                     )
 
-    dependency_states = store.dependency_states(capsule.depends_on)
+    dependency_ids: list[str] = list(capsule.depends_on)
+    for fact in capsule.facts:
+        raw_dependencies = fact.get("depends_on", ())
+        if raw_dependencies is None:
+            continue
+        if not isinstance(raw_dependencies, Sequence) or isinstance(
+            raw_dependencies, (str, bytes, bytearray)
+        ):
+            return _ack(
+                capsule,
+                AckStatus.INCOMPATIBLE,
+                reasons=(
+                    f"fact {fact.get('fact_id') or '<unknown>'} depends_on "
+                    "is not a sequence",
+                ),
+            )
+        dependency_ids.extend(str(item) for item in raw_dependencies if str(item))
+
+    dependency_states = store.dependency_states(
+        tuple(dict.fromkeys(dependency_ids)),
+        task_id=capsule.task_id,
+        now=check_time,
+    )
     missing_dependencies = sorted(
         dependency_id
         for dependency_id, state in dependency_states.items()
@@ -470,32 +710,21 @@ def verify_capsule(
             reasons=("capsule depends on conflicted facts",),
             missing=tuple(f"conflict:{item}" for item in conflicted_dependencies),
         )
+    rejected_dependencies = sorted(
+        dependency_id
+        for dependency_id, state in dependency_states.items()
+        if state not in (None, "current", "verified", "observed", "inferred")
+        and state not in ("invalidated", "stale", "conflicted")
+    )
+    if rejected_dependencies:
+        return _ack(
+            capsule,
+            AckStatus.NEED_CONTEXT,
+            reasons=("capsule depends on unaccepted state",),
+            missing=tuple(f"dependency:{item}" for item in rejected_dependencies),
+        )
 
     return _ack(capsule, AckStatus.ACCEPTED)
-
-
-def _duplicate_ack(capsule: WorkCapsule, row: sqlite3.Row) -> CapsuleAck:
-    ack_json = row["ack_json"]
-    if ack_json:
-        data = json.loads(ack_json)
-        status = data.get("status")
-        if status not in ACK_STATUSES:
-            status = AckStatus.CONFLICTED.value
-        return CapsuleAck(
-            message_id=capsule.message_id,
-            capsule_id=capsule.capsule_id,
-            status=status,
-            reasons=tuple(data.get("reasons", ())) + ("duplicate message_id",),
-            missing=tuple(data.get("missing", ())),
-            checked_sha256=str(data.get("checked_sha256", row["sha256"])),
-            duplicate=True,
-        )
-    return _ack(
-        capsule,
-        AckStatus.ACCEPTED,
-        reasons=("duplicate message_id",),
-        duplicate=True,
-    )
 
 
 def ack_capsule(
@@ -504,28 +733,21 @@ def ack_capsule(
     *,
     current_permission_snapshot: JSONValue,
     receiver_permissions: Collection[str] = (),
+    receiver_bee: str | None = None,
     artifact_loader: ArtifactLoader | None = None,
     now: datetime | None = None,
+    run_id: str | None = None,
+    stage_id: str | None = None,
+    attempt: int = 1,
 ) -> CapsuleAck:
-    """Idempotently store, verify, and persist a receiver ACK."""
-
-    body_hash = capsule_sha256(capsule)
-    existing = store.find_capsule_by_message(capsule.message_id)
-    if existing is not None:
-        if existing["sha256"] != body_hash or existing["body_json"] != capsule.to_json():
-            return _ack(
-                capsule,
-                AckStatus.CONFLICTED,
-                reasons=("message_id was reused with different content",),
-                duplicate=True,
-            )
-        return _duplicate_ack(capsule, existing)
+    """Idempotently verify and atomically persist a receiver ACK."""
 
     ack = verify_capsule(
         capsule,
         store,
         current_permission_snapshot=current_permission_snapshot,
         receiver_permissions=receiver_permissions,
+        receiver_bee=receiver_bee,
         artifact_loader=artifact_loader,
         now=now,
     )
@@ -536,12 +758,19 @@ def ack_capsule(
         return ack
 
     try:
-        inserted, row = store.put_capsule(capsule, body_hash)
-    except DuplicateMessageError:
+        _, persisted_ack, _ = store.record_capsule_ack(
+            capsule,
+            ack,
+            run_id=run_id,
+            stage_id=stage_id,
+            attempt=attempt,
+        )
+        return persisted_ack
+    except DuplicateMessageError as exc:
         return _ack(
             capsule,
             AckStatus.CONFLICTED,
-            reasons=("message_id was concurrently reused with different content",),
+            reasons=(str(exc) or "message_id was reused with different content",),
             duplicate=True,
         )
     except sqlite3.IntegrityError as exc:
@@ -550,11 +779,6 @@ def ack_capsule(
             AckStatus.CONFLICTED,
             reasons=(f"capsule identity conflicts with stored data: {exc}",),
         )
-
-    if not inserted:
-        return _duplicate_ack(capsule, row)
-    store.set_capsule_ack(ack)
-    return ack
 
 
 # Concise API aliases used by callers that treat verification and acknowledgement

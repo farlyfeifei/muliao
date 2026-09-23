@@ -112,6 +112,7 @@ class TaskContract(JsonModel):
     task_id: str
     contract_rev: int
     goal: str
+    recipe: str = ""
     scope: dict[str, JSONValue] = field(
         default_factory=lambda: {"included": [], "excluded": []}
     )
@@ -130,6 +131,8 @@ class TaskContract(JsonModel):
             raise ValueError("contract_rev must be at least 1")
         if not self.goal:
             raise ValueError("goal is required")
+        if self.recipe and self.recipe not in {"single", "research", "diagnose", "build", "sensitive"}:
+            raise ValueError(f"unsupported recipe: {self.recipe}")
 
     @property
     def required_constraint_ids(self) -> tuple[str, ...]:
@@ -219,8 +222,8 @@ class SwarmEvent(JsonModel):
     def __post_init__(self) -> None:
         if not self.event_id or not self.run_id or not self.task_id or not self.type:
             raise ValueError("event_id, run_id, task_id, and type are required")
-        if self.seq < 0:
-            raise ValueError("seq cannot be negative")
+        if self.seq < 1:
+            raise ValueError("seq must start at 1")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "SwarmEvent":
@@ -294,6 +297,7 @@ class WorkCapsule(JsonModel):
     loss_manifest: tuple[JSONValue, ...] = ()
     depends_on: tuple[str, ...] = ()
     sender_claims: dict[str, JSONValue] = field(default_factory=dict)
+    payload: JSONValue = None
     permission_snapshot: JSONValue = None
     required_permissions: tuple[str, ...] = ()
     created_at: str = field(default_factory=utc_now)
@@ -367,3 +371,10 @@ class CapsuleAck(JsonModel):
     @property
     def accepted(self) -> bool:
         return self.status == AckStatus.ACCEPTED.value
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CapsuleAck":
+        data = dict(value)
+        data["reasons"] = tuple(data.get("reasons", ()))
+        data["missing"] = tuple(data.get("missing", ()))
+        return cls(**data)
