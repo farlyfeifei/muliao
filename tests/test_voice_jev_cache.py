@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -186,6 +187,41 @@ def _payload(*, kind="open_app", app="notepad"):
             "shortcut": {"choice": "none", "confidence": 0.97},
         },
     }
+
+
+class ConfigClampTests(unittest.TestCase):
+    """A negative cache TTL must clamp to 0 (disable), never crash the runtime."""
+
+    def test_negative_cache_seconds_clamps_to_zero(self):
+        import os
+
+        from voice.config import VoiceSettings
+
+        env = {
+            "MULIAO_VOICE_SENSEVOICE_DIR": "C:/models/sensevoice",
+            "MULIAO_JEV_CACHE_SECONDS": "-1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch("voice.config._external_config", return_value={}):
+            settings = VoiceSettings.load()
+        self.assertEqual(settings.jev_cache_seconds, 0.0)
+        # The clamped value must construct a cache without raising.
+        cache = JevResponseCache(ttl_seconds=settings.jev_cache_seconds)
+        self.assertEqual(cache.ttl_seconds, 0.0)
+
+    def test_positive_cache_seconds_is_preserved(self):
+        import os
+
+        from voice.config import VoiceSettings
+
+        env = {
+            "MULIAO_VOICE_SENSEVOICE_DIR": "C:/models/sensevoice",
+            "MULIAO_JEV_CACHE_SECONDS": "120",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch("voice.config._external_config", return_value={}):
+            settings = VoiceSettings.load()
+        self.assertEqual(settings.jev_cache_seconds, 120.0)
 
 
 class FastRouterCacheIntegrationTests(unittest.TestCase):

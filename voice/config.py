@@ -49,6 +49,12 @@ def _float_setting(name: str, default: float) -> float:
         return default
 
 
+def _non_negative_float_setting(name: str, default: float) -> float:
+    """Clamp a negative value to 0.0 so an operator's -1 means 'disable', not crash."""
+
+    return max(0.0, _float_setting(name, default))
+
+
 @dataclass(frozen=True)
 class VoiceSettings:
     # 保留 M0 的前四个必填字段和其后位置参数顺序；新增云配置全部追加并提供安全默认值。
@@ -72,6 +78,8 @@ class VoiceSettings:
     mimo_tts_enabled: bool = False
     mimo_asr_model: str = "mimo-v2.5-asr"
     mimo_asr_enabled: bool = False
+    vits_dir: Path = Path("C:/ProgramData/Muliao/models/vits-aishell3")
+    vits_tts_enabled: bool = False
     jev_cache_enabled: bool = True
     jev_cache_seconds: float = 300.0
 
@@ -104,8 +112,19 @@ class VoiceSettings:
             mimo_tts_enabled=_bool_setting("MULIAO_MIMO_TTS_ENABLED", True),
             mimo_asr_model=_setting("MULIAO_MIMO_ASR_MODEL", "mimo-v2.5-asr"),
             mimo_asr_enabled=_bool_setting("MULIAO_MIMO_ASR_ENABLED", False),
+            vits_dir=Path(
+                os.path.expandvars(
+                    os.path.expanduser(
+                        _setting(
+                            "MULIAO_VOICE_VITS_AISHELL3_DIR",
+                            "C:/ProgramData/Muliao/models/vits-aishell3",
+                        )
+                    )
+                )
+            ),
+            vits_tts_enabled=_bool_setting("MULIAO_VOICE_VITS_TTS_ENABLED", False),
             jev_cache_enabled=_bool_setting("MULIAO_JEV_CACHE_ENABLED", True),
-            jev_cache_seconds=_float_setting("MULIAO_JEV_CACHE_SECONDS", 300.0),
+            jev_cache_seconds=_non_negative_float_setting("MULIAO_JEV_CACHE_SECONDS", 300.0),
             sample_rate=_int_setting("MULIAO_VOICE_SAMPLE_RATE", 16_000),
             frame_ms=_int_setting("MULIAO_VOICE_FRAME_MS", 30),
             vad_mode=_int_setting("MULIAO_VOICE_VAD_MODE", 2),

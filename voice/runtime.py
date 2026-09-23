@@ -20,6 +20,7 @@ from .permission_gate import ExistingVoicePermission
 from .safety import EchoAwareSpeaker, EchoGuard
 from .tts_local import FallbackSpeaker, NullSpeaker, SapiSpeaker
 from .tts_mimo import MiMoTtsClient
+from .tts_vits import VitsSpeaker
 
 
 class _TranscriptOnlyRecognizer:
@@ -120,9 +121,19 @@ def build_runtime(
     )
     echo_guard = EchoGuard() if speak else None
     local_speaker = _local_speaker(speak)
+    # Degradation chain MiMo -> VITS -> SAPI, built by nesting the two-tier
+    # FallbackSpeaker. The innermost local tier is SAPI (or Null when muted).
+    # When VITS is enabled the local tier becomes VITS -> SAPI; VITS is lazy and
+    # raises FileNotFoundError on a missing model, so the inner FallbackSpeaker
+    # degrades to SAPI rather than failing closed. VITS owns and closes its own
+    # internal player, reachable through the chain's propagated close().
+    local_tier: object = local_speaker
+    if speak and settings.vits_tts_enabled:
+        vits_speaker = VitsSpeaker(settings.vits_dir)
+        local_tier = FallbackSpeaker(vits_speaker, local_speaker)
     player = None
     sink = None
-    base_speaker: object = local_speaker
+    base_speaker: object = local_tier
     if speak and settings.mimo_tts_enabled and settings.mimo_api_key:
         sink = PyAudioPcmSink()
         player = CancellableAudioPlayer(sink)
@@ -133,7 +144,7 @@ def build_runtime(
             voice=settings.mimo_tts_voice,
             base_url=settings.mimo_base_url,
         )
-        base_speaker = FallbackSpeaker(cloud, local_speaker)
+        base_speaker = FallbackSpeaker(cloud, local_tier)
     speaker: object = (
         EchoAwareSpeaker(base_speaker, echo_guard)
         if speak and echo_guard is not None

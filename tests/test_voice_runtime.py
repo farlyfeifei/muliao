@@ -831,5 +831,86 @@ class FallbackGetRecognizerTests(unittest.TestCase):
             wrapper._get_recognizer()
 
 
+class VitsDegradationChainTests(unittest.TestCase):
+    @staticmethod
+    def settings(**changes):
+        base = VoiceSettings(
+            sensevoice_dir=Path("C:/models/sensevoice"),
+            jev_url="https://example.test/systemone",
+            jev_key="jev-test",
+            jev_model="jev-latest",
+            mimo_base_url="https://api.xiaomimimo.com/v1",
+            mimo_api_key="",
+        )
+        return replace(base, **changes)
+
+    def test_vits_disabled_by_default_keeps_plain_sapi(self):
+        with mock.patch("voice.runtime.SapiSpeaker") as sapi_cls, \
+                mock.patch("voice.runtime.VitsSpeaker") as vits_cls:
+            _, resources = build_runtime(self.settings(), speak=True)
+        try:
+            vits_cls.assert_not_called()
+            self.assertIs(resources.speaker.speaker, sapi_cls.return_value)
+        finally:
+            resources.close()
+
+    def test_vits_enabled_wraps_vits_then_sapi(self):
+        from voice.tts_local import FallbackSpeaker
+
+        with mock.patch("voice.runtime.SapiSpeaker") as sapi_cls, \
+                mock.patch("voice.runtime.VitsSpeaker") as vits_cls:
+            _, resources = build_runtime(
+                self.settings(vits_tts_enabled=True), speak=True
+            )
+        try:
+            vits_cls.assert_called_once()
+            inner = resources.speaker.speaker  # EchoAwareSpeaker -> FallbackSpeaker
+            self.assertIsInstance(inner, FallbackSpeaker)
+            self.assertIs(inner.cloud, vits_cls.return_value)
+            self.assertIs(inner.local, sapi_cls.return_value)
+        finally:
+            resources.close()
+
+    def test_full_chain_is_mimo_then_vits_then_sapi(self):
+        from voice.tts_local import FallbackSpeaker
+
+        with (
+            mock.patch("voice.runtime.SapiSpeaker") as sapi_cls,
+            mock.patch("voice.runtime.VitsSpeaker") as vits_cls,
+            mock.patch("voice.runtime.PyAudioPcmSink"),
+            mock.patch("voice.runtime.CancellableAudioPlayer"),
+            mock.patch("voice.runtime.MiMoTtsClient") as cloud_cls,
+        ):
+            _, resources = build_runtime(
+                self.settings(
+                    mimo_api_key="test-only",
+                    mimo_tts_enabled=True,
+                    vits_tts_enabled=True,
+                ),
+                speak=True,
+            )
+        try:
+            outer = resources.speaker.speaker
+            self.assertIsInstance(outer, FallbackSpeaker)
+            self.assertIs(outer.cloud, cloud_cls.return_value)  # MiMo first
+            inner = outer.local
+            self.assertIsInstance(inner, FallbackSpeaker)
+            self.assertIs(inner.cloud, vits_cls.return_value)  # then VITS
+            self.assertIs(inner.local, sapi_cls.return_value)  # then SAPI
+        finally:
+            resources.close()
+
+    def test_resource_close_reaches_vits_through_the_chain(self):
+        from voice.tts_local import FallbackSpeaker
+
+        with mock.patch("voice.runtime.SapiSpeaker"), \
+                mock.patch("voice.runtime.VitsSpeaker") as vits_cls:
+            _, resources = build_runtime(
+                self.settings(vits_tts_enabled=True), speak=True
+            )
+            resources.close()
+        vits_cls.return_value.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
