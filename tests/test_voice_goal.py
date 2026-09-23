@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from voice.goal import GoalLoop, validate_choice
+from voice.goal import DryRunActionExecutor, GoalLoop, validate_choice
 from voice.perception import (
     MAX_ELEMENTS,
     MAX_STATE_CHARS,
@@ -225,6 +225,112 @@ class GoalLoopTests(unittest.TestCase):
         self.assertEqual(len(actions), 8)
         with self.assertRaisesRegex(ValueError, "between 1 and 8"):
             GoalLoop(SequencePerception([self.snapshot()]), lambda state: "e001", max_steps=9)
+
+
+class ValidateChoiceActionTests(unittest.TestCase):
+    @staticmethod
+    def snap(*elements):
+        return Snapshot(elements, source="uia")
+
+    def test_id_only_validation_is_backward_compatible(self):
+        snapshot = self.snap(UIElement(text="打开", role="Button", bounds=(1, 2, 30, 40)))
+        element = validate_choice({"id": "e001"}, snapshot)
+        self.assertEqual(element.id, "e001")
+
+    def test_typing_into_non_editable_role_is_rejected(self):
+        snapshot = self.snap(UIElement(text="打开", role="Button", bounds=(1, 2, 30, 40)))
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            validate_choice({"id": "e001", "action": "type"}, snapshot, action="type")
+
+    def test_typing_into_editable_role_is_allowed(self):
+        snapshot = self.snap(UIElement(text="评论框", role="EditControl", bounds=(1, 2, 30, 40)))
+        element = validate_choice({"id": "e001"}, snapshot, action="type_text")
+        self.assertEqual(element.id, "e001")
+
+    def test_select_on_inert_role_is_rejected(self):
+        snapshot = self.snap(UIElement(text="标题", role="Text", bounds=(1, 2, 30, 40)))
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            validate_choice({"id": "e001"}, snapshot, action="select")
+
+    def test_select_on_combobox_is_allowed(self):
+        snapshot = self.snap(UIElement(text="排序", role="ComboBox", bounds=(1, 2, 30, 40)))
+        element = validate_choice({"id": "e001"}, snapshot, action="select")
+        self.assertEqual(element.id, "e001")
+
+    def test_click_action_is_never_role_rejected(self):
+        snapshot = self.snap(UIElement(text="任意", role="Pane", bounds=(1, 2, 30, 40)))
+        element = validate_choice({"id": "e001"}, snapshot, action="click")
+        self.assertEqual(element.id, "e001")
+
+
+class GoalLoopTextPayloadTests(unittest.TestCase):
+    def test_text_payload_reaches_executor_verbatim(self):
+        seen = []
+
+        def executor(element, action, text):
+            seen.append((element.id, action, text))
+            return {"ok": True, "changed": True}
+
+        snapshot = Snapshot((UIElement(text="评论框", role="EditControl", bounds=(1, 2, 30, 40)),), source="uia")
+        loop = GoalLoop(
+            SequencePerception([snapshot, Snapshot((UIElement(text="完成", role="Button", bounds=(1, 2, 3, 4)),), source="uia")]),
+            lambda goal, state, step: {"id": "e001", "action": "type_text", "text": "用户原话"},
+            action=executor,
+            dry_run=False,
+        )
+        loop.run("填写评论")
+        self.assertEqual(seen[0], ("e001", "type_text", "用户原话"))
+
+    def test_legacy_two_arg_executor_still_works(self):
+        seen = []
+
+        def executor(element, action):
+            seen.append((element.id, action))
+            return {"ok": True, "changed": True}
+
+        snapshot = Snapshot((UIElement(text="打开", role="Button", bounds=(1, 2, 30, 40)),), source="uia")
+        loop = GoalLoop(
+            SequencePerception([snapshot, Snapshot((UIElement(text="完成", role="Button", bounds=(1, 2, 3, 4)),), source="uia")]),
+            lambda goal, state, step: {"id": "e001", "action": "click"},
+            action=executor,
+            dry_run=False,
+        )
+        loop.run("点击打开")
+        self.assertEqual(seen[0], ("e001", "click"))
+
+    def test_incompatible_action_stops_before_executor(self):
+        calls = []
+        snapshot = Snapshot((UIElement(text="打开", role="Button", bounds=(1, 2, 30, 40)),), source="uia")
+        loop = GoalLoop(
+            SequencePerception([snapshot]),
+            lambda goal, state, step: {"id": "e001", "action": "type", "text": "x"},
+            action=lambda element, action, text: calls.append(element) or {"ok": True},
+            dry_run=False,
+        )
+        result = loop.run("在按钮里输入")
+        self.assertEqual(result.status, "invalid_choice")
+        self.assertIn("incompatible", result.detail)
+        self.assertEqual(calls, [])
+
+    def test_dry_run_never_echoes_typed_text(self):
+        snapshot = Snapshot((UIElement(text="评论框", role="EditControl", bounds=(1, 2, 30, 40)),), source="uia")
+        loop = GoalLoop(
+            SequencePerception([snapshot]),
+            lambda goal, state, step: {"id": "e001", "action": "type_text", "text": "隐私内容1234"},
+            dry_run=True,
+        )
+        result = loop.run("填写评论")
+        self.assertEqual(result.status, "dry_run")
+        self.assertNotIn("隐私内容1234", result.steps[0].detail)
+        self.assertNotIn("隐私内容1234", result.detail)
+
+    def test_dry_run_executor_does_not_echo_text(self):
+        executor = DryRunActionExecutor()
+        snapshot = Snapshot((UIElement(text="评论框", role="EditControl", bounds=(1, 2, 30, 40)),), source="uia")
+        outcome = executor.execute(snapshot.elements[0], "type_text", "隐私内容1234")
+        self.assertTrue(outcome["ok"])
+        self.assertNotIn("隐私内容1234", outcome["detail"])
+        self.assertIn("8 chars", outcome["detail"])
 
 
 if __name__ == "__main__":

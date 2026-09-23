@@ -56,22 +56,75 @@ class GoalChooser(Protocol):
 
 @runtime_checkable
 class GoalActionExecutor(Protocol):
-    def execute(self, element: UIElement, action: str = "activate") -> Any: ...
+    def execute(self, element: UIElement, action: str = "activate", text: str = "") -> Any: ...
 
 
 class DryRunActionExecutor:
     """Action adapter that records intent and cannot touch the desktop."""
 
-    def execute(self, element: UIElement, action: str = "activate") -> Mapping[str, Any]:
+    def execute(self, element: UIElement, action: str = "activate", text: str = "") -> Mapping[str, Any]:
+        detail = f"dry-run: would {action} {element.id}"
+        if text:
+            # Never echo the text itself; only record that a value would be typed.
+            detail += f" with {len(text)} chars"
         return {
             "ok": True,
             "changed": False,
-            "detail": f"dry-run: would {action} {element.id}",
+            "detail": detail,
         }
 
 
-def validate_choice(choice: Any, snapshot: Snapshot) -> UIElement:
-    """Return the chosen candidate or reject an ungrounded element id."""
+# Actions that write a value into the target; they require an editable element.
+_TEXT_ACTIONS = frozenset({"type", "type_text", "input", "input_text", "fill", "set_value"})
+# Actions that toggle/select; they require a selectable/interactive element.
+_SELECT_ACTIONS = frozenset({"select", "choose", "toggle", "check", "uncheck"})
+# Roles that can receive typed text.
+_EDITABLE_ROLE_TOKENS = ("edit", "textbox", "text box", "input", "document", "search")
+# Roles that expose a selection.
+_SELECTABLE_ROLE_TOKENS = (
+    "combo", "combobox", "list", "listitem", "menu", "menuitem",
+    "radio", "checkbox", "tab", "tabitem", "tree", "treeitem", "option",
+)
+
+
+def _role_allows_action(role: str, action: str) -> bool:
+    """Conservative role/action compatibility check.
+
+    Unknown roles are permissive (we cannot enumerate every UI framework); only
+    clearly incompatible pairs — typing into a non-editable control, or selecting
+    a non-selectable one — are rejected. This is a guard against the model
+    choosing a plausible id for the wrong action, not a full a11y model.
+    """
+
+    normalized_role = role.strip().lower().replace("_", " ")
+    normalized_action = action.strip().lower().replace("_", "")
+    if normalized_action in {a.replace("_", "") for a in _TEXT_ACTIONS}:
+        if not normalized_role:
+            return True
+        return any(token in normalized_role for token in _EDITABLE_ROLE_TOKENS)
+    if normalized_action in {a.replace("_", "") for a in _SELECT_ACTIONS}:
+        if not normalized_role:
+            return True
+        if any(token in normalized_role for token in _SELECTABLE_ROLE_TOKENS):
+            return True
+        # A button/link can also "select" in loose UIs; only reject clearly inert roles.
+        return normalized_role not in {"text", "static", "image", "group", "pane", "window"}
+    return True
+
+
+def validate_choice(
+    choice: Any,
+    snapshot: Snapshot,
+    *,
+    action: str = "",
+) -> UIElement:
+    """Return the chosen candidate, or reject an ungrounded/incompatible choice.
+
+    ``action`` is optional; when supplied the element's role is checked for
+    compatibility (typing needs an editable control, selecting needs a
+    selectable one). Backward compatible: callers that pass no action get the
+    original id-only validation.
+    """
 
     element_id = _choice_id(choice)
     if not element_id:
@@ -79,6 +132,10 @@ def validate_choice(choice: Any, snapshot: Snapshot) -> UIElement:
     candidate = snapshot.candidate(element_id)
     if candidate is None:
         raise ValueError(f"unknown element id: {element_id}")
+    if action and not _role_allows_action(candidate.role, action):
+        raise ValueError(
+            f"action {action!r} is incompatible with element {element_id} role {candidate.role!r}"
+        )
     return candidate
 
 
@@ -118,6 +175,27 @@ def _choice_complete(choice: Any) -> bool:
     )
 
 
+def _choice_text(choice: Any) -> str:
+    """Extract an optional verbatim text value the chooser resolved for typing.
+
+    The text always originates from a code-selected span (select-not-generate);
+    the model may only point at it, never author it. An empty string means no
+    value is attached, so the action is not a text-bearing one.
+    """
+
+    if isinstance(choice, Mapping):
+        for key in ("text", "value", "input_text", "text_value"):
+            value = choice.get(key)
+            if value is not None:
+                return str(value)
+        return ""
+    for name in ("text", "value", "input_text", "text_value"):
+        value = getattr(choice, name, None)
+        if value is not None:
+            return str(value)
+    return ""
+
+
 def _safe_goal(value: Any) -> str:
     # Keep the goal bounded too: it is sent with state to the chooser.
     return " ".join(str(value or "").split())[:24_000]
@@ -155,11 +233,16 @@ def _invoke_chooser(chooser: Any, goal: str, snapshot: Snapshot, step: int) -> A
     )
 
 
-def _execute_action(executor: Any, element: UIElement, action: str) -> Any:
+def _execute_action(executor: Any, element: UIElement, action: str, text: str = "") -> Any:
     method = getattr(executor, "execute", None)
     target = method if callable(method) else executor
     if not callable(target):
         raise TypeError("action executor must be callable or expose execute()")
+    # Prefer the 3-arg form (element, action, text) for text-bearing actions;
+    # fall back to older 2-arg / 1-arg executors. _call_with_signature binds by
+    # signature, so an internal TypeError is never mistaken for arity mismatch.
+    if text:
+        return _call_with_signature(target, ((element, action, text), (element, action), (element,)))
     return _call_with_signature(target, ((element, action), (element,)))
 
 
@@ -231,8 +314,8 @@ class GoalLoop:
         self.settle = sleeper or settle
         self.stall_limit = int(stall_limit)
 
-    def validate_choice(self, choice: Any, snapshot: Snapshot) -> UIElement:
-        return validate_choice(choice, snapshot)
+    def validate_choice(self, choice: Any, snapshot: Snapshot, *, action: str = "") -> UIElement:
+        return validate_choice(choice, snapshot, action=action)
 
     def run(self, goal: str) -> GoalResult:
         goal_text = _safe_goal(goal)
@@ -250,11 +333,12 @@ class GoalLoop:
             if _choice_complete(choice):
                 return GoalResult("completed", goal_text, tuple(steps), snapshot)
 
+            action_name = _choice_action(choice)
             try:
-                element = self.validate_choice(choice, snapshot)
+                element = self.validate_choice(choice, snapshot, action=action_name)
             except ValueError as exc:
                 return GoalResult("invalid_choice", goal_text, tuple(steps), snapshot, str(exc))
-            action_name = _choice_action(choice)
+            choice_text = _choice_text(choice)
 
             if self.dry_run:
                 steps.append(
@@ -272,7 +356,7 @@ class GoalLoop:
                 )
                 return GoalResult("dry_run", goal_text, tuple(steps), snapshot)
 
-            action_result = _execute_action(self.action, element, action_name)
+            action_result = _execute_action(self.action, element, action_name, choice_text)
             if not _action_ok(action_result):
                 step = GoalStep(
                     index=index,
