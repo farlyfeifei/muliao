@@ -290,3 +290,178 @@ destructive<=0.5
 ```
 
 其他一律拒绝，不执行动作。
+
+---
+
+# M0 交接报告
+
+## Base commit
+
+```text
+8ed88c9b5ce8c5923859243977317d352c5893a3
+```
+
+## Head commit
+
+M0 代码提交完成时：
+
+```text
+9b8a1c49c6c25acf28caafc679cfd54bcf240ec6
+```
+
+本交接报告会作为后续纯文档提交追加；合入时以 `feature/voice-command` 最新 HEAD 为准。
+
+## Changed files
+
+```text
+VOICE-INTEGRATION-REQUEST.md
+requirements-voice.txt
+tests/test_voice_adapters.py
+tests/test_voice_m0.py
+voice-models.json
+voice/__init__.py
+voice/__main__.py
+voice/actions.py
+voice/asr_local.py
+voice/capture.py
+voice/cli.py
+voice/config.py
+voice/contracts.py
+voice/engine.py
+voice/events.py
+voice/jev_router.py
+voice/permission_gate.py
+voice/runtime.py
+voice/tts_local.py
+voice/wake.py
+```
+
+未修改任何共享文件、聊天文件或蜂群文件。
+
+## Shared-file requests
+
+详见本文件 §1–§7。M0 独立运行不需要共享改动；后续由集成窗口处理：
+
+- `server.py` 注册 `/api/voice/*` 与生命周期；
+- `static/index.html` / `static/app.js` 仅添加独立 `/voice/` 入口和 capability 开关；
+- `requirements.txt` 合并 `requirements-voice.txt`；
+- `muliao.spec` / `installer.iss` / `deploy.py` 纳入模块、静态页、运行库和安装态冒烟；
+- `使用说明.md` 更新正式使用方式。
+
+## API/schema changes
+
+M0 新增的内部契约和 `voice.*` 事件见 §8。
+
+独立 CLI：
+
+```bash
+python -m voice --text "幕僚幕僚，打开记事本" --no-tts
+python -m voice --audio-file command.wav --no-tts
+python -m voice --microphone --no-tts
+```
+
+默认 dry-run；只有 `--act` 才真正打开记事本。所有模式先检查隔离数据目录中的
+`voice_control`。
+
+## Tests and results
+
+### 自动测试
+
+```text
+python -m pytest -q
+71 passed
+
+python -B -m unittest discover -s tests -p "test_*.py" -q
+Ran 71 tests - OK
+```
+
+覆盖：
+
+- 未授权时不打开麦克风，ASR/Jev/动作/TTS 调用数均为 0；
+- 未唤醒时 Jev、云上传和动作均为 0，事件流不暴露环境语音原文；
+- 识别后撤权会阻止 Jev；Jev 后撤权会阻止动作；
+- 固定唤醒词剥离、停顿标点容错和单次/句中误唤醒拒绝；
+- Jev MockTransport 响应解析、缺 Key 零网络、非记事本/危险请求拒绝；
+- Windows 记事本严格白名单；
+- VAD 起止、尾静音与无语音超时；
+- SenseVoice PCM 适配、SAPI 适配和 `voice.*` JSON 事件序列；
+- 全量蜂群、权限、安全和 Prompt 哈希测试无回归。
+
+### 冻结与安全门禁
+
+```text
+SYSTEM_PROMPT SHA-256:
+50e07b3b31dc5ca87420135484c4002cbce6878ece982defb026ce36e12e7ea7
+
+Voice secret scan: no offenders
+File ownership violations: none
+```
+
+### 真实 SenseVoice 验收
+
+Windows SAPI 合成“幕僚幕僚，打开记事本”后，SenseVoice 实测稳定转写：
+
+```text
+木聊木聊打开记事本。
+```
+
+冷启动约 2.1–2.4 秒，暖态约 152–180ms。`voice/wake.py` 只增加有限、显式的同音别名
+白名单；仍要求句首重复两次，未使用宽泛模糊匹配。剥离结果为：
+
+```text
+打开记事本。
+```
+
+### 真实 Jev dry-run 验收
+
+本机系统代理会导致 TypeSafe TLS `UNEXPECTED_EOF`；直连且保持 TLS 校验成功。因此独立语音
+Jev client 使用 `trust_env=False`，不使用 `verify=False`。
+
+隔离授权下真实结果：
+
+```text
+command=打开记事本
+kind=open_app
+target=notepad
+confidence=1.0
+destructive=false
+action=dry-run: would launch notepad.exe
+```
+
+真实 Jev 延迟约 561–690ms；测试结束后隔离 `voice_control` 已撤销。
+
+### 真正记事本动作验收
+
+在显式 `--act` 下：
+
+- 运行前无 `notepad.exe`；
+- 新建 PID 34276；
+- 仅终止本次新进程；
+- 其他进程未触碰；
+- 隔离权限测试后立即撤销。
+
+### 真实麦克风验收
+
+在隔离授权、3 秒等待窗口内打开真实麦克风成功。未说唤醒词时事件只有：
+
+```text
+voice.state listening
+voice.state recognizing
+voice.metric wake_miss
+voice.state sleeping
+```
+
+没有 `voice.final` 原文、没有 Jev 调用、没有云上传、没有动作；测试后权限已撤销。
+
+## Known limitations
+
+1. M0 只允许 `open_app:notepad`；其他 FAST/GOAL 动作尚未实现。
+2. 尚无 `/api/voice/*` 和 `/voice/` 页面；当前通过独立 CLI 验收，接线请求已记录。
+3. 唤醒词 0–800ms 的真实时间戳级容错尚未实现；M0 文本门控容忍 ASR 输出中的空白/标点，真麦克风停顿专项留给 M1 流式状态机。
+4. SenseVoice 冷启动约 2.1–2.4 秒；正式产品需启动预热，暖态约 152–180ms。
+5. 真实用户口音、距离、噪声和误唤醒率尚需扩充样本；当前只将实测到的有限同音变体加入白名单。
+6. M0 本地播报只接 Windows SAPI；MiMo/VITS、打断、回环防护属于 M1/M5。
+7. 当前 CLI 的 `--microphone` 一次只处理一个 utterance；8 秒会话窗口属于 M1。
+8. API Key 仅从环境变量或仓库外配置读取；仓库不包含凭据。
+9. `voice_control` 默认关闭；集成 UI 尚未提供 capability 开关。
+10. M0–M5 完成前未实施 M6 微信回复建议。
