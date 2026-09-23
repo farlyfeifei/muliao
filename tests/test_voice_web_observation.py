@@ -87,6 +87,40 @@ class NumberingTests(unittest.TestCase):
         self.assertEqual(len(observation.targets), MAX_TARGETS)
         self.assertEqual(observation.omitted_target_count, 7)
 
+    def test_reobserving_same_document_renumbers_targets_from_e001(self):
+        # target_id is observation-local: a second observe of the SAME document
+        # must restart at e001, not continue from e003. Otherwise a confirmed
+        # target_id would wrongly look stale after a post-confirm re-observe.
+        b = builder()
+        elements = [{"backend_id": "n1", "role": "button", "label": "A"},
+                    {"backend_id": "n2", "role": "button", "label": "B"}]
+        first, _ = build(b, elements, token="doc-1")
+        second, _ = build(b, elements, token="doc-1")
+        self.assertEqual([t.target_id for t in first.targets], ["e001", "e002"])
+        self.assertEqual([t.target_id for t in second.targets], ["e001", "e002"])
+        self.assertEqual(first.page_revision, second.page_revision)
+
+    def test_node_handle_is_stable_across_reobservations_of_same_document(self):
+        # The code-owned node handle persists for the same backend element within
+        # one document, so the code keeps a stable reference to the real node.
+        b = builder()
+        elements = [{"backend_id": "n1", "role": "button", "label": "A"}]
+        first, _ = build(b, elements, token="doc-1")
+        second, _ = build(b, elements, token="doc-1")
+        self.assertEqual(
+            first.targets[0].metadata["node"],
+            second.targets[0].metadata["node"],
+        )
+
+    def test_navigation_mints_new_revision_so_old_node_handles_cannot_be_reused(self):
+        # Across a navigation the node counter restarts, so a bare node number is
+        # NOT a cross-document identity — the page_revision is what makes an old
+        # target stale. Assert the revision changes even for the same backend id.
+        b = builder()
+        first, _ = build(b, [{"backend_id": "n1", "role": "button", "label": "A"}], token="doc-1")
+        second, _ = build(b, [{"backend_id": "n1", "role": "button", "label": "A"}], token="doc-2")
+        self.assertNotEqual(first.page_revision, second.page_revision)
+
 
 class PrivacyFilterTests(unittest.TestCase):
     def test_password_and_file_inputs_never_become_targets(self):

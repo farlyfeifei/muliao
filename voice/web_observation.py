@@ -101,7 +101,11 @@ class ObservationBuilder:
     _next_node: int = field(default=0, init=False)
     _page_revision: str = field(default="", init=False)
     _document_token: str = field(default="", init=False)
-    _handles: dict[int, str] = field(default_factory=dict, init=False)
+    # backend_id -> stable node handle for the CURRENT document. Node identity
+    # persists across re-observations of the same document (so the code holds a
+    # stable reference to the real element); target_id, by contrast, is
+    # observation-local and renumbered on every build().
+    _handles: dict[str, int] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self.session_id = _clean(self.session_id)
@@ -133,9 +137,15 @@ class ObservationBuilder:
         return self._page_revision
 
     def _identity(self, backend_id: str) -> NodeIdentity:
+        # Stable per (document, backend_id): re-observing the same document
+        # returns the same node handle, so the code's reference to the real
+        # element survives across observations until the document is replaced.
+        existing = self._handles.get(backend_id)
+        if existing is not None:
+            return NodeIdentity(node=existing, backend_id=backend_id)
         self._next_node += 1
         node = self._next_node
-        self._handles[node] = backend_id
+        self._handles[backend_id] = node
         return NodeIdentity(node=node, backend_id=backend_id)
 
     def build(
@@ -153,6 +163,8 @@ class ObservationBuilder:
 
         ``document_token`` (when given) is passed to :meth:`begin_document` so a
         navigation detected by the backend advances the revision atomically.
+        ``target_id`` numbering restarts at ``e001`` for every build so ids are
+        observation-local and never reused across observations.
         """
 
         if document_token:
@@ -164,7 +176,7 @@ class ObservationBuilder:
         unsupported: list[UnsupportedSurface] = []
         omitted = 0
         for raw in raw_elements:
-            element, surface = self._coerce(raw)
+            element, surface = self._coerce(raw, len(targets) + 1)
             if surface is not None:
                 unsupported.append(surface)
                 continue
@@ -190,7 +202,7 @@ class ObservationBuilder:
         return observation, tuple(unsupported)
 
     def _coerce(
-        self, raw: Mapping[str, Any]
+        self, raw: Mapping[str, Any], sequence: int
     ) -> tuple[WebTarget | None, UnsupportedSurface | None]:
         if not isinstance(raw, Mapping):
             return None, None
@@ -222,7 +234,8 @@ class ObservationBuilder:
         backend_id = _clean(_first(raw, ("backend_id", "node_id", "id"), ""))
         identity = self._identity(backend_id)
         operations = _ROLE_OPERATIONS.get(role, _DEFAULT_OPERATIONS)
-        target_id = f"e{len(self._handles):03d}"
+        # target_id is observation-local: renumbered from the per-build sequence.
+        target_id = f"e{sequence:03d}"
         return WebTarget(
             target_id=target_id,
             role=role,
