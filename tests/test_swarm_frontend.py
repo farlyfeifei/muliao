@@ -21,16 +21,32 @@ class SwarmFrontendContractTests(unittest.TestCase):
             const fs = require("fs");
             const vm = require("vm");
             const controllerSource = fs.readFileSync({json.dumps(str(ROOT / 'static' / 'swarm-controller.js'))}, "utf8");
+            const runControlSource = fs.readFileSync({json.dumps(str(ROOT / 'static' / 'run-control.js'))}, "utf8");
 
             function makeElement(id) {{
               return {{
                 id,
                 value: "",
                 disabled: false,
+                title: "",
                 style: {{}},
                 children: [],
+                dataset: {{}},
+                attributes: {{}},
                 classList: {{ add() {{}}, remove() {{}}, toggle() {{}} }},
                 appendChild(value) {{ this.children.push(value); return value; }},
+                setAttribute(name, value) {{ this.attributes[name] = String(value); }},
+                getAttribute(name) {{ return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; }},
+                querySelector(selector) {{
+                  if (selector === "use") {{
+                    this._use ||= {{
+                      href: "#i-up",
+                      setAttribute(name, value) {{ if (name === "href") this.href = value; }},
+                    }};
+                    return this._use;
+                  }}
+                  return null;
+                }},
                 focus() {{}},
               }};
             }}
@@ -49,11 +65,21 @@ class SwarmFrontendContractTests(unittest.TestCase):
               handleEvent(value) {{ uiEvents.push(["event", value]); }},
             }};
             const listeners = {{}};
+            const draftCalls = [];
             const windowObject = {{
               MuliaoSwarmUI: ui,
+              MuliaoDrafts: {{
+                recover(sessionId, text) {{
+                  draftCalls.push([sessionId, text]);
+                  if (sessionId === curId) {{
+                    elements.input.value = text;
+                  }}
+                }},
+              }},
               addEventListener(name, handler) {{ listeners[name] = handler; }},
             }};
             const documentObject = {{
+              getElementById(id) {{ return elements[id] || null; }},
               querySelector(selector) {{
                 return selector === ".app" ? {{ classList: {{ remove() {{}} }} }} : null;
               }},
@@ -68,7 +94,11 @@ class SwarmFrontendContractTests(unittest.TestCase):
             let nextSessionId = 0;
             const busyStates = [];
             const singleTurns = [];
-            let sendTurnImpl = async (text) => {{ singleTurns.push([curId, text]); }};
+            const singleTurnOptions = [];
+            let sendTurnImpl = async (text, options) => {{
+              singleTurns.push([curId, text]);
+              singleTurnOptions.push(options);
+            }};
             let fetchCalls = [];
             let fetchImpl = null;
 
@@ -81,13 +111,15 @@ class SwarmFrontendContractTests(unittest.TestCase):
               Promise,
               setTimeout,
               clearTimeout,
+              setInterval,
+              clearInterval,
               window: windowObject,
               document: documentObject,
               sessions,
               $: (id) => elements[id],
               cur: () => sessions.find((session) => session.id === curId) || null,
               newSession: () => {{
-                const session = {{ id: `session-new-${{++nextSessionId}}`, title: "新会话", msgs: [], created: Date.now() }};
+                const session = {{ id: `session-new-${{++nextSessionId}}`, title: "新会话", msgs: [], draft: "", created: Date.now() }};
                 sessions.unshift(session);
                 curId = session.id;
               }},
@@ -95,19 +127,24 @@ class SwarmFrontendContractTests(unittest.TestCase):
               msgEl: (role, text) => ({{ role, text }}),
               saveSessions: () => {{}},
               renderSessions: () => {{}},
+              renderThread: () => {{}},
               updateCounts: () => {{}},
               scrollBottom: () => {{}},
               gotoTab: () => {{}},
               setBusy: (busy, text) => busyStates.push([busy, text]),
               autoGrow: () => {{}},
-              sendTurn: async (text) => sendTurnImpl(text),
+              sendTurn: async (text, options) => sendTurnImpl(text, options),
               fetch: async (...args) => {{
                 fetchCalls.push(args);
                 return fetchImpl(...args);
               }},
             }});
+            vm.runInContext(runControlSource, context, {{ filename: "run-control.js" }});
             vm.runInContext(controllerSource, context, {{ filename: "swarm-controller.js" }});
             const swarm = windowObject.MuliaoSwarm;
+            const runControl = windowObject.MuliaoRunControl;
+            // 未完成用例必须超时失败，不允许 Promise 悬挂时 Node 静默退出为 0。
+            const keepAlive = setInterval(() => {{}}, 1000);
 
             async function jsonResponse(payload, ok = true, status = 200) {{
               return {{ ok, status, json: async () => payload }};
@@ -126,6 +163,7 @@ class SwarmFrontendContractTests(unittest.TestCase):
                         if (index >= chunks.length) return {{ done: true, value: undefined }};
                         return {{ done: false, value: chunks[index++] }};
                       }},
+                      async cancel() {{}},
                     }};
                   }},
                 }},
@@ -191,7 +229,7 @@ class SwarmFrontendContractTests(unittest.TestCase):
               assert.deepEqual(sessions[1].msgs, []);
               assert.equal(elements.thread.children.length, 0, "background session must not write into visible thread");
               assert.equal(swarm.active, null);
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
@@ -237,16 +275,15 @@ class SwarmFrontendContractTests(unittest.TestCase):
               });
               await running;
 
-              assert.deepEqual(sessions[0].msgs.map((item) => [item.role, item.text]), [
-                ["user", "cancel goal"],
-              ]);
+              assert.deepEqual(sessions[0].msgs.map((item) => [item.role, item.text]), []);
+              assert.equal(elements.input.value, "cancel goal", "cancelled goal should return to the origin draft");
               assert.equal(swarm.active, null);
               assert.equal(
                 uiEvents.filter(([kind, event]) => kind === "event" && event.type === "swarm.done").length,
                 0,
                 "late completion must be discarded after cancellation",
               );
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
     def test_single_agent_fallback_waits_for_origin_session(self) -> None:
@@ -268,7 +305,8 @@ class SwarmFrontendContractTests(unittest.TestCase):
               await planningRequest;
 
               assert.deepEqual(singleTurns, [], "fallback must not run in the wrong session");
-              assert.equal(elements.send.disabled, true);
+              assert.equal(elements.send.disabled, false, "pause button must stay clickable while pending");
+              assert.equal(elements.send.dataset.mode, "stop", "pending fallback shows the pause affordance");
               assert.ok(
                 uiEvents.some(([kind, event]) => kind === "event" && event.type === "swarm.notice"),
                 "cross-session fallback should show a notice",
@@ -278,7 +316,8 @@ class SwarmFrontendContractTests(unittest.TestCase):
               await listeners["muliao-swarm-single"]({ detail: {} });
               assert.deepEqual(singleTurns, [["session-a", "single goal"]]);
               assert.equal(elements.send.disabled, false);
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+              assert.equal(elements.send.dataset.mode, "send", "single-agent fallback finishes back to send mode");
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
@@ -340,7 +379,7 @@ class SwarmFrontendContractTests(unittest.TestCase):
                 ["user", "keep running"],
                 ["assistant", "completed after rejection"],
               ]);
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
@@ -367,7 +406,8 @@ class SwarmFrontendContractTests(unittest.TestCase):
               await new Promise((resolve) => setTimeout(resolve, 0));
               assert.equal(singleTurns.length, 1);
               assert.deepEqual(singleTurns[0], ["session-new-1", "empty session goal"]);
-              assert.equal(elements.send.disabled, true, "fallback must own lifecycle while sendTurn is pending");
+              assert.equal(elements.send.disabled, false, "pause button must stay clickable while fallback runs");
+              assert.equal(elements.send.dataset.mode, "stop", "fallback must own lifecycle while sendTurn is pending");
 
               await swarm.planGoal("must wait");
               assert.equal(fetchCalls.length, 1, "fallback lock must block concurrent planning");
@@ -376,7 +416,8 @@ class SwarmFrontendContractTests(unittest.TestCase):
               releaseSingle();
               await fallback;
               assert.equal(elements.send.disabled, false);
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+              assert.equal(elements.send.dataset.mode, "send", "fallback completion returns to send mode");
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
@@ -404,7 +445,7 @@ class SwarmFrontendContractTests(unittest.TestCase):
 
               await swarm.planGoal("new goal after cleanup");
               assert.equal(fetchCalls.length, 2, "stale pending must not permanently block planning");
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
@@ -460,7 +501,7 @@ class SwarmFrontendContractTests(unittest.TestCase):
                 })}\\n\\n`, "utf8"),
               });
               await running;
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
@@ -487,7 +528,7 @@ class SwarmFrontendContractTests(unittest.TestCase):
               const forwarded = uiEvents.filter(([kind]) => kind === "event").map(([, event]) => event.event_id);
               assert.deepEqual(forwarded, ["evt-one", "evt-done"]);
               assert.deepEqual(sessions[0].msgs.map((item) => item.text), ["envelope filters", "right"]);
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
@@ -533,7 +574,7 @@ class SwarmFrontendContractTests(unittest.TestCase):
                 uiEvents.filter(([kind, event]) => kind === "event" && event.run_id === "run-wrong").length,
                 0,
               );
-            })().catch((error) => { console.error(error); process.exitCode = 1; });
+            })().catch((error) => { console.error(error); process.exitCode = 1; }).finally(() => clearInterval(keepAlive));
             """
         )
 
