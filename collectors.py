@@ -487,6 +487,51 @@ def sources() -> list:
     ]
 
 
+# ============ 能力项：执行/设备类，独立于只读数据源 ============
+def capabilities() -> list:
+    """能力项（执行/设备类）的可用性 + 授权状态，供前端渲染独立开关。
+
+    与 sources() 的七类只读数据源分开：能力默认关、不随「全部数据」授权打开，
+    只能经 permissions.set_scope(scope, True) 逐项显式授权。本函数只探测可用性，
+    绝不调用任何控制功能。每项都带 kind="capability" 以便前端区分能力区。
+    """
+    # computer_control：需 Windows + pywinauto；仅探测库是否可导入，不触碰控制逻辑。
+    if sys.platform == "win32":
+        try:
+            import pywinauto  # noqa: F401
+            cc_available = True
+            cc_detail = "pywinauto 就绪（Windows）"
+        except Exception:
+            cc_available = False
+            cc_detail = "需安装 pywinauto（pip install pywinauto）"
+    else:
+        cc_available = False
+        cc_detail = "仅支持 Windows（当前平台 %s）" % sys.platform
+
+    return [
+        {
+            "id": "computer_control", "name": "电脑控制",
+            "desc": "允许幕僚聚焦/切换窗口、点击界面元素、输入文字、打开应用；高风险动作会先请你确认",
+            "granted": permissions.is_granted("computer_control"),
+            "available": cc_available,
+            "detail": cc_detail,
+            "note": "高风险动作会先请你确认",
+            "sensitive": True,
+            "kind": "capability",
+        },
+        {
+            "id": "voice_control", "name": "语音控制",
+            "desc": "允许幕僚通过语音指令控制本机；高风险动作会先请你确认",
+            "granted": permissions.is_granted("voice_control"),
+            "available": False,
+            "detail": "语音能力未在本分支实装",
+            "note": "未实装",
+            "sensitive": True,
+            "kind": "capability",
+        },
+    ]
+
+
 def _has(mod: str) -> bool:
     try:
         __import__(mod)

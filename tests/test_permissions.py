@@ -30,13 +30,21 @@ class PermissionCapabilityTests(unittest.TestCase):
     def test_voice_control_is_separate_and_default_off(self):
         status = permissions.status()
         self.assertEqual(len(permissions.DATA_SCOPES), 7)
-        self.assertEqual(permissions.CAPABILITY_SCOPES, ["voice_control"])
+        self.assertEqual(permissions.CAPABILITY_SCOPES, ["voice_control", "computer_control"])
         self.assertFalse(status["scopes"]["voice_control"])
+        self.assertFalse(status["scopes"]["computer_control"])
+
+    def test_computer_control_is_separate_and_default_off(self):
+        status = permissions.status()
+        # 电脑控制是能力 scope：默认关，且永不随「全选数据」打开。
+        self.assertIn("computer_control", permissions.CAPABILITY_SCOPES)
+        self.assertFalse(status["scopes"]["computer_control"])
 
     def test_agree_all_enables_only_data_scopes(self):
         status = permissions.agree(agree_all=True)
         self.assertTrue(all(status["scopes"][scope] for scope in permissions.DATA_SCOPES))
         self.assertFalse(status["scopes"]["voice_control"])
+        self.assertFalse(status["scopes"]["computer_control"])
 
     def test_resaving_data_permissions_preserves_voice_capability(self):
         permissions.set_scope("voice_control", True)

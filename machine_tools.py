@@ -19,6 +19,7 @@ import time
 from typing import Any
 
 import collectors
+import machine_control
 import permissions
 
 # ---- 工具定义（OpenAI function-calling 格式）----
@@ -140,6 +141,138 @@ TOOL_DEFS: dict[str, dict] = {
             },
         },
     },
+    # ---- 电脑控制能力（scope=computer_control，默认关、不随全选打开、独立显式授权）----
+    # 这些是「执行动作」而非只读采集。每个都受 computer_control 权限闸门 + 每次执行前的
+    # Jev 门控（server.action_gate）双重约束；高风险动作会先请用户确认才真正执行。
+    "list_windows": {
+        "scope": "computer_control",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "list_windows",
+                "description": "列出当前可控制的桌面窗口（标题、进程、pid）。在执行任何窗口操作前，先用它确认目标窗口存在与准确标题。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "最多返回几个窗口，默认 20，上限 200", "default": 20},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    },
+    "focus_window": {
+        "scope": "computer_control",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "focus_window",
+                "description": "把指定窗口切换到前台/激活，以便后续点击或输入。按 title（可模糊匹配）或 pid 定位，二者至少给一个。当用户说「切到那个窗口」「把它调到前面」时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "窗口标题（支持部分匹配）"},
+                        "pid": {"type": "integer", "description": "窗口所属进程 pid"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    },
+    "close_window": {
+        "scope": "computer_control",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "close_window",
+                "description": "关闭指定窗口。按 title 或 pid 定位，二者至少给一个。这会终止该窗口对应的程序，属较高风险动作。当用户说「关掉那个窗口/程序」时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "窗口标题（支持部分匹配）"},
+                        "pid": {"type": "integer", "description": "窗口所属进程 pid"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    },
+    "open_application": {
+        "scope": "computer_control",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "open_application",
+                "description": "启动一个应用程序（按名字如 notepad / 计算器，或可执行文件路径），可附启动参数。当用户说「打开某程序」「帮我启动 X」时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name_or_path": {"type": "string", "description": "应用名或可执行文件路径"},
+                        "args": {"type": "string", "description": "可选启动参数（字符串，或字符串数组）"},
+                    },
+                    "required": ["name_or_path"],
+                },
+            },
+        },
+    },
+    "click_element": {
+        "scope": "computer_control",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "click_element",
+                "description": "在某个窗口内点击一个界面控件（按钮、菜单项、输入框等），按控件名 element_name 或 automation_id 定位。window_title 为空则作用于当前前台窗口。当用户说「点那个按钮」「勾选某项」时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "window_title": {"type": "string", "description": "目标窗口标题；留空表示当前前台窗口"},
+                        "element_name": {"type": "string", "description": "控件显示名称"},
+                        "automation_id": {"type": "string", "description": "控件的 automation id（比名称更稳定）"},
+                        "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "鼠标按键，默认 left", "default": "left"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    },
+    "type_text": {
+        "scope": "computer_control",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "type_text",
+                "description": "向（可选定位的）输入框输入文字，可选在末尾回车。先确保目标窗口/控件已聚焦（必要时先 focus_window 或 click_element）。当用户说「在某处输入…」「帮我填…」时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "要输入的文本"},
+                        "window_title": {"type": "string", "description": "目标窗口标题；留空表示当前前台窗口"},
+                        "element_name": {"type": "string", "description": "目标输入控件名称；留空表示当前焦点控件"},
+                        "enter": {"type": "boolean", "description": "输入后是否追加回车，默认 false", "default": False},
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+    },
+    "press_keys": {
+        "scope": "computer_control",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "press_keys",
+                "description": "发送组合键或单个按键，如 ctrl+s、alt+f4、enter、esc。window_title 为空则作用于当前前台窗口。当用户说「按某快捷键」「保存一下（Ctrl+S）」时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keys": {"type": "string", "description": "组合键，用 + 连接，如 ctrl+s、alt+f4；单键如 enter、esc、a"},
+                        "window_title": {"type": "string", "description": "目标窗口标题；留空表示当前前台窗口"},
+                    },
+                    "required": ["keys"],
+                },
+            },
+        },
+    },
 }
 
 
@@ -154,6 +287,22 @@ def available_tool_specs() -> list[dict]:
 
 def available_tool_names() -> list:
     return [n for n, t in TOOL_DEFS.items() if permissions.is_granted(t["scope"])]
+
+
+def tool_scope(name: str) -> str | None:
+    """返回某工具绑定的权限 scope；未知工具返回 None。
+
+    server 的动作门控据此判断一个工具是否「控制类」（scope == computer_control），
+    从而决定 Jev 不可用时 fail-closed（控制类拒绝）还是降级放行（只读类）。
+    """
+    t = TOOL_DEFS.get(name)
+    return t["scope"] if t else None
+
+
+def is_control_tool(name: str) -> bool:
+    """该工具是否为电脑控制类（执行动作，而非只读采集）。"""
+    return tool_scope(name) == "computer_control"
+
 
 
 # ---- 工具执行 ----
@@ -344,6 +493,54 @@ def execute_tool(name: str, args: dict | None) -> str:
                 "count": len(items), "keyword": kw or None, "tools": d.get("tools_found"),
                 "matches": [f"[{x['tool']}/{x['role']}] {x['text'][:150]}" for x in items],
             })
+
+        # ---- 电脑控制能力（执行动作）----
+        # 到这里 computer_control 权限已过（函数头 scope 闸门）；动作该不该做由
+        # server.action_gate 的 Jev 门控在执行前裁决。machine_control 返回 dict，
+        # 这里统一转成给模型的截断文本；控制结果不复用 finish() 的权限复查语义
+        # （finish 是为只读采集设计的），但同样在返回前再查一次 computer_control，
+        # 防止执行途中撤权后仍把结果回灌给模型。
+        def finish_control(res: dict) -> str:
+            if not permissions.is_granted(t["scope"]):
+                return _trim({"error": "unavailable_tool",
+                              "hint": "电脑控制权限已撤销，本次动作结果已丢弃。不要重试。"})
+            return _trim(res)
+
+        if name == "list_windows":
+            return finish_control(machine_control.list_windows(limit=limit or 20))
+
+        if name == "focus_window":
+            return finish_control(machine_control.focus_window(
+                title=args.get("title"), pid=args.get("pid")))
+
+        if name == "close_window":
+            return finish_control(machine_control.close_window(
+                title=args.get("title"), pid=args.get("pid")))
+
+        if name == "open_application":
+            return finish_control(machine_control.open_application(
+                name_or_path=_as_text(args.get("name_or_path")), args=args.get("args")))
+
+        if name == "click_element":
+            return finish_control(machine_control.click_element(
+                window_title=args.get("window_title"),
+                element_name=args.get("element_name"),
+                automation_id=args.get("automation_id"),
+                button=_as_text(args.get("button")) or "left"))
+
+        if name == "type_text":
+            # 直接透传原始 text（不经 _as_text 的 strip），保留用户想输入的首尾空白；
+            # machine_control.type_text 自己校验 isinstance(str) 与非空。
+            return finish_control(machine_control.type_text(
+                text=args.get("text"),
+                window_title=args.get("window_title"),
+                element_name=args.get("element_name"),
+                enter=bool(args.get("enter"))))
+
+        if name == "press_keys":
+            return finish_control(machine_control.press_keys(
+                keys=_as_text(args.get("keys")),
+                window_title=args.get("window_title")))
 
     except Exception as e:  # noqa: BLE001
         # 脱敏后再回灌：不把本机路径 / 用户名 / 临时文件位置泄给上游模型
