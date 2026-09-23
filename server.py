@@ -2357,6 +2357,20 @@ async def swarm_status(run_id: str):
     return _json(status, 200 if status.get("found") else 404)
 
 
+# ---- 语音子系统「言出法随」(feature/voice-command) ----
+# 独立 router 挂到 /api/voice/*：status/start/stop/command/test/events(SSE，仅 voice.* 事件)。
+# 必须在静态 mount("/") **之前**注册，否则会被 StaticFiles 吞掉、永不匹配。
+# 不改聊天/蜂群/权限/SYSTEM_PROMPT；权限沿用主线 voice_control 能力 scope（默认关）。
+import voice.api  # noqa: E402
+
+app.include_router(voice.api.router, prefix="/api/voice")
+# 关键陷阱：FastAPI 一旦给 app 传了自定义 lifespan（见 _app_lifespan），就**不再**执行
+# router 自带的 lifespan。voice.api.router 的 _voice_lifespan 本会在退出时调用
+# shutdown_voice_service() 释放麦克风；既然它不会触发，这里显式把释放挂进 app 生命周期，
+# 否则进程退出时麦克风/runtime 不释放会泄漏（交接手册明确警告过这一点）。
+register_shutdown_hook(voice.api.shutdown_voice_service)
+
+
 # ---- 静态前端（必须最后挂载，/api/* 路由优先匹配）----
 app.mount("/", StaticFiles(directory=os.path.join(HERE, "static"), html=True), name="static")
 
