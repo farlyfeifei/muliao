@@ -196,6 +196,25 @@ def _choice_text(choice: Any) -> str:
     return ""
 
 
+def _choice_stuck(choice: Any) -> bool:
+    """True when the chooser reports no element can advance the goal.
+
+    A distinct ``stuck`` signal (doc 12 §6.2) keeps "the model correctly found
+    no way forward" separate from "the model named an id that is not in the
+    candidate set" (invalid_choice), so the loop can report the honest reason.
+    """
+
+    if isinstance(choice, Mapping):
+        if choice.get("stuck") is True:
+            return True
+        action = str(choice.get("action") or choice.get("kind") or "").strip().lower()
+        return action in {"stuck", "blocked"}
+    if getattr(choice, "stuck", False) is True:
+        return True
+    action = str(getattr(choice, "action", "") or "").strip().lower()
+    return action in {"stuck", "blocked"}
+
+
 def _safe_goal(value: Any) -> str:
     # Keep the goal bounded too: it is sent with state to the chooser.
     return " ".join(str(value or "").split())[:24_000]
@@ -332,6 +351,8 @@ class GoalLoop:
             choice = _invoke_chooser(self.chooser, goal_text, snapshot, index)
             if _choice_complete(choice):
                 return GoalResult("completed", goal_text, tuple(steps), snapshot)
+            if _choice_stuck(choice):
+                return GoalResult("stuck", goal_text, tuple(steps), snapshot, "chooser reported no way forward")
 
             action_name = _choice_action(choice)
             try:

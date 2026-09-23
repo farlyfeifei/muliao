@@ -333,5 +333,39 @@ class GoalLoopTextPayloadTests(unittest.TestCase):
         self.assertIn("8 chars", outcome["detail"])
 
 
+class GoalLoopStuckTests(unittest.TestCase):
+    def test_chooser_stuck_signal_is_reported_not_invalid_choice(self):
+        calls = []
+        snapshot = Snapshot((UIElement(text="打开", role="Button", bounds=(1, 2, 30, 40)),), source="uia")
+        loop = GoalLoop(
+            SequencePerception([snapshot]),
+            lambda goal, state, step: {"id": "none", "action": "stuck", "stuck": True},
+            action=lambda element, action, text: calls.append(element),
+            dry_run=False,
+        )
+        result = loop.run("点那个不存在的按钮")
+        self.assertEqual(result.status, "stuck")
+        self.assertIn("no way forward", result.detail)
+        self.assertEqual(calls, [], "a stuck report must not invoke the executor")
+
+    def test_stuck_by_action_name_alone(self):
+        snapshot = Snapshot((UIElement(text="打开", role="Button", bounds=(1, 2, 30, 40)),), source="uia")
+        loop = GoalLoop(
+            SequencePerception([snapshot]),
+            lambda goal, state, step: {"id": "none", "action": "blocked"},
+            dry_run=False,
+        )
+        self.assertEqual(loop.run("g").status, "stuck")
+
+    def test_complete_still_wins_over_stuck_shape(self):
+        snapshot = Snapshot((UIElement(text="完成", role="Button", bounds=(1, 2, 30, 40)),), source="uia")
+        loop = GoalLoop(
+            SequencePerception([snapshot]),
+            lambda goal, state, step: {"complete": True},
+            dry_run=False,
+        )
+        self.assertEqual(loop.run("g").status, "completed")
+
+
 if __name__ == "__main__":
     unittest.main()
