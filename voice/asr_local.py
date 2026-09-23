@@ -6,6 +6,7 @@ import threading
 
 import numpy as np
 
+from .cancellation import CancellationToken
 from .contracts import AudioSegment, Transcript
 
 
@@ -46,7 +47,14 @@ class SenseVoiceRecognizer:
             )
             return self._recognizer
 
-    def transcribe(self, audio: AudioSegment) -> Transcript:
+    def transcribe(
+        self,
+        audio: AudioSegment,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> Transcript:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         if audio.channels != 1 or audio.sample_width != 2:
             raise ValueError("SenseVoice expects 16-bit mono PCM")
         if len(audio.pcm) % 2:
@@ -56,6 +64,8 @@ class SenseVoiceRecognizer:
         stream = recognizer.create_stream()
         stream.accept_waveform(audio.sample_rate, samples)
         recognizer.decode_stream(stream)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         result = stream.result
         text = str(result.text or "").strip()
         metadata = {

@@ -194,14 +194,20 @@ class VoiceM1OrchestrationTests(unittest.TestCase):
         self.assertEqual(speaker.texts, [])
         self.assertTrue(any(e.payload.get("state") == "cancelled" for e in events.events))
 
-    def test_cancel_current_stops_speaker_and_emits_event(self):
+    def test_cancel_current_marks_current_operation_without_publishing_terminal(self):
         engine, _, _, _, speaker, events, _ = engine_with()
         token = CancellationToken()
-        engine._current_cancel = token
-        engine.cancel_current()
+        operation = engine._begin_operation(token)
+        self.assertTrue(engine.cancel_current())
         self.assertTrue(token.cancelled)
         self.assertEqual(speaker.stops, 1)
-        self.assertTrue(any(e.payload.get("state") == "cancelled" for e in events.events))
+        self.assertFalse(operation.terminal)
+        self.assertFalse(any(e.payload.get("state") == "cancelled" for e in events.events))
+        result = engine._cancelled(operation)
+        self.assertEqual(result.status, "cancelled")
+        terminals = [e for e in events.events if e.payload.get("state") == "cancelled"]
+        self.assertEqual(len(terminals), 1)
+        self.assertFalse(engine.cancel_current())
 
 
 if __name__ == "__main__":

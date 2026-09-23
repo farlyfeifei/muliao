@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from collections import deque
+import threading
 from typing import Any, Callable
 
+from .cancellation import CancellationToken, VoiceCancelled
 from .contracts import AudioSegment
 
 
@@ -40,15 +42,19 @@ class PyAudioVADCapture:
         self.input_device_index = input_device_index
         self._pyaudio_factory = pyaudio_factory
         self._vad_factory = vad_factory
+        self._stop_event = threading.Event()
+        self._stream = None
+        self._stream_lock = threading.Lock()
 
     @property
     def samples_per_frame(self) -> int:
         return self.sample_rate * self.frame_ms // 1000
 
-    def capture_utterance(self) -> AudioSegment:
+    def capture_utterance(self, *, cancellation: CancellationToken | None = None) -> AudioSegment:
         import pyaudio
         import webrtcvad
 
+        self._stop_event.clear()
         audio = (self._pyaudio_factory or pyaudio.PyAudio)()
         vad = (self._vad_factory or webrtcvad.Vad)(self.vad_mode)
         stream = None
@@ -61,8 +67,12 @@ class PyAudioVADCapture:
                 input_device_index=self.input_device_index,
                 frames_per_buffer=self.samples_per_frame,
             )
-            return self._read_segment(stream, vad)
+            with self._stream_lock:
+                self._stream = stream
+            return self._read_segment(stream, vad, cancellation=cancellation)
         finally:
+            with self._stream_lock:
+                self._stream = None
             if stream is not None:
                 try:
                     stream.stop_stream()
@@ -74,7 +84,23 @@ class PyAudioVADCapture:
                     pass
             audio.terminate()
 
-    def _read_segment(self, stream: Any, vad: Any) -> AudioSegment:
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._stream_lock:
+            stream = self._stream
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+
+    def _read_segment(
+        self,
+        stream: Any,
+        vad: Any,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> AudioSegment:
         pre_roll_frames = max(1, self.pre_roll_ms // self.frame_ms)
         silence_frames = max(1, self.silence_ms // self.frame_ms)
         min_speech_frames = max(1, self.min_speech_ms // self.frame_ms)
@@ -88,6 +114,8 @@ class PyAudioVADCapture:
         frames_read = 0
 
         while len(frames) < max_frames:
+            if self._stop_event.is_set() or (cancellation is not None and cancellation.cancelled):
+                raise VoiceCancelled("voice capture cancelled")
             if not started and frames_read >= listen_frames:
                 break
             frame = stream.read(self.samples_per_frame, exception_on_overflow=False)

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import sys
+import threading
 import time
 from typing import Any, Mapping, TextIO
 
@@ -21,18 +22,20 @@ class MemoryEventSink:
 
     def __init__(self) -> None:
         self.events: list[VoiceEvent] = []
+        self._lock = threading.Lock()
 
     def emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
         if not event_type.startswith("voice."):
             raise ValueError("voice event type must use the voice.* namespace")
-        self.events.append(
-            VoiceEvent(
-                type=event_type,
-                seq=len(self.events) + 1,
-                ts=time.time(),
-                payload=dict(payload),
+        with self._lock:
+            self.events.append(
+                VoiceEvent(
+                    type=event_type,
+                    seq=len(self.events) + 1,
+                    ts=time.time(),
+                    payload=dict(payload),
+                )
             )
-        )
 
 
 class JsonLineEventSink:
@@ -41,19 +44,21 @@ class JsonLineEventSink:
     def __init__(self, stream: TextIO | None = None) -> None:
         self.stream = stream or sys.stdout
         self.seq = 0
+        self._lock = threading.Lock()
 
     def emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
         if not event_type.startswith("voice."):
             raise ValueError("voice event type must use the voice.* namespace")
-        self.seq += 1
-        event = VoiceEvent(type=event_type, seq=self.seq, ts=time.time(), payload=dict(payload))
-        self.stream.write(json.dumps({
-            "type": event.type,
-            "seq": event.seq,
-            "ts": event.ts,
-            "payload": event.payload,
-        }, ensure_ascii=False) + "\n")
-        self.stream.flush()
+        with self._lock:
+            self.seq += 1
+            event = VoiceEvent(type=event_type, seq=self.seq, ts=time.time(), payload=dict(payload))
+            self.stream.write(json.dumps({
+                "type": event.type,
+                "seq": event.seq,
+                "ts": event.ts,
+                "payload": event.payload,
+            }, ensure_ascii=False) + "\n")
+            self.stream.flush()
 
 
 class NullEventSink:

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, TypeVar
+
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -55,21 +58,25 @@ class VoiceResult:
     command: str = ""
     decision: RouteDecision | None = None
     action: ActionResult | None = None
+    detail: str = ""
     decisions: tuple[RouteDecision, ...] = ()
     actions: tuple[ActionResult, ...] = ()
-    detail: str = ""
 
 
 class PermissionGate(Protocol):
     def allowed(self) -> bool: ...
 
+    def run_if_allowed(self, callback: Callable[[], T]) -> tuple[bool, T | None]: ...
+
 
 class AudioCapture(Protocol):
-    def capture_utterance(self) -> AudioSegment: ...
+    def capture_utterance(self, *, cancellation: Any | None = None) -> AudioSegment: ...
+
+    def stop(self) -> None: ...
 
 
 class Recognizer(Protocol):
-    def transcribe(self, audio: AudioSegment) -> Transcript: ...
+    def transcribe(self, audio: AudioSegment, *, cancellation: Any | None = None) -> Transcript: ...
 
 
 class CommandRouter(Protocol):
