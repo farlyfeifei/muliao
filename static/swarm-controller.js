@@ -39,40 +39,51 @@
       buffer = lines.pop() || "";
       for (const line of lines) {
         if (!line.startsWith("data:")) continue;
-        try { onEvent(JSON.parse(line.slice(5).trim())); } catch {}
+        let event;
+        try { event = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        onEvent(event);
       }
     }
   }
 
-  function addUserGoal(goal) {
-    if (!cur()) newSession();
-    const session = cur();
+  function addUserGoal(goal, sessionId) {
+    if (!cur() && !sessionId) newSession();
+    const session = sessionById(sessionId) || cur();
     if (!session) return null;
     if (session.msgs.length === 0) {
       session.title = titleFrom(goal);
-      $("topTitle").textContent = session.title;
+      if (cur()?.id === session.id) $("topTitle").textContent = session.title;
     }
-    $("empty").style.display = "none";
     session.msgs.push({ role: "user", text: goal });
-    $("thread").appendChild(msgEl("user", goal));
     saveSessions();
     renderSessions($("search").value);
     updateCounts();
-    scrollBottom();
+    if (cur()?.id === session.id) {
+      $("empty").style.display = "none";
+      $("thread").appendChild(msgEl("user", goal));
+      scrollBottom();
+    }
     return session;
   }
 
-  function addFinalAnswer(text, meta) {
-    const session = cur();
+  function sessionById(sessionId) {
+    return sessions.find((session) => session.id === sessionId) || null;
+  }
+
+  function addFinalAnswer(text, meta, run) {
+    const session = sessionById(run?.sessionId);
     const value = String(text || "蜂群任务已完成，详情与产物见右侧蜂群面板。");
     if (session) {
-      session.msgs.push({ role: "assistant", text: value, think: "", thinkMs: meta?.duration_ms || 0, swarmRunId: active?.runId });
+      session.msgs.push({ role: "assistant", text: value, think: "", thinkMs: meta?.duration_ms || 0, swarmRunId: run?.runId });
       saveSessions();
       renderSessions($("search").value);
       updateCounts();
     }
-    $("thread").appendChild(msgEl("assistant", value));
-    scrollBottom();
+    // 用户可能在蜂群运行时切换会话；只在原会话仍可见时追加到当前线程。
+    if (cur()?.id === run?.sessionId) {
+      $("thread").appendChild(msgEl("assistant", value));
+      scrollBottom();
+    }
   }
 
   function shouldUseSwarm(plan) {
@@ -85,8 +96,16 @@
 
   async function planGoal(goal, options = {}) {
     const text = String(goal || "").trim();
-    if (!text || planning) return;
+    if (!text) return;
+    if (planning || active || pending) {
+      setBusy(false, active ? "蜂群运行中，请先取消或等待完成" : "已有蜂群计划等待处理");
+      $("input").value = text;
+      autoGrow($("input"));
+      $("input").focus();
+      return;
+    }
     planning = true;
+    const plannedSessionId = cur()?.id || null;
     $("send").disabled = true;
     UI()?.reset();
     UI()?.setConnection("connecting");
@@ -96,7 +115,7 @@
     try {
       const data = await jsonPost("/api/swarm/plan", {
         goal: text,
-        session_id: cur()?.id || `s${Date.now()}`,
+        session_id: plannedSessionId || `s${Date.now()}`,
         source: options.source || "chat",
         source_ref: options.sourceRef || null,
       });
@@ -107,7 +126,7 @@
         await sendTurn(text);
         return;
       }
-      pending = { goal: text, plan, source: options.source || "chat" };
+      pending = { goal: text, plan, source: options.source || "chat", sessionId: plannedSessionId };
       UI()?.renderPlan(plan);
       UI()?.setConnection("connected");
       setBusy(false, plan.requires_confirmation === false ? "蜂群计划已就绪" : "等待确认派蜂");
@@ -119,7 +138,7 @@
       await sendTurn(text);
     } finally {
       planning = false;
-      $("send").disabled = false;
+      if (!active) $("send").disabled = false;
       $("input").focus();
     }
   }
@@ -127,12 +146,15 @@
   async function runPending(detail) {
     if (!pending || active) return;
     const goal = pending.goal;
+    const plannedSessionId = pending.sessionId;
     const plan = detail?.plan || pending.plan;
-    const session = addUserGoal(goal);
+    const session = addUserGoal(goal, plannedSessionId);
     if (!session) return;
     pending = null;
-    active = { runId: plan.run_id || plan.runId || null, sessionId: session.id, goal, plan, terminal: null };
-    aborter = new AbortController();
+    const controller = new AbortController();
+    const run = { runId: plan.run_id || plan.runId || null, sessionId: session.id, goal, plan, terminal: null, cancelled: false, controller };
+    active = run;
+    aborter = controller;
     UI()?.setConnection("connecting");
     gotoTab("swarm");
     setBusy(true, "蜂群运行中…");
@@ -142,21 +164,24 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ goal, plan, session_id: session.id, confirmed: true }),
-        signal: aborter.signal,
+        signal: controller.signal,
       });
       await consumeSSE(response, (event) => {
-        if (event.run_id && !active.runId) active.runId = event.run_id;
+        // 取消或被后续状态替换的 run 不再接收迟到事件。
+        if (active !== run || run.cancelled) return;
+        if (event.run_id && !run.runId) run.runId = event.run_id;
         UI()?.handleEvent(event);
         if (["swarm.done", "swarm.error", "swarm.cancelled", "swarm.waiting_user", "swarm.skipped"].includes(event.type)) {
-          active.terminal = event;
+          run.terminal = event;
         }
         if (event.type === "swarm.done") {
           const payload = event.payload || {};
           const integrator = payload.results?.integrator || payload.results?.integration || {};
-          addFinalAnswer(payload.final_text || payload.summary || integrator.text || integrator.output || integrator.summary, payload);
+          addFinalAnswer(payload.final_text || payload.summary || integrator.text || integrator.output || integrator.summary, payload, run);
         }
       });
-      const terminal = active?.terminal;
+      if (run.cancelled) return;
+      const terminal = run.terminal;
       if (!terminal) throw new Error("蜂群事件流未返回终态");
       if (terminal.type === "swarm.done") {
         UI()?.setConnection("connected");
@@ -181,11 +206,14 @@
         setBusy(false, "蜂群任务失败");
       }
     } finally {
-      active = null;
-      aborter = null;
-      $("swarmCancel").disabled = true;
-      $("send").disabled = false;
-      $("input").focus();
+      const stillCurrent = active === run;
+      if (stillCurrent) active = null;
+      if (aborter === controller) aborter = null;
+      if (!active && !planning) {
+        $("swarmCancel").disabled = true;
+        $("send").disabled = false;
+        $("input").focus();
+      }
     }
   }
 
@@ -200,10 +228,12 @@
       if (!runId) throw new Error("任务尚未建立运行 ID");
       const result = await jsonPost(`/api/swarm/${encodeURIComponent(runId)}/cancel`, {});
       if (result.ok === false || result.cancelled === false) throw new Error(result.err || "服务端未接受取消请求");
+      const run = active;
+      if (run) run.cancelled = true;
       aborter?.abort();
       UI()?.handleEvent({ type: "swarm.cancelled", run_id: runId, payload: { reason: "用户取消" } });
       UI()?.setConnection("disconnected");
-      active = null;
+      if (active === run) active = null;
       setBusy(false, "蜂群任务已取消");
     } catch (error) {
       UI()?.handleEvent({ type: "swarm.error", run_id: runId, payload: { message: `取消失败：${error.message}` } });
