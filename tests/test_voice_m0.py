@@ -173,7 +173,7 @@ class VoiceM0Tests(unittest.TestCase):
 
     def test_permission_revoked_after_jev_stops_before_action(self):
         engine, _, _, router, executor, speaker, events = make_engine(
-            permission_sequence=[True, True, False]
+            permission_sequence=[True, True, True, False]
         )
         result = engine.process_transcript("幕僚幕僚，打开记事本")
         self.assertEqual(result.status, "permission_denied")

@@ -55,6 +55,8 @@ class VoiceResult:
     command: str = ""
     decision: RouteDecision | None = None
     action: ActionResult | None = None
+    decisions: tuple[RouteDecision, ...] = ()
+    actions: tuple[ActionResult, ...] = ()
     detail: str = ""
 
 
