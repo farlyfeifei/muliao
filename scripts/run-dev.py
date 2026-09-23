@@ -23,7 +23,8 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
-    workspace = root.parent
+    # 主检出位于项目根下；功能 worktree 位于 <项目根>/muliao-worktrees/<lane>。
+    workspace = root.parent.parent if root.parent.name == "muliao-worktrees" else root.parent
     lane = LANES[args.lane]
     appdata = Path(os.environ.get("APPDATA") or Path.home())
     shared_config = appdata / "Muliao" / "config.json"
