@@ -35,9 +35,7 @@ from swarm_planner import (
 )
 
 
-_REQUIRED_PLAN_ANSWERS = tuple(SWARM_PLAN_QUESTIONS)
 _TERMINAL_STATUSES = {"cancelled", "completed", "failed", "skipped"}
-_HIGH_RISK_LEVELS = {"high", "critical", "severe", "very_high", "very high"}
 
 
 class SwarmBackendUnavailable(RuntimeError):
@@ -368,15 +366,21 @@ class SwarmService:
         with self._lock:
             state = self._runs.get(run_id)
             if state is None:
-                requires_confirmation, _ = _confirmation_gate(plan)
+                gate_plan = plan.get("_orchestrator_plan")
+                if not isinstance(gate_plan, Mapping):
+                    gate_plan = plan
+                gate = evaluate_user_gate(
+                    normalize_plan(gate_plan),
+                    confirmed=bool(plan.get("_confirmed", False)),
+                )
                 state = {
                     "found": True,
                     "run_id": run_id,
                     "session_id": session_id,
                     "goal": goal,
-                    "status": "requires_confirmation" if requires_confirmation else "planned",
+                    "status": "requires_confirmation" if gate.required else "planned",
                     "source": plan.get("source", "external"),
-                    "requires_confirmation": requires_confirmation,
+                    "requires_confirmation": gate.required,
                     "created_at": now,
                     "updated_at": now,
                     "events": 0,
@@ -465,194 +469,6 @@ class SwarmService:
             "Expected stream_run(), run_swarm(), run(), an orchestrator singleton, "
             "or a zero-argument Orchestrator class."
         )
-
-
-def _decision_from_jev(response: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not isinstance(response, Mapping):
-        raise ValueError("Jev returned a non-object response")
-    if response.get("ok") is False:
-        raise RuntimeError(str(response.get("err") or response.get("error") or "Jev planning failed"))
-
-    if "answers" in response:
-        answers = response.get("answers")
-    elif all(key in response for key in _REQUIRED_PLAN_ANSWERS):
-        answers = response
-    else:
-        raise ValueError("Jev response has no complete answers object")
-    if not isinstance(answers, Mapping):
-        raise ValueError("Jev answers must be an object")
-    missing = [key for key in _REQUIRED_PLAN_ANSWERS if key not in answers]
-    if missing:
-        raise ValueError(f"Jev answers missing: {', '.join(missing)}")
-
-    decision = {
-        "swarm_worthy": _coerce_bool(_answer_value(answers["swarm_worthy"]), "swarm_worthy"),
-        "task_type": _coerce_task_type(_answer_value(answers["task_type"])),
-        "needs_clarify": _coerce_bool(_answer_value(answers["needs_clarify"]), "needs_clarify"),
-        "risk_level": _coerce_risk(_answer_value(answers["risk_level"])),
-        "evidence_heavy": _coerce_bool(_answer_value(answers["evidence_heavy"]), "evidence_heavy"),
-        "parallelizable": _coerce_bool(_answer_value(answers["parallelizable"]), "parallelizable"),
-    }
-    meta = {
-        "ok": True,
-        "model": _json_safe(response.get("model")),
-        "usage": _json_safe(response.get("usage")),
-        "ms": _json_safe(response.get("ms")),
-    }
-    return decision, meta
-
-
-def _answer_value(value: Any) -> Any:
-    if not isinstance(value, Mapping):
-        return value
-    for key in ("choice", "noul", "value", "answer", "score", "label"):
-        if key in value:
-            return value[key]
-    raise ValueError("Jev answer has no recognized value field")
-
-
-def _coerce_bool(value: Any, field: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return value != 0
-    text = str(value).strip().lower().replace("-", "_")
-    truthy = {"yes", "true", "1", "y", "是", "需要", "适合", "值得", "swarm", "high"}
-    falsy = {"no", "false", "0", "n", "否", "不需要", "不适合", "single", "low"}
-    if text in truthy:
-        return True
-    if text in falsy:
-        return False
-    raise ValueError(f"Jev answer {field!r} is not boolean-like: {value!r}")
-
-
-def _coerce_task_type(value: Any) -> str:
-    text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "coding": "code",
-        "software": "code",
-        "fact": "query",
-        "question": "query",
-        "writing": "create",
-        "operation": "action",
-        "multi": "mixed",
-    }
-    return aliases.get(text, text or "task")
-
-
-def _coerce_risk(value: Any) -> str:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        score = float(value)
-        if score >= 9:
-            return "critical"
-        if score >= 7:
-            return "high"
-        if score >= 4:
-            return "medium"
-        return "low"
-    text = str(value).strip().lower().replace("-", "_")
-    try:
-        return _coerce_risk(float(text))
-    except ValueError:
-        pass
-    aliases = {
-        "none": "low",
-        "safe": "low",
-        "moderate": "medium",
-        "med": "medium",
-        "severe": "critical",
-        "very_high": "critical",
-        "极高": "critical",
-        "高": "high",
-        "中": "medium",
-        "低": "low",
-    }
-    return aliases.get(text, text or "medium")
-
-
-def _confirmation_gate(decision: Mapping[str, Any]) -> tuple[bool, list[str]]:
-    reasons: list[str] = []
-    risk = _coerce_risk(decision.get("risk_level", "low"))
-    if risk in _HIGH_RISK_LEVELS:
-        reasons.append("high_risk")
-    try:
-        clarify = _coerce_bool(decision.get("needs_clarify", False), "needs_clarify")
-    except ValueError:
-        clarify = bool(decision.get("needs_clarify"))
-    if clarify:
-        reasons.append("needs_clarification")
-    return bool(reasons), reasons
-
-
-def _fallback_decision(goal: str, permissions_snapshot: Any) -> dict[str, Any]:
-    text = " ".join(goal.lower().split())
-    evidence_terms = (
-        "research", "source", "citation", "evidence", "compare", "benchmark", "verify",
-        "调研", "来源", "引用", "证据", "对比", "比较", "核实", "验证",
-    )
-    parallel_terms = (
-        "parallel", "independent", "multiple", "several", "across", "in parallel",
-        "并行", "分别", "多个", "多路", "同时", "逐个", "各自",
-    )
-    swarm_terms = (
-        "multi-step", "end-to-end", "architecture", "audit", "investigate", "plan and implement",
-        "多步骤", "端到端", "架构", "审计", "排查", "规划并实现", "蜂群", "分工",
-    )
-    high_risk_terms = (
-        "delete", "erase", "wipe", "format disk", "uninstall", "drop database", "rm -rf",
-        "purchase", "pay", "transfer money", "publish", "send email", "deploy production",
-        "credential", "password", "secret key", "sudo", "administrator",
-        "删除", "清空", "抹除", "格式化", "卸载", "删库", "付款", "转账", "购买",
-        "发布", "群发", "发邮件", "生产环境", "密码", "凭据", "密钥", "管理员权限",
-    )
-    medium_risk_terms = (
-        "install", "modify", "edit", "write file", "execute", "run command", "deploy",
-        "安装", "修改", "编辑", "写入", "执行", "运行命令", "部署",
-    )
-    vague_exact = {
-        "", "do it", "fix it", "handle it", "take care of it", "帮我弄一下", "处理一下",
-        "修一下", "帮我看看", "搞定它", "照办",
-    }
-
-    evidence_heavy = any(term in text for term in evidence_terms)
-    parallelizable = any(term in text for term in parallel_terms)
-    decomposition = any(term in text for term in swarm_terms)
-    if len(text) >= 160 and any(token in text for token in (" and ", "、", "以及", ";", "；")):
-        parallelizable = True
-    swarm_worthy = bool(decomposition or (evidence_heavy and parallelizable) or len(text) >= 280)
-    needs_clarify = text in vague_exact or len(text) < 4
-
-    if any(term in text for term in high_risk_terms):
-        risk_level = "high"
-    elif any(term in text for term in medium_risk_terms):
-        risk_level = "medium"
-    else:
-        risk_level = "low"
-
-    if any(term in text for term in ("code", "bug", "test", "python", "javascript", "api", "代码", "修复", "测试", "接口")):
-        task_type = "code"
-    elif evidence_heavy:
-        task_type = "research"
-    elif any(term in text for term in ("write", "draft", "design", "create", "写", "撰写", "设计", "创作")):
-        task_type = "create"
-    elif risk_level != "low" or any(term in text for term in ("send", "change", "发送", "更改")):
-        task_type = "action"
-    elif "?" in text or "？" in text or text.startswith(("what", "why", "how", "什么", "为什么", "怎么")):
-        task_type = "query"
-    else:
-        task_type = "task"
-
-    # A snapshot is intentionally accepted but does not invent permissions.  It
-    # remains part of the deterministic input for future policy refinements.
-    _ = permissions_snapshot
-    return {
-        "swarm_worthy": swarm_worthy,
-        "task_type": task_type,
-        "needs_clarify": needs_clarify,
-        "risk_level": risk_level,
-        "evidence_heavy": evidence_heavy,
-        "parallelizable": parallelizable,
-    }
 
 
 def _resolve_awaitable_sync(value: Any) -> Any:
