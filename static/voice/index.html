@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>言出法随 · 幕僚语音监听台</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="voice-console" id="voiceConsole" data-state="booting">
+    <header class="masthead">
+      <div class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <div>
+        <p class="product-name">幕僚 · 言出法随</p>
+        <h1>语音监听台</h1>
+      </div>
+      <div class="connection" id="connectionState" role="status">
+        <span class="connection-lamp"></span>
+        <span>正在接入事件流</span>
+      </div>
+    </header>
+
+    <section class="control-rail" aria-labelledby="controlTitle">
+      <div class="rail-heading">
+        <p id="controlTitle">执行闸门</p>
+        <span>权限通过后才会启动麦克风、Jev 与动作链。</span>
+      </div>
+
+      <div class="permission-state" id="permissionState">
+        <span class="permission-seal" aria-hidden="true">锁</span>
+        <div>
+          <strong id="permissionLabel">读取授权中</strong>
+          <p id="permissionHint">默认关闭，不会采音。</p>
+        </div>
+      </div>
+
+      <div class="run-controls">
+        <button class="primary-action" id="startVoice" type="button">
+          <span class="button-sigil" aria-hidden="true"></span>
+          启动监听
+        </button>
+        <button class="secondary-action" id="stopVoice" type="button" disabled>停止并释放</button>
+      </div>
+
+      <dl class="runtime-facts">
+        <div><dt>运行状态</dt><dd id="runtimeState">初始化</dd></div>
+        <div><dt>运行代次</dt><dd id="generationValue">0</dd></div>
+        <div><dt>SSE 订阅</dt><dd id="subscriberValue">0</dd></div>
+      </dl>
+
+      <form class="test-bench" id="testForm">
+        <div class="test-copy">
+          <label for="testCommand">命令试验台</label>
+          <span>只走 dry-run，不打开麦克风，不执行系统动作。</span>
+        </div>
+        <textarea id="testCommand" rows="3" maxlength="500" placeholder="例如：幕僚幕僚，打开记事本" required></textarea>
+        <button type="submit" id="testCommandButton">验证命令</button>
+        <p class="form-result" id="testResult" aria-live="polite"></p>
+      </form>
+    </section>
+
+    <section class="transcript-stage" aria-labelledby="transcriptTitle">
+      <div class="stage-rule">
+        <span>实时字幕</span>
+        <time id="lastEventTime">尚无语音事件</time>
+      </div>
+      <div class="signal-field" aria-hidden="true">
+        <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+      </div>
+      <div class="transcript-copy">
+        <h2 id="transcriptTitle">等待唤醒</h2>
+        <p id="transcriptText">授权并启动后，说出“幕僚幕僚”再下达命令。</p>
+        <p class="partial-text" id="partialText"></p>
+      </div>
+      <div class="latest-decision" id="latestDecision">
+        <span>判断</span>
+        <strong>尚未收到决策</strong>
+        <p>Jev 的接受、目标与置信度会显示在这里。</p>
+      </div>
+    </section>
+
+    <aside class="event-ledger" aria-labelledby="ledgerTitle">
+      <header>
+        <div>
+          <p>事件卷宗</p>
+          <h2 id="ledgerTitle">Voice namespace</h2>
+        </div>
+        <button id="clearEvents" type="button">清空视图</button>
+      </header>
+      <div class="event-filter" aria-label="事件类型图例">
+        <span data-kind="decision">判断</span>
+        <span data-kind="action">动作</span>
+        <span data-kind="tts">播报</span>
+        <span data-kind="metric">指标</span>
+        <span data-kind="error">错误</span>
+      </div>
+      <ol class="event-list" id="eventList" aria-live="polite">
+        <li class="empty-ledger" id="emptyLedger">
+          <strong>事件流尚为空</strong>
+          <span>这里只接收 <code>voice.*</code> 信封。</span>
+        </li>
+      </ol>
+    </aside>
+
+    <footer class="safety-note">
+      <span>本地安全线</span>
+      未授权时服务保持静止；停止会取消当前操作并释放运行资源。
+    </footer>
+  </main>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
