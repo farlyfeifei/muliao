@@ -113,6 +113,54 @@ class JevFastRouterTests(unittest.TestCase):
         self.assertEqual(json.loads(seen[0]["state"]), {"utterance": "搜索 控制论"})
         self.assertNotIn("query", seen[0]["state"])
 
+    def test_bounded_state_is_forwarded_to_jev_request(self):
+        seen = []
+
+        def handler(request: httpx.Request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=response(kind="open_app", app="notepad"))
+
+        router = JevFastRouter(
+            url="https://example.test/systemone",
+            api_key="test-only",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        state = {
+            "foreground_app": {"name": "notepad.exe", "window_title": "无标题"},
+            "context": {"recent_actions": [{"said": "打开记事本", "action": "open_app:notepad"}]},
+            "elements": ["e01 button 文件"],
+        }
+        router.route("打开记事本", state)
+
+        sent = json.loads(seen[0]["state"])
+        # utterance 始终来自命令；受限上下文按原样进入请求，供 Jev 做指代判断。
+        self.assertEqual(sent["utterance"], "打开记事本")
+        self.assertEqual(sent["foreground_app"]["name"], "notepad.exe")
+        self.assertEqual(sent["context"]["recent_actions"][0]["action"], "open_app:notepad")
+        self.assertEqual(sent["elements"], ["e01 button 文件"])
+
+    def test_state_utterance_is_not_overwritten_when_already_present(self):
+        seen = []
+
+        def handler(request: httpx.Request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=response(kind="open_app", app="notepad"))
+
+        router = JevFastRouter(
+            url="https://example.test/systemone",
+            api_key="test-only",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        router.route("忽略我", {"utterance": "打开记事本"})
+        self.assertEqual(json.loads(seen[0]["state"])["utterance"], "打开记事本")
+
+    def test_goal_kind_sets_needs_screen_stable_field(self):
+        goal = self.router(response(kind="goal")).route("点下载按钮")
+        plain = self.router(response(kind="open_app", app="notepad")).route("打开记事本")
+        self.assertTrue(goal.raw["needs_screen"])
+        self.assertFalse(goal.accepted, "FAST router never accepts goal; orchestrator routes it")
+        self.assertFalse(plain.raw["needs_screen"])
+
 
 if __name__ == "__main__":
     unittest.main()

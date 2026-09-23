@@ -123,6 +123,10 @@ FAST_QUESTIONS = {
 }
 
 
+def _clean_str(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
 def _safe_float(value: Any) -> float:
     try:
         return float(value or 0.0)
@@ -174,11 +178,21 @@ class _JevRouterBase:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    def _ask(self, command: str) -> tuple[Mapping[str, Any], Mapping[str, Any]] | RouteDecision:
+    def _ask(
+        self,
+        command: str,
+        state: Mapping[str, Any] | None = None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]] | RouteDecision:
         if not self.api_key:
             return RouteDecision(accepted=False, reason="jev_missing_api_key")
+        if state is None:
+            request_state: dict[str, Any] = {"utterance": command}
+        else:
+            request_state = dict(state)
+            if not _clean_str(request_state.get("utterance")):
+                request_state["utterance"] = command
         body = {
-            "state": json.dumps({"utterance": command}, ensure_ascii=False),
+            "state": json.dumps(request_state, ensure_ascii=False),
             "model": self.model,
             "questions": self.questions,
         }
@@ -201,8 +215,8 @@ class JevM0Router(_JevRouterBase):
 
     questions = M0_QUESTIONS
 
-    def route(self, command: str) -> RouteDecision:
-        result = self._ask(command)
+    def route(self, command: str, state: Mapping[str, Any] | None = None) -> RouteDecision:
+        result = self._ask(command, state)
         if isinstance(result, RouteDecision):
             return result
         answers, payload = result
@@ -252,8 +266,8 @@ class JevFastRouter(_JevRouterBase):
         "stop",
     }
 
-    def route(self, command: str) -> RouteDecision:
-        result = self._ask(command)
+    def route(self, command: str, state: Mapping[str, Any] | None = None) -> RouteDecision:
+        result = self._ask(command, state)
         if isinstance(result, RouteDecision):
             return result
         answers, payload = result
@@ -263,6 +277,10 @@ class JevFastRouter(_JevRouterBase):
         kind, kind_conf = _choice(answers, "kind")
         target, target_conf, span = self._target_for(kind, answers, command)
         confidence = min(kind_conf, target_conf) if target_conf is not None else kind_conf
+        # kind=goal 需要看屏多步执行，由 orchestrator 分流到 GOAL 通道；它不属于
+        # FAST allowlist，因此这里 accepted 恒为 False，但把 needs_screen 提为稳定
+        # 字段供上层判断，避免长期从 raw.answers 偷读。
+        needs_screen = kind == "goal"
         allowed = (
             addressed >= 0.5
             and complete >= 0.6
@@ -271,7 +289,14 @@ class JevFastRouter(_JevRouterBase):
             and target != "none"
             and confidence >= 0.5
         )
-        raw: dict[str, Any] = {"answers": answers, "model": payload.get("model")}
+        raw: dict[str, Any] = {
+            "answers": answers,
+            "model": payload.get("model"),
+            "needs_screen": needs_screen,
+            "addressed": addressed,
+            "complete": complete,
+            "destructive_probability": destructive,
+        }
         if span is not None:
             raw["span"] = span.as_dict()
             if kind == "search":
