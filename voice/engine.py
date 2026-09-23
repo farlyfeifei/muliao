@@ -1,7 +1,6 @@
 """M0 语音主循环：权限 → 本地 ASR → 唤醒 → Jev → 白名单动作 → 本地 TTS。"""
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Mapping, Any
 
 from .contracts import (
@@ -73,15 +72,20 @@ class VoiceEngine:
             return VoiceResult(status="permission_denied", detail="voice_control is not granted")
 
         item = transcript if isinstance(transcript, Transcript) else Transcript(text=str(transcript))
-        self._emit("voice.final", {"text": item.text, "language": item.language})
         wake = self.wake.detect(item.text)
         if wake is None:
+            # 未唤醒语音只在本机内存中完成关键词判断，不向事件流暴露原文。
             self._emit("voice.metric", {"name": "wake_miss", "value": 1})
             self._emit("voice.state", {"state": "sleeping"})
-            return VoiceResult(status="wake_miss", transcript=item.text)
+            return VoiceResult(status="wake_miss")
+        if not self.permission.allowed():
+            self._emit("voice.error", {"code": "permission_revoked"})
+            return VoiceResult(status="permission_denied", detail="voice_control was revoked")
+
+        self._emit("voice.final", {"text": wake.command, "language": item.language})
         if not wake.command:
             self._emit("voice.state", {"state": "wake_detected"})
-            return VoiceResult(status="wake_only", transcript=item.text)
+            return VoiceResult(status="wake_only")
 
         self._emit("voice.state", {"state": "deciding"})
         decision = self.router.route(wake.command)
@@ -108,10 +112,17 @@ class VoiceEngine:
             self._emit("voice.state", {"state": "rejected"})
             return VoiceResult(
                 status="rejected",
-                transcript=item.text,
                 command=wake.command,
                 decision=decision,
                 detail=decision.reason,
+            )
+        if not self.permission.allowed():
+            self._emit("voice.error", {"code": "permission_revoked"})
+            return VoiceResult(
+                status="permission_denied",
+                command=wake.command,
+                decision=decision,
+                detail="voice_control was revoked before action",
             )
 
         action = self.executor.execute(decision)

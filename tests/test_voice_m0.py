@@ -20,12 +20,15 @@ class Counter:
 
 
 class FakePermission(Counter):
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, sequence: list[bool] | None = None) -> None:
         super().__init__()
         self.enabled = enabled
+        self.sequence = list(sequence or [])
 
     def allowed(self) -> bool:
         self.calls += 1
+        if self.sequence:
+            return self.sequence.pop(0)
         return self.enabled
 
 
@@ -84,8 +87,14 @@ class FakeSpeaker(Counter):
         self.texts.append(text)
 
 
-def make_engine(*, allowed=True, transcript="幕僚幕僚，打开记事本", decision=None):
-    permission = FakePermission(allowed)
+def make_engine(
+    *,
+    allowed=True,
+    permission_sequence=None,
+    transcript="幕僚幕僚，打开记事本",
+    decision=None,
+):
+    permission = FakePermission(allowed, permission_sequence)
     recognizer = FakeRecognizer(transcript)
     router = FakeRouter(decision)
     executor = FakeExecutor()
@@ -113,6 +122,11 @@ class WakeDetectorTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match.command, "打开记事本")
 
+    def test_accepts_verified_homophone_alias_from_real_sensevoice(self):
+        match = WakeDetector().detect("木聊木聊打开记事本。")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.command, "打开记事本。")
+
     def test_rejects_single_or_mid_sentence_wake_word(self):
         detector = WakeDetector()
         self.assertIsNone(detector.detect("幕僚，打开记事本"))
@@ -138,11 +152,35 @@ class VoiceM0Tests(unittest.TestCase):
         )
         result = engine.process_audio(AudioSegment(b"\0\0" * 160))
         self.assertEqual(result.status, "wake_miss")
+        self.assertEqual(result.transcript, "")
         self.assertEqual(recognizer.calls, 1)
         self.assertEqual(router.calls, 0)
         self.assertEqual(executor.calls, 0)
         self.assertEqual(speaker.calls, 0)
         self.assertTrue(any(e.type == "voice.metric" for e in events.events))
+        self.assertFalse(any(e.type == "voice.final" for e in events.events))
+
+    def test_permission_revoked_after_recognition_stops_before_jev(self):
+        engine, _, _, router, executor, speaker, events = make_engine(
+            permission_sequence=[True, False]
+        )
+        result = engine.process_transcript("幕僚幕僚，打开记事本")
+        self.assertEqual(result.status, "permission_denied")
+        self.assertEqual(router.calls, 0)
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+        self.assertTrue(any(e.payload.get("code") == "permission_revoked" for e in events.events))
+
+    def test_permission_revoked_after_jev_stops_before_action(self):
+        engine, _, _, router, executor, speaker, events = make_engine(
+            permission_sequence=[True, True, False]
+        )
+        result = engine.process_transcript("幕僚幕僚，打开记事本")
+        self.assertEqual(result.status, "permission_denied")
+        self.assertEqual(router.calls, 1)
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+        self.assertTrue(any(e.payload.get("code") == "permission_revoked" for e in events.events))
 
     def test_wake_phrase_is_stripped_before_router_and_notepad_executes(self):
         engine, _, _, router, executor, speaker, events = make_engine()

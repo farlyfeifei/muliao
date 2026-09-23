@@ -1,0 +1,9 @@
+# 幕僚“言出法随”独立依赖（与共享 requirements.txt 分离）
+# 安装：python -m pip install -r requirements-voice.txt
+
+httpx==0.28.1
+numpy==2.3.5
+PyAudio==0.2.14 ; sys_platform == "win32"
+pywin32==312 ; sys_platform == "win32"
+sherpa-onnx==1.13.8
+webrtcvad==2.0.14

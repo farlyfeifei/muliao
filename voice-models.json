@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "models": {
+    "sensevoice": {
+      "purpose": "M0 final command ASR after local wake gating",
+      "runtime": "sherpa-onnx",
+      "env": "MULIAO_VOICE_SENSEVOICE_DIR",
+      "default_relative_dir": "models/sensevoice",
+      "files": [
+        {"name": "model.int8.onnx", "size_bytes": 239233841},
+        {"name": "tokens.txt", "size_bytes": 315894}
+      ],
+      "source": "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    }
+  },
+  "notes": [
+    "Model assets are never committed to git.",
+    "Production packaging must place model files under an ASCII-only path.",
+    "API keys must come from environment variables or repository-external config."
+  ]
+}
