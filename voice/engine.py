@@ -341,7 +341,7 @@ class VoiceEngine:
                     return self._cancelled(operation, command, decisions, actions)
                 if not self._is_current(operation):
                     return self._finish_stale(operation)
-                self._stop_speaker(operation.operation_id)
+                self._stop_current_playback()
                 action = ActionResult(True, "stop:current", "voice operation stopped")
                 actions.append(action)
                 self._emit(operation, "voice.action", {"step": index, "steps": len(commands), "ok": True, "action": action.action, "detail": action.detail})
@@ -511,6 +511,22 @@ class VoiceEngine:
                 stop()
             except Exception:
                 pass
+        except Exception:
+            pass
+
+    def _stop_current_playback(self) -> None:
+        """无条件停止当前任何播报，用于显式"停止播报"语音命令。
+
+        与 :meth:`_stop_speaker` 不同：这里不绑定 operation_id，因为发出停止
+        命令的是一个新 operation，而正在播放的音频属于上一个 operation；按 id
+        过滤会因不匹配而拒绝停止，违背用户意图。
+        """
+
+        stop = getattr(self.speaker, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            stop()
         except Exception:
             pass
 

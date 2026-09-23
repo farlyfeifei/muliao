@@ -294,5 +294,39 @@ class VoiceM0Tests(unittest.TestCase):
         )
 
 
+    def test_stop_command_issues_unconditional_playback_stop(self):
+        # "停止播报"是一个新 operation，但要打断的音频属于上一个 operation。
+        # 按 operation_id 过滤会因不匹配而拒绝停止，因此 stop 决策必须发出
+        # 无 operation_id 的无条件停止。
+        decision = RouteDecision(accepted=True, kind="stop", target="current", confidence=0.99)
+        engine, _, _, _, executor, _, events = make_engine(decision=decision)
+
+        class IdFilteringSpeaker(Counter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.stop_calls: list[object] = []
+
+            def speak(self, text: str, **kwargs) -> None:
+                self.calls += 1
+
+            def stop(self, *, operation_id=None) -> bool:
+                self.stop_calls.append(operation_id)
+                # 模拟 FallbackSpeaker：带不匹配的 operation_id 时拒绝停止。
+                return operation_id is None
+
+        speaker = IdFilteringSpeaker()
+        engine.speaker = speaker
+
+        result = engine.process_transcript("幕僚幕僚，停止播报")
+
+        self.assertEqual(result.status, "executed")
+        self.assertEqual(result.action.action, "stop:current")
+        self.assertEqual(executor.calls, 0, "stop must not reach the action executor")
+        self.assertEqual(speaker.stop_calls, [None])
+        self.assertTrue(
+            any(e.payload.get("action") == "stop:current" for e in events.events),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
