@@ -25,64 +25,15 @@ import uuid
 from collections.abc import AsyncIterable, Iterable, Mapping
 from typing import Any, Callable
 
+from swarm_planner import (
+    SWARM_PLAN_QUESTIONS,
+    deterministic_fallback,
+    evaluate_user_gate,
+    materialize_plan,
+    normalize_plan,
+    parse_jev_response,
+)
 
-SWARM_PLAN_QUESTIONS: dict[str, dict[str, Any]] = {
-    "swarm_worthy": {
-        "type": "choice",
-        "instructions": "Would multiple specialized agents materially improve this task?",
-        "criteria": {
-            "yes": "The task benefits from decomposition, independent checks, or specialists.",
-            "no": "A single agent can complete it directly without meaningful loss.",
-        },
-    },
-    "task_type": {
-        "type": "choice",
-        "instructions": "Classify the task by its primary execution pattern.",
-        "criteria": {
-            "chat": "Conversation or emotional support.",
-            "query": "A direct factual question or explanation.",
-            "research": "Evidence gathering, comparison, or source-heavy analysis.",
-            "code": "Software implementation, debugging, or review.",
-            "create": "Writing, design, or content creation.",
-            "action": "An operation that changes an external system or user data.",
-            "mixed": "Several materially different task types are combined.",
-        },
-    },
-    "needs_clarify": {
-        "type": "choice",
-        "instructions": "Is a material user decision or missing fact required before execution?",
-        "criteria": {
-            "yes": "Execution would require guessing something that changes the outcome or risk.",
-            "no": "Reasonable defaults are sufficient and the requested outcome is clear.",
-        },
-    },
-    "risk_level": {
-        "type": "choice",
-        "instructions": "Rate execution risk, including irreversibility and external side effects.",
-        "criteria": {
-            "low": "Read-only or readily reversible.",
-            "medium": "Limited side effects with a straightforward recovery path.",
-            "high": "Sensitive, consequential, destructive, costly, or externally visible.",
-            "critical": "Potentially irreversible or severely harmful.",
-        },
-    },
-    "evidence_heavy": {
-        "type": "choice",
-        "instructions": "Does success depend on collecting and reconciling substantial evidence?",
-        "criteria": {
-            "yes": "Multiple sources, citations, measurements, or verification are central.",
-            "no": "The task can be completed without substantial evidence collection.",
-        },
-    },
-    "parallelizable": {
-        "type": "choice",
-        "instructions": "Can independent work streams run in parallel and later be combined?",
-        "criteria": {
-            "yes": "At least two useful sub-tasks can proceed independently.",
-            "no": "The task is inherently sequential or too small to parallelize.",
-        },
-    },
-}
 
 _REQUIRED_PLAN_ANSWERS = tuple(SWARM_PLAN_QUESTIONS)
 _TERMINAL_STATUSES = {"cancelled", "completed", "failed", "skipped"}
@@ -164,7 +115,6 @@ class SwarmService:
         goal_text = str(goal or "").strip()
         session_text = str(session_id or "").strip()
         permissions = _json_safe(permissions_snapshot)
-        fallback = _fallback_decision(goal_text, permissions)
         source = "fallback"
         jev_error: str | None = None
         jev_meta: dict[str, Any] = {"ok": False}
@@ -184,14 +134,26 @@ class SwarmService:
             )
             response = jev_ask_callable(state, copy.deepcopy(SWARM_PLAN_QUESTIONS))
             response = _resolve_awaitable_sync(response)
-            decision, jev_meta = _decision_from_jev(response)
+            planner_decision = parse_jev_response(response)
             source = "jev"
+            jev_meta = {
+                "ok": True,
+                "model": _json_safe(response.get("model")) if isinstance(response, Mapping) else None,
+                "usage": _json_safe(response.get("usage")) if isinstance(response, Mapping) else None,
+                "ms": _json_safe(response.get("ms")) if isinstance(response, Mapping) else None,
+            }
         except Exception as exc:  # A planner outage must never block deterministic routing.
-            decision = fallback
             jev_error = f"{type(exc).__name__}: {exc}"
+            planner_decision = deterministic_fallback(
+                goal_text,
+                permissions,
+                degraded_reason=jev_error,
+            )
             jev_meta = {"ok": False, "error": jev_error}
 
-        requires_confirmation, confirmation_reasons = _confirmation_gate(decision)
+        decision = materialize_plan(planner_decision)
+        requires_confirmation = bool(decision["requires_confirmation"])
+        confirmation_reasons = list(decision["confirmation_reasons"])
         run_id = f"run_{uuid.uuid4().hex}"
         executable = bool(decision["swarm_worthy"]) and not requires_confirmation
         status = "requires_confirmation" if requires_confirmation else "planned"
@@ -264,14 +226,26 @@ class SwarmService:
             )
             return
 
-        requires_confirmation, reasons = _confirmation_gate(plan_data)
-        if bool(plan_data.get("requires_confirmation")) or requires_confirmation:
+        gate_plan = plan_data.get("_orchestrator_plan")
+        if not isinstance(gate_plan, Mapping):
+            gate_plan = plan_data
+        planner_decision = normalize_plan(gate_plan)
+        gate = evaluate_user_gate(
+            planner_decision,
+            confirmed=bool(plan_data.get("_confirmed", False)),
+        )
+        if gate.required:
+            reasons = list(gate.reasons)
             self._update_run(run_id, status="requires_confirmation", requires_confirmation=True)
             yield self._service_event(
                 run_id,
                 seq + 1,
                 "swarm.waiting_user",
-                {"requires_confirmation": True, "reasons": reasons or plan_data.get("confirmation_reasons", [])},
+                {
+                    "requires_confirmation": True,
+                    "gate": gate.kind,
+                    "reasons": reasons,
+                },
             )
             return
 

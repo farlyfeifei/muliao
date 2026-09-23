@@ -22,92 +22,22 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
-ROLE_POOL: tuple[str, ...] = (
-    "compiler",
-    "investigator",
-    "extractor",
-    "builder",
-    "verifier",
-    "integrator",
+from swarm_planner import (
+    RECIPES,
+    RECIPE_STAGES,
+    ROLE_POOL,
+    SWARM_PLAN_QUESTIONS,
+    deterministic_fallback,
+    evaluate_user_gate,
+    materialize_plan,
+    normalize_plan,
+    parse_jev_response,
+    plan_for_recipe,
+    recipe_stages,
+    risk_gate,
 )
 
-# 每个元组是一阶段；同一阶段中的蜂并行。仅使用固定角色池。
-_RECIPE_STAGES: dict[str, tuple[tuple[str, ...], ...]] = {
-    "single": (("integrator",),),
-    "research": (
-        ("compiler",),
-        ("investigator", "extractor"),
-        ("verifier",),
-        ("integrator",),
-    ),
-    # 固定角色池里没有 code_diagnoser，因此 builder 在第二阶段承担代码诊断职责。
-    "diagnose": (
-        ("compiler",),
-        ("investigator", "builder"),
-        ("verifier",),
-        ("integrator",),
-    ),
-    "build": (
-        ("compiler",),
-        ("investigator",),
-        ("builder",),
-        ("verifier",),
-        ("integrator",),
-    ),
-    "sensitive": (
-        ("compiler",),
-        ("investigator",),
-        ("builder",),
-        ("verifier",),
-        ("integrator",),
-    ),
-}
-
-RECIPES: dict[str, dict[str, Any]] = {
-    recipe_id: {
-        "id": recipe_id,
-        "stages": [list(stage) for stage in stages],
-    }
-    for recipe_id, stages in _RECIPE_STAGES.items()
-}
-
-SWARM_PLAN_QUESTIONS: dict[str, dict[str, Any]] = {
-    "swarm_worthy": {
-        "type": "noul",
-        "instructions": "Is this task worth a multi-bee run instead of one direct response?",
-    },
-    "task_type": {
-        "type": "choice",
-        "instructions": "Which fixed Ghost swarm recipe best matches this task?",
-        "criteria": {
-            "single": "A short, low-complexity question or creation task",
-            "research": "Multi-source research, extraction, comparison, or evidence gathering",
-            "diagnose": "Failure, error, notification, log, or application diagnosis",
-            "build": "Create code, a report, a plan, or another structured artifact",
-            "sensitive": "Deletion, external transmission, system change, or irreversible action",
-        },
-    },
-    "needs_clarify": {
-        "type": "noul",
-        "instructions": "Must the user clarify the goal before any bee starts?",
-    },
-    "risk_level": {
-        "type": "score",
-        "instructions": "Rate execution risk from 1 (harmless) to 9 (irreversible or harmful).",
-        "criteria": [
-            "1 harmless read-only", "2 minor", "3 minor", "4 moderate", "5 moderate",
-            "6 requires explicit confirmation", "7 serious", "8 severe", "9 irreversible",
-        ],
-    },
-    "evidence_heavy": {
-        "type": "noul",
-        "instructions": "Does this task need independent investigation and source evidence?",
-    },
-    "parallelizable": {
-        "type": "noul",
-        "instructions": "Can independent parts of this task run in parallel?",
-    },
-}
+_RECIPE_STAGES = RECIPE_STAGES
 
 _ALLOWED_CORRECTIONS = {"accept", "retry", "need_context", "pause", "escalate"}
 _STREAM_EVENT_TYPES = {"bee.reasoning", "bee.delta", "bee.tool_call", "bee.tool_result"}
@@ -126,20 +56,11 @@ def _stable_id(prefix: str, value: Any, size: int = 20) -> str:
 
 
 def _risk_gate(risk_level: float) -> str:
-    if risk_level >= 6.0:
-        return "confirm"
-    if risk_level >= 3.5:
-        return "review"
-    return "auto"
+    return risk_gate(float(risk_level))
 
 
 def _recipe_stages(recipe: str) -> list[dict[str, Any]]:
-    if recipe not in _RECIPE_STAGES:
-        raise ValueError(f"unknown recipe: {recipe}")
-    return [
-        {"id": f"stage_{index + 1}", "index": index, "bees": list(bees)}
-        for index, bees in enumerate(_RECIPE_STAGES[recipe])
-    ]
+    return recipe_stages(recipe)
 
 
 def _plan_for_recipe(
@@ -150,73 +71,20 @@ def _plan_for_recipe(
     degraded: bool = False,
     needs_clarification: bool = False,
 ) -> dict[str, Any]:
-    if recipe not in RECIPES:
-        raise ValueError(f"unknown recipe: {recipe}")
-    if risk_level is None:
-        risk_level = 7.0 if recipe == "sensitive" else 1.0
-    risk_level = max(0.0, min(10.0, float(risk_level)))
-    stages = _recipe_stages(recipe)
-    bees = [bee for stage in stages for bee in stage["bees"]]
-    return {
-        "recipe": recipe,
-        "bees": bees,
-        "stages": stages,
-        "max_parallel": 3,
-        "risk_level": risk_level,
-        "risk_gate": _risk_gate(risk_level),
-        "requires_confirmation": recipe == "sensitive" or risk_level >= 6.0,
-        "needs_clarification": bool(needs_clarification),
-        "planner": source,
-        "degraded": bool(degraded),
-    }
+    decision = plan_for_recipe(
+        recipe,
+        source=source,
+        risk_score=risk_level,
+        degraded=degraded,
+        needs_clarification=needs_clarification,
+    )
+    return materialize_plan(decision)
 
 
 def deterministic_fallback_plan(goal: str) -> dict[str, Any]:
-    """Return a deterministic, side-effect-free plan when Jev is unavailable.
+    """Return the canonical deterministic fallback with legacy compatibility fields."""
 
-    The heuristic intentionally stays conservative and finite: it can only select one of
-    the five fixed recipes and never invents a role or topology.
-    """
-
-    text = " ".join(str(goal or "").strip().lower().split())
-    sensitive_terms = (
-        "删除", "清空", "卸载", "外发", "发送给", "发布", "上传", "系统设置", "注册表",
-        "delete", "remove all", "wipe", "uninstall", "send to", "publish", "upload",
-        "registry", "system setting",
-    )
-    diagnose_terms = (
-        "故障", "报错", "错误", "失败", "崩溃", "异常", "日志", "通知", "诊断", "排查",
-        "bug", "error", "failed", "failure", "crash", "exception", "log", "diagnose",
-        "troubleshoot",
-    )
-    research_terms = (
-        "研究", "调查", "分析", "多个来源", "多来源", "资料", "证据", "核验", "比较", "对比",
-        "research", "investigate", "analyze", "multiple sources", "evidence", "verify",
-        "compare", "sources",
-    )
-    build_terms = (
-        "实现", "编写", "生成", "创建", "构建", "开发", "代码", "报告", "方案", "修复",
-        "implement", "write", "generate", "create", "build", "develop", "code", "report",
-        "fix",
-    )
-
-    if any(term in text for term in sensitive_terms):
-        recipe, risk = "sensitive", 7.0
-    elif any(term in text for term in diagnose_terms):
-        recipe, risk = "diagnose", 2.5
-    elif any(term in text for term in research_terms):
-        recipe, risk = "research", 1.5
-    elif any(term in text for term in build_terms):
-        recipe, risk = "build", 2.0
-    else:
-        recipe, risk = "single", 0.5
-
-    return _plan_for_recipe(
-        recipe,
-        source="deterministic_fallback",
-        risk_level=risk,
-        degraded=True,
-    )
+    return materialize_plan(deterministic_fallback(goal))
 
 
 def _permission_tools(permission_snapshot: Any) -> list[str]:
@@ -396,47 +264,11 @@ def _float_or(value: Any, default: float) -> float:
 
 
 def _jev_plan(goal: str, response: Mapping[str, Any]) -> dict[str, Any] | None:
-    if response.get("ok") is False:
+    del goal
+    try:
+        return materialize_plan(parse_jev_response(response))
+    except (TypeError, ValueError, RuntimeError):
         return None
-    answers: Mapping[str, Any]
-    raw_answers = response.get("answers")
-    answers = raw_answers if isinstance(raw_answers, Mapping) else response
-
-    raw_recipe = answers.get("task_type", answers.get("recipe"))
-    recipe = str(_answer_value(raw_recipe) or "").strip().lower()
-    if recipe not in RECIPES:
-        return None
-
-    confidence = _answer_confidence(raw_recipe)
-    needs_clarification = _as_bool(answers.get("needs_clarify", False))
-    if confidence is not None and confidence < 0.35:
-        needs_clarification = True
-    elif confidence is not None and confidence < 0.60:
-        # 中等集中度只做推荐，仍由用户确认。
-        needs_clarification = True
-
-    swarm_worthy_raw = answers.get("swarm_worthy")
-    if swarm_worthy_raw is not None and recipe != "sensitive":
-        worthy = _answer_value(swarm_worthy_raw)
-        if isinstance(worthy, (int, float)) and not isinstance(worthy, bool):
-            if float(worthy) <= 0.60:
-                recipe = "single"
-        elif not _as_bool(worthy):
-            recipe = "single"
-
-    risk = _float_or(answers.get("risk_level", 7.0 if recipe == "sensitive" else 1.0), 1.0)
-    plan = _plan_for_recipe(
-        recipe,
-        source="jev",
-        risk_level=risk,
-        degraded=False,
-        needs_clarification=needs_clarification,
-    )
-    plan["jev"] = {
-        "model": response.get("model"),
-        "confidence": confidence,
-    }
-    return plan
 
 
 def _json_safe(value: Any) -> Any:
@@ -896,42 +728,48 @@ class SwarmOrchestrator:
 
         try:
             if plan is not None:
-                selected_plan = copy.deepcopy(dict(plan))
-                selected_plan.setdefault("planner", "provided")
-                selected_plan.setdefault("degraded", self.jev_checker is None)
+                original_plan = copy.deepcopy(dict(plan))
+                decision = normalize_plan(original_plan)
+                if self.jev_checker is None and not decision.degraded:
+                    original_plan["degraded"] = True
+                    original_plan["degraded_reason"] = "checker_unavailable"
+                    decision = normalize_plan(original_plan)
+                selected_plan = {**original_plan, **materialize_plan(decision, confirmed=confirmed)}
             elif recipe is not None:
-                selected_plan = _plan_for_recipe(
+                decision = plan_for_recipe(
                     str(recipe),
                     source="explicit",
                     degraded=self.jev_checker is None,
+                    degraded_reason="checker_unavailable" if self.jev_checker is None else None,
                 )
+                selected_plan = materialize_plan(decision, confirmed=confirmed)
             else:
                 plan_response = await self._call_jev(goal, SWARM_PLAN_QUESTIONS, jev_state)
                 selected_plan = _jev_plan(goal, plan_response) if plan_response is not None else None
                 if selected_plan is None:
                     jev_state["degraded"] = True
                     jev_state.setdefault("reason", "invalid_planner_response")
-                    selected_plan = deterministic_fallback_plan(goal)
+                    selected_plan = materialize_plan(
+                        deterministic_fallback(goal, degraded_reason=jev_state.get("reason")),
+                        confirmed=confirmed,
+                    )
+                else:
+                    selected_plan = materialize_plan(
+                        normalize_plan(selected_plan),
+                        confirmed=confirmed,
+                    )
 
-            recipe_id = str(selected_plan.get("recipe") or "")
-            if recipe_id not in RECIPES:
-                raise ValueError(f"unknown recipe: {recipe_id}")
+            decision = normalize_plan(selected_plan)
+            recipe_id = decision.recipe_id
             selected_plan["stages"] = _normalize_stages(selected_plan)
-            risk_level = max(
-                0.0,
-                min(10.0, float(selected_plan.get("risk_level", 7.0 if recipe_id == "sensitive" else 1.0))),
-            )
-            if recipe_id == "sensitive":
-                risk_level = max(6.0, risk_level)
-            selected_plan["risk_level"] = risk_level
-            selected_plan["risk_gate"] = _risk_gate(risk_level)
-            selected_plan["requires_confirmation"] = recipe_id == "sensitive" or risk_level >= 6.0
-            selected_plan["needs_clarification"] = bool(selected_plan.get("needs_clarification", False))
-            selected_plan["degraded"] = bool(selected_plan.get("degraded", False) or jev_state["degraded"])
-            selected_plan["degraded_reason"] = jev_state.get("reason") if selected_plan["degraded"] else None
+            selected_plan["degraded"] = bool(decision.degraded or jev_state["degraded"])
+            selected_plan["degraded_reason"] = (
+                decision.degraded_reason or jev_state.get("reason")
+            ) if selected_plan["degraded"] else None
             selected_plan["bees"] = [
                 bee for stage in selected_plan["stages"] for bee in stage["bees"]
             ]
+            risk_level = decision.risk_score
 
             contract = build_contract(goal, selected_plan, permission_snapshot)
             task_id = contract["task_id"]
@@ -945,15 +783,18 @@ class SwarmOrchestrator:
             })
             yield emit("contract.created", {"contract": copy.deepcopy(contract)})
 
-            waiting_reason = None
-            if selected_plan["needs_clarification"]:
-                waiting_reason = "clarification_required"
-            elif selected_plan["requires_confirmation"]:
-                waiting_reason = "high_risk_confirmation_required"
-            if waiting_reason and not confirmed:
+            gate = evaluate_user_gate(decision, confirmed=confirmed)
+            if gate.required:
+                waiting_reason = (
+                    "clarification_required"
+                    if gate.kind == "clarification"
+                    else "high_risk_confirmation_required"
+                )
                 yield emit("swarm.waiting_user", {
                     "status": "waiting_user",
                     "reason": waiting_reason,
+                    "gate": gate.kind,
+                    "reasons": list(gate.reasons),
                     "risk_level": risk_level,
                     "risk_gate": selected_plan["risk_gate"],
                 })

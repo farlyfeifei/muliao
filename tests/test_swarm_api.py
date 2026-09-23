@@ -16,12 +16,12 @@ from swarm_api import SWARM_PLAN_QUESTIONS, SwarmService  # noqa: E402
 
 
 SAFE_ANSWERS = {
-    "swarm_worthy": {"choice": "yes"},
-    "task_type": {"choice": "research"},
-    "needs_clarify": {"choice": "no"},
-    "risk_level": {"choice": "low"},
-    "evidence_heavy": {"choice": "yes"},
-    "parallelizable": {"choice": "yes"},
+    "swarm_worthy": {"noul": 0.95},
+    "recipe_id": {"choice": "research"},
+    "needs_clarification": {"noul": 0.05},
+    "risk_score": {"score": 1.5},
+    "evidence_heavy": {"noul": 0.95},
+    "parallelizable": {"noul": 0.95},
 }
 
 
@@ -53,9 +53,9 @@ class SwarmServicePlanTests(unittest.TestCase):
             set(questions),
             {
                 "swarm_worthy",
-                "task_type",
-                "needs_clarify",
-                "risk_level",
+                "recipe_id",
+                "needs_clarification",
+                "risk_score",
                 "evidence_heavy",
                 "parallelizable",
             },
@@ -82,9 +82,9 @@ class SwarmServicePlanTests(unittest.TestCase):
         self.assertEqual(calls, 2)
         for field in (
             "swarm_worthy",
-            "task_type",
-            "needs_clarify",
-            "risk_level",
+            "recipe_id",
+            "needs_clarification",
+            "risk_score",
             "evidence_heavy",
             "parallelizable",
         ):
@@ -98,7 +98,7 @@ class SwarmServicePlanTests(unittest.TestCase):
     def test_high_risk_plan_requires_confirmation(self):
         def high_risk_jev(state, questions):
             answers = {key: dict(value) for key, value in SAFE_ANSWERS.items()}
-            answers["risk_level"] = {"choice": "high"}
+            answers["risk_score"] = {"score": 7}
             return {"ok": True, "answers": answers}
 
         service = SwarmService(orchestrator=_ExplodingOrchestrator())
