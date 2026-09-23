@@ -257,5 +257,87 @@ class CloseTests(unittest.TestCase):
         recognizer.close()  # must not raise
 
 
+class MissingModelClassificationTests(unittest.TestCase):
+    """Regression guard for the over-broad _is_missing_model_error (HIGH)."""
+
+    def test_real_decode_oserror_does_not_leak_audio_to_cloud(self):
+        # A native decode failure surfaces as OSError, but it is NOT a missing
+        # model: sending this audio to the cloud would violate the privacy
+        # contract. The local error must surface and the cloud must stay idle.
+        cloud = Cloud()
+        recognizer = FallbackRecognizer(
+            Primary(error=OSError("native decode failure")),
+            cloud,
+            api_key="k",
+        )
+        with self.assertRaisesRegex(OSError, "native decode failure"):
+            recognizer.transcribe(AUDIO)
+        self.assertEqual(cloud.calls, 0)
+
+    def test_runtime_error_with_load_like_text_is_not_treated_as_missing(self):
+        cloud = Cloud()
+        recognizer = FallbackRecognizer(
+            Primary(error=RuntimeError("cannot load stream for decode")),
+            cloud,
+            api_key="k",
+        )
+        with self.assertRaisesRegex(RuntimeError, "cannot load stream"):
+            recognizer.transcribe(AUDIO)
+        self.assertEqual(cloud.calls, 0)
+
+    def test_file_not_found_still_falls_back_to_cloud(self):
+        cloud = Cloud()
+        recognizer = FallbackRecognizer(
+            Primary(error=FileNotFoundError("missing SenseVoice assets")),
+            cloud,
+            api_key="k",
+        )
+        result = recognizer.transcribe(AUDIO)
+        self.assertEqual(result.metadata["provider"], "mimo")
+        self.assertEqual(cloud.calls, 1)
+
+    def test_import_error_still_falls_back_to_cloud(self):
+        cloud = Cloud()
+        recognizer = FallbackRecognizer(
+            Primary(error=ImportError("sherpa_onnx not installed")),
+            cloud,
+            api_key="k",
+        )
+        result = recognizer.transcribe(AUDIO)
+        self.assertEqual(result.metadata["provider"], "mimo")
+        self.assertEqual(cloud.calls, 1)
+
+
+class CloudCancellationBreakerTests(unittest.TestCase):
+    """A barge-in during the cloud round-trip must not trip the breaker (MEDIUM)."""
+
+    def test_voice_cancelled_during_cloud_does_not_count_as_failure(self):
+        from voice.cancellation import VoiceCancelled
+
+        token = CancellationToken()
+
+        class FailLocal(Primary):
+            def transcribe(self, audio, *, cancellation=None):
+                raise FileNotFoundError("missing")
+
+        class CancellingCloud(Cloud):
+            def transcribe(self, audio, *, cancellation=None):
+                self.calls += 1
+                raise VoiceCancelled("barge-in")
+
+        recognizer = FallbackRecognizer(
+            FailLocal(),
+            CancellingCloud(),
+            api_key="k",
+            breaker_threshold=1,
+        )
+        with self.assertRaises(VoiceCancelled):
+            recognizer.transcribe(AUDIO, cancellation=token)
+        # VoiceCancelled propagates; it is NOT recorded as a cloud failure and
+        # does NOT open the breaker.
+        self.assertEqual(recognizer.stats.cloud_failed, 0)
+        self.assertFalse(recognizer.breaker_open)
+
+
 if __name__ == "__main__":
     unittest.main()

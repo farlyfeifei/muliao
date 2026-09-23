@@ -22,22 +22,25 @@ import threading
 import time
 from typing import Any
 
-from .cancellation import CancellationToken
+from .cancellation import CancellationToken, VoiceCancelled
 from .contracts import AudioSegment, Transcript
 
 
 def _is_missing_model_error(exc: BaseException) -> bool:
-    """本地模型不可用（缺失/无法加载）→ 云备援才有意义。"""
+    """本地模型不可用（缺失/无法加载）→ 云备援才有意义。
 
-    if isinstance(exc, FileNotFoundError):
-        return True
-    if isinstance(exc, (ImportError, OSError)):
-        return True
-    text = f"{type(exc).__name__} {exc}".lower()
-    return any(
-        token in text
-        for token in ("missing sensevoice", "no such file", "failed to load", "cannot load")
-    )
+    只对**确定**的"模型资产缺失/无法加载"判定为可上云，绝不把真实解码错误
+    （native 失败、PCM 对齐、流创建失败等）误判上去——那会把已通过唤醒门控的
+    音频错误地发给云端，违背"仅模型缺失才上云"的隐私承诺。因此：
+
+    - ``FileNotFoundError``：SenseVoiceRecognizer 在资产文件不存在时抛它，明确可上云。
+    - ``ImportError``：sherpa_onnx 未安装，本地无法识别，可上云。
+    - 其余一律不上云。不再无条件放行所有 ``OSError``（native 解码失败常以 OSError
+      形态出现），也不用 "failed to load"/"cannot load" 之类宽泛子串匹配真实运行期
+      错误。
+    """
+
+    return isinstance(exc, (FileNotFoundError, ImportError))
 
 
 @dataclass
@@ -172,6 +175,12 @@ class FallbackRecognizer:
             cancellation.raise_if_cancelled()
         try:
             cloud = self.fallback.transcribe(audio, cancellation=cancellation)
+        except VoiceCancelled:
+            # A barge-in during the cloud round-trip is a user cancellation, not
+            # a cloud failure. Re-raise untouched so it never increments the
+            # consecutive-failure counter or trips the breaker; the caller's
+            # cancelled path stays authoritative.
+            raise
         except Exception:
             self._record_cloud_failure()
             # Never hand an empty/garbage transcript to Jev: surface the local error.
