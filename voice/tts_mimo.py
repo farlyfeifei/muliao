@@ -59,6 +59,7 @@ class MiMoTtsClient:
             verify=True,
         )
         self._owns_client = client is None
+        self._transition_lock = threading.Lock()
         self._lock = threading.Lock()
         self._generation = 0
         self._active_token: CancellationToken | None = None
@@ -81,20 +82,23 @@ class MiMoTtsClient:
         self.close()
 
     def cancel(self, generation: int | None = None) -> bool:
-        """取消当前合成；迟到 chunk 会因 generation/token 双检查被丢弃。"""
-        with self._lock:
-            if generation is not None and generation != self._generation:
-                return False
-            token = self._active_token
-            player_generation = self._active_player_generation
-            self._generation += 1
-            self._active_token = None
-            self._active_player_generation = None
-        if token is not None:
-            token.cancel()
-        if player_generation is not None:
-            self.player.stop(generation=player_generation)
-        return token is not None or player_generation is not None
+        """取消当前合成/播放；返回前对应 player generation 已停止。"""
+        with self._transition_lock:
+            with self._lock:
+                if generation is not None and generation != self._generation:
+                    return False
+                token = self._active_token
+                player_generation = self._active_player_generation
+                if token is None and player_generation is None:
+                    return False
+                self._generation += 1
+                self._active_token = None
+                self._active_player_generation = None
+            if token is not None:
+                token.cancel()
+            if player_generation is not None:
+                self.player.stop(generation=player_generation)
+            return True
 
     def speak(
         self,
@@ -102,31 +106,40 @@ class MiMoTtsClient:
         *,
         instruction: str | None = None,
         cancellation: CancellationToken | None = None,
+        operation_id: int | str | None = None,
     ) -> int:
         """同步消费 SSE，第一段有效音频到达即交给播放器。"""
+        del operation_id  # operation ordering is enforced by generation/token ownership
         if not self.api_key:
             raise MiMoTtsError("missing_api_key", "MiMo TTS API key is missing")
         if not str(text).strip():
             raise MiMoTtsError("empty_text", "MiMo TTS text is empty")
 
         token = cancellation or CancellationToken()
-        with self._lock:
-            previous = self._active_token
-            previous_player_generation = self._active_player_generation
-            self._generation += 1
-            generation = self._generation
-            self._active_token = token
-            self._active_player_generation = None
-        if previous is not None:
-            previous.cancel()
-        if previous_player_generation is not None:
-            self.player.stop(generation=previous_player_generation)
-        player_generation = self.player.begin()
-        with self._lock:
-            if generation != self._generation or token.cancelled:
+        # Startup is one state transition: an older speak cannot finish its
+        # cancel/begin sequence after a newer speak has already taken ownership.
+        with self._transition_lock:
+            with self._lock:
+                previous = self._active_token
+                previous_player_generation = self._active_player_generation
+                self._generation += 1
+                generation = self._generation
+                self._active_token = token
+                self._active_player_generation = None
+            if previous is not None:
+                previous.cancel()
+            if previous_player_generation is not None:
+                self.player.stop(generation=previous_player_generation)
+            player_generation = self.player.begin()
+            with self._lock:
+                if generation != self._generation or token.cancelled:
+                    owns_generation = False
+                else:
+                    self._active_player_generation = player_generation
+                    owns_generation = True
+            if not owns_generation:
                 self.player.stop(generation=player_generation)
                 return generation
-            self._active_player_generation = player_generation
 
         messages: list[dict[str, str]] = []
         if instruction:
@@ -170,7 +183,12 @@ class MiMoTtsClient:
                     if self._cancelled(generation, token):
                         break
                     received_audio = True
-                    self.player.play(chunk, generation=player_generation)
+                    if not self.player.play(chunk, generation=player_generation):
+                        raise MiMoTtsError(
+                            "audio_queue_full",
+                            "MiMo TTS audio queue rejected a chunk",
+                            retryable=False,
+                        )
                 if not received_audio and not self._cancelled(generation, token):
                     code = (
                         "first_audio_timeout"
@@ -181,6 +199,22 @@ class MiMoTtsClient:
                         code,
                         "MiMo TTS stream ended before the first audio chunk",
                         retryable=code == "first_audio_timeout",
+                    )
+            if received_audio and not self._cancelled(generation, token):
+                wait = getattr(self.player, "wait_until_drained", None)
+                if callable(wait) and not wait(player_generation, timeout=self.timeout):
+                    raise MiMoTtsError(
+                        "audio_playback_timeout",
+                        "MiMo TTS audio did not finish playing before timeout",
+                        retryable=False,
+                    )
+                failure = getattr(self.player, "failure", None)
+                device_error = failure(player_generation) if callable(failure) else None
+                if device_error is not None:
+                    raise MiMoTtsError(
+                        "audio_output_error",
+                        f"MiMo TTS audio output failed: {type(device_error).__name__}",
+                        retryable=False,
                     )
         except MiMoTtsError:
             self.player.stop(generation=player_generation)
@@ -203,12 +237,18 @@ class MiMoTtsClient:
                 "invalid_response", "MiMo TTS returned an invalid stream"
             ) from exc
         finally:
-            if self._cancelled(generation, token):
+            cancelled = self._cancelled(generation, token)
+            if cancelled:
                 self.player.stop(generation=player_generation)
+            # Do not discard the player handle merely because SSE reached EOF.
+            # cancel() must still be able to stop queued audio until the player
+            # confirms this generation has completely drained.
             with self._lock:
                 if generation == self._generation:
                     self._active_token = None
-                    self._active_player_generation = None
+                    is_drained = getattr(self.player, "is_drained", None)
+                    if callable(is_drained) and is_drained(player_generation):
+                        self._active_player_generation = None
         return generation
 
     def _cancelled(self, generation: int, token: CancellationToken) -> bool:

@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import io
+import wave
 from typing import Any
 
 import httpx
 
-from .contracts import Transcript
+from .cancellation import CancellationToken
+from .contracts import AudioSegment, Transcript
 
 
 MIMO_BASE_URL = "https://api.xiaomimimo.com/v1"
@@ -61,26 +64,40 @@ class MiMoAsrClient:
 
     def transcribe(
         self,
-        audio: bytes,
+        audio: AudioSegment | bytes,
         *,
-        mime_type: str = "audio/wav",
+        mime_type: str | None = None,
         language: str | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> Transcript:
+        """转写已通过本地唤醒门控的音频。
+
+        ``AudioSegment`` 会被正确封装为 WAV；裸 bytes 仅保留给已编码 WAV/MP3 调用方。
+        本适配器不得作为唤醒前的首层 recognizer。
+        """
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        if isinstance(audio, AudioSegment):
+            audio_bytes = _audio_segment_to_wav(audio)
+            effective_mime = "audio/wav"
+        else:
+            audio_bytes = bytes(audio)
+            effective_mime = mime_type or "audio/wav"
         if not self.api_key:
             raise MiMoAsrError("missing_api_key", "MiMo ASR API key is missing")
-        if mime_type not in _SUPPORTED_MIME_TYPES:
+        if effective_mime not in _SUPPORTED_MIME_TYPES:
             raise MiMoAsrError(
                 "unsupported_mime_type",
-                f"MiMo ASR supports WAV/MP3, not {mime_type!r}",
+                f"MiMo ASR supports WAV/MP3, not {effective_mime!r}",
             )
-        encoded = base64.b64encode(bytes(audio))
+        encoded = base64.b64encode(audio_bytes)
         if len(encoded) > MAX_BASE64_BYTES:
             raise MiMoAsrError(
                 "audio_too_large",
                 "MiMo ASR Base64 audio exceeds 10 MB",
             )
 
-        data_uri = f"data:{mime_type};base64,{encoded.decode('ascii')}"
+        data_uri = f"data:{effective_mime};base64,{encoded.decode('ascii')}"
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [
@@ -117,6 +134,8 @@ class MiMoAsrClient:
                 "network_error", "MiMo ASR network request failed", retryable=True
             ) from exc
 
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         if response.status_code >= 400:
             retryable = response.status_code == 429 or response.status_code >= 500
             raise MiMoAsrError(
@@ -142,6 +161,18 @@ class MiMoAsrClient:
             language=language or "auto",
             metadata={"provider": "mimo", "model": self.model},
         )
+
+
+def _audio_segment_to_wav(audio: AudioSegment) -> bytes:
+    if audio.channels < 1 or audio.sample_width not in {1, 2, 3, 4}:
+        raise MiMoAsrError("invalid_audio", "AudioSegment has an unsupported PCM format")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(audio.channels)
+        wav_file.setsampwidth(audio.sample_width)
+        wav_file.setframerate(audio.sample_rate)
+        wav_file.writeframes(audio.pcm)
+    return output.getvalue()
 
 
 def _extract_transcript(payload: Any) -> str:

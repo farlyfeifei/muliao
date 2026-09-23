@@ -37,8 +37,14 @@ def _int_setting(name: str, default: int) -> int:
         return default
 
 
+def _bool_setting(name: str, default: bool) -> bool:
+    value = _setting(name, "1" if default else "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class VoiceSettings:
+    # 保留 M0 的前四个必填字段和其后位置参数顺序；新增云配置全部追加并提供安全默认值。
     sensevoice_dir: Path
     jev_url: str
     jev_key: str
@@ -52,6 +58,11 @@ class VoiceSettings:
     listen_timeout_ms: int = 15_000
     min_speech_ms: int = 300
     input_device_index: int | None = None
+    mimo_base_url: str = "https://api.xiaomimimo.com/v1"
+    mimo_api_key: str = ""
+    mimo_tts_model: str = "mimo-v2.5-tts"
+    mimo_tts_voice: str = "冰糖"
+    mimo_tts_enabled: bool = False
 
     @classmethod
     def load(cls) -> "VoiceSettings":
@@ -75,6 +86,11 @@ class VoiceSettings:
             jev_url=_setting("MULIAO_JEV_URL", "https://api.typesafe.ai/v1/systemone"),
             jev_key=_setting("MULIAO_JEV_KEY"),
             jev_model=_setting("MULIAO_JEV_MODEL", "jev-latest"),
+            mimo_base_url=_setting("MULIAO_MIMO_BASE_URL", "https://api.xiaomimimo.com/v1"),
+            mimo_api_key=_setting("MULIAO_MIMO_API_KEY"),
+            mimo_tts_model=_setting("MULIAO_MIMO_TTS_MODEL", "mimo-v2.5-tts"),
+            mimo_tts_voice=_setting("MULIAO_MIMO_TTS_VOICE", "冰糖"),
+            mimo_tts_enabled=_bool_setting("MULIAO_MIMO_TTS_ENABLED", True),
             sample_rate=_int_setting("MULIAO_VOICE_SAMPLE_RATE", 16_000),
             frame_ms=_int_setting("MULIAO_VOICE_FRAME_MS", 30),
             vad_mode=_int_setting("MULIAO_VOICE_VAD_MODE", 2),

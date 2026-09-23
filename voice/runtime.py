@@ -1,18 +1,50 @@
-"""构建独立 M0 引擎，不接触聊天或蜂群运行时。"""
+"""构建独立语音运行时，不接触聊天或蜂群运行时。"""
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
 
 from .actions import DryRunExecutor, WindowsNotepadExecutor
 from .asr_local import SenseVoiceRecognizer
+from .audio_player import CancellableAudioPlayer, PyAudioPcmSink
 from .capture import PyAudioVADCapture
 from .config import VoiceSettings
 from .engine import VoiceEngine
 from .events import JsonLineEventSink
-from .jev_router import JevM0Router
+from .fast_actions import DryRunFastAdapter, FastActionExecutor, WindowsFastAdapter
+from .jev_router import JevFastRouter, JevM0Router
 from .permission_gate import ExistingVoicePermission
-from .tts_local import NullSpeaker, SapiSpeaker
+from .tts_local import FallbackSpeaker, NullSpeaker, SapiSpeaker
+from .tts_mimo import MiMoTtsClient
+
+
+@dataclass
+class VoiceRuntimeResources:
+    """统一释放 Jev、MiMo、播放器与声卡。"""
+
+    router: Any
+    speaker: object
+    player: CancellableAudioPlayer | None = None
+    sink: PyAudioPcmSink | None = None
+
+    def close(self) -> None:
+        close = getattr(self.speaker, "close", None)
+        if callable(close):
+            close()
+        self.router.close()
+        if self.player is not None:
+            self.player.close()
+        if self.sink is not None:
+            self.sink.close()
+
+
+def _local_speaker(speak: bool) -> object:
+    return SapiSpeaker() if speak else NullSpeaker()
 
 
 def build_engine(settings: VoiceSettings, *, act: bool = False, speak: bool = True):
+    """保留 M0 兼容入口：只允许记事本，并返回 ``(engine, router)``。"""
+
     settings.validate_m0()
     router = JevM0Router(
         url=settings.jev_url,
@@ -24,10 +56,55 @@ def build_engine(settings: VoiceSettings, *, act: bool = False, speak: bool = Tr
         recognizer=SenseVoiceRecognizer(settings.sensevoice_dir),
         router=router,
         executor=WindowsNotepadExecutor() if act else DryRunExecutor(),
-        speaker=SapiSpeaker() if speak else NullSpeaker(),
+        speaker=_local_speaker(speak),
         events=JsonLineEventSink(),
     )
     return engine, router
+
+
+def build_runtime(
+    settings: VoiceSettings,
+    *,
+    mode: str = "fast",
+    act: bool = False,
+    speak: bool = True,
+):
+    """构建显式 M1+ runtime；当前仅支持 ``mode='fast'``。"""
+
+    if mode != "fast":
+        raise ValueError("build_runtime currently supports only mode='fast'")
+    settings.validate_m0()
+    router = JevFastRouter(
+        url=settings.jev_url,
+        api_key=settings.jev_key,
+        model=settings.jev_model,
+    )
+    local_speaker = _local_speaker(speak)
+    player = None
+    sink = None
+    speaker: object = local_speaker
+    if speak and settings.mimo_tts_enabled and settings.mimo_api_key:
+        sink = PyAudioPcmSink()
+        player = CancellableAudioPlayer(sink)
+        cloud = MiMoTtsClient(
+            api_key=settings.mimo_api_key,
+            player=player,
+            model=settings.mimo_tts_model,
+            voice=settings.mimo_tts_voice,
+            base_url=settings.mimo_base_url,
+        )
+        speaker = FallbackSpeaker(cloud, local_speaker)
+
+    adapter = WindowsFastAdapter() if act else DryRunFastAdapter()
+    engine = VoiceEngine(
+        permission=ExistingVoicePermission(),
+        recognizer=SenseVoiceRecognizer(settings.sensevoice_dir),
+        router=router,
+        executor=FastActionExecutor(adapter),
+        speaker=speaker,
+        events=JsonLineEventSink(),
+    )
+    return engine, VoiceRuntimeResources(router=router, speaker=speaker, player=player, sink=sink)
 
 
 def build_capture(settings: VoiceSettings) -> PyAudioVADCapture:
