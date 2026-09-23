@@ -7,7 +7,31 @@
   let planning = false;
   let pending = null;
   let active = null;
-  let aborter = null;
+  let singleFallback = null;
+
+  function syncLifecycleControls(message) {
+    const canResumeSingle = !!(
+      pending?.mode === "single" && cur()?.id === pending.sessionId
+    );
+    const blocked = !!(planning || active || singleFallback || (pending && !canResumeSingle));
+    $("send").disabled = blocked;
+    $("swarmCancel").disabled = !active || !!active.terminal || active.cancelState !== "idle";
+    if (active) {
+      setBusy(true, message || (active.cancelState === "requesting" ? "正在取消蜂群…" : "蜂群运行中…"));
+    } else if (singleFallback) {
+      setBusy(true, message || "正在改用单 Agent…");
+    } else if (planning) {
+      setBusy(true, message || "Jev 正在编排蜂群…");
+    } else if (pending) {
+      setBusy(true, message || (
+        pending.mode === "single"
+          ? (canResumeSingle ? "可改用单 Agent 继续" : "等待返回发起会话")
+          : "等待确认派蜂"
+      ));
+    } else {
+      setBusy(false, message || "就绪");
+    }
+  }
 
   async function jsonPost(url, body) {
     const response = await fetch(url, {
@@ -46,10 +70,31 @@
     }
   }
 
+  function acceptRunEnvelope(run, event) {
+    if (!event || typeof event !== "object") return false;
+    const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const eventRunId = String(event.run_id || event.runId || payload.run_id || payload.runId || "");
+    if (eventRunId && run.runId && eventRunId !== run.runId) return false;
+    if (eventRunId && !run.runId) run.runId = eventRunId;
+    const eventId = String(event.event_id || event.eventId || payload.event_id || payload.eventId || "");
+    if (eventId && run.seenEventIds.has(eventId)) return false;
+    const rawSeq = event.seq ?? event.sequence ?? payload.seq ?? payload.sequence;
+    const seq = Number(rawSeq);
+    if (Number.isFinite(seq)) {
+      if (run.lastSeq !== null && seq <= run.lastSeq) return false;
+      run.lastSeq = seq;
+    }
+    if (eventId) run.seenEventIds.add(eventId);
+    return true;
+  }
+
   function addUserGoal(goal, sessionId) {
     if (!cur() && !sessionId) newSession();
-    const session = sessionById(sessionId) || cur();
-    if (!session) return null;
+    const session = sessionId ? sessionById(sessionId) : cur();
+    if (!session) {
+      UI()?.handleEvent({ type: "swarm.notice", payload: { message: "发起会话已不存在，已停止写入。" } });
+      return null;
+    }
     if (session.msgs.length === 0) {
       session.title = titleFrom(goal);
       if (cur()?.id === session.id) $("topTitle").textContent = session.title;
@@ -94,19 +139,69 @@
     return p > 0.6;
   }
 
+  async function startSingleForOrigin(request) {
+    if (!request || singleFallback) return false;
+    const origin = sessionById(request.sessionId);
+    if (!origin) {
+      pending = null;
+      UI()?.reset();
+      UI()?.handleEvent({
+        type: "swarm.notice",
+        payload: { message: "发起会话已删除，已清除待处理任务。" },
+      });
+      UI()?.setConnection("idle");
+      syncLifecycleControls("发起会话已删除，待处理任务已清除");
+      return false;
+    }
+    if (cur()?.id !== origin.id) {
+      pending = { ...request, sessionId: origin.id, mode: "single" };
+      UI()?.handleEvent({
+        type: "swarm.notice",
+        payload: { message: "该任务来自其他会话，请返回发起会话后再改用单 Agent。" },
+      });
+      syncLifecycleControls("等待返回发起会话");
+      return false;
+    }
+    const fallback = { sessionId: origin.id, goal: request.goal };
+    pending = null;
+    singleFallback = fallback;
+    UI()?.reset();
+    gotoTab("insp");
+    syncLifecycleControls("正在改用单 Agent…");
+    try {
+      await sendTurn(request.goal);
+      return true;
+    } finally {
+      if (singleFallback === fallback) singleFallback = null;
+      syncLifecycleControls("就绪");
+    }
+  }
+
   async function planGoal(goal, options = {}) {
     const text = String(goal || "").trim();
     if (!text) return;
-    if (planning || active || pending) {
-      setBusy(false, active ? "蜂群运行中，请先取消或等待完成" : "已有蜂群计划等待处理");
+    if (planning || active || singleFallback || pending) {
       $("input").value = text;
       autoGrow($("input"));
       $("input").focus();
+      syncLifecycleControls(
+        active ? "蜂群运行中，请先取消或等待完成"
+          : singleFallback ? "单 Agent 正在处理，请等待完成"
+            : "已有蜂群计划等待处理"
+      );
+      return;
+    }
+    if (!cur()) newSession();
+    const plannedSessionId = cur()?.id || null;
+    if (!plannedSessionId) {
+      $("input").value = text;
+      autoGrow($("input"));
+      UI()?.handleEvent({ type: "swarm.notice", payload: { message: "无法建立发起会话，请重试。" } });
+      syncLifecycleControls("无法建立发起会话");
       return;
     }
     planning = true;
-    const plannedSessionId = cur()?.id || null;
-    $("send").disabled = true;
+    syncLifecycleControls("Jev 正在编排蜂群…");
     UI()?.reset();
     UI()?.setConnection("connecting");
     document.querySelector(".app")?.classList.remove("no-insp");
@@ -115,50 +210,80 @@
     try {
       const data = await jsonPost("/api/swarm/plan", {
         goal: text,
-        session_id: plannedSessionId || `s${Date.now()}`,
+        session_id: plannedSessionId,
         source: options.source || "chat",
         source_ref: options.sourceRef || null,
       });
       const plan = data.plan || data;
       if (!shouldUseSwarm(plan)) {
         UI()?.setConnection("connected");
-        gotoTab("insp");
-        await sendTurn(text);
+        planning = false;
+        await startSingleForOrigin({
+          goal: text,
+          sessionId: plannedSessionId,
+          source: options.source || "chat",
+          sourceRef: options.sourceRef || null,
+        });
         return;
       }
-      pending = { goal: text, plan, source: options.source || "chat", sessionId: plannedSessionId };
+      pending = { goal: text, plan, source: options.source || "chat", sourceRef: options.sourceRef || null, sessionId: plannedSessionId };
       UI()?.renderPlan(plan);
       UI()?.setConnection("connected");
-      setBusy(false, plan.requires_confirmation === false ? "蜂群计划已就绪" : "等待确认派蜂");
+      syncLifecycleControls(plan.requires_confirmation === false ? "蜂群计划已就绪" : "等待确认派蜂");
       // 即使低风险也展示计划并由用户确认，避免复杂任务在用户不知情时消耗多模型调用。
     } catch (error) {
-      UI()?.handleEvent({ type: "swarm.error", payload: { message: error.message } });
+      UI()?.handleEvent({ type: "swarm.notice", payload: { message: `蜂群规划失败：${error.message}` } });
       UI()?.setConnection("error");
-      gotoTab("insp");
-      await sendTurn(text);
+      planning = false;
+      await startSingleForOrigin({
+        goal: text,
+        sessionId: plannedSessionId,
+        source: options.source || "chat",
+        sourceRef: options.sourceRef || null,
+      });
     } finally {
       planning = false;
-      if (!active) $("send").disabled = false;
+      syncLifecycleControls();
       $("input").focus();
     }
   }
 
   async function runPending(detail) {
-    if (!pending || active) return;
+    if (!pending || active || singleFallback) return;
     const goal = pending.goal;
     const plannedSessionId = pending.sessionId;
     const plan = detail?.plan || pending.plan;
     const session = addUserGoal(goal, plannedSessionId);
-    if (!session) return;
+    if (!session) {
+      pending = null;
+      UI()?.reset();
+      UI()?.handleEvent({
+        type: "swarm.notice",
+        payload: { message: "发起会话已删除，蜂群计划已清除。" },
+      });
+      UI()?.setConnection("idle");
+      syncLifecycleControls("发起会话已删除，蜂群计划已清除");
+      return;
+    }
     pending = null;
     const controller = new AbortController();
-    const run = { runId: plan.run_id || plan.runId || null, sessionId: session.id, goal, plan, terminal: null, cancelled: false, controller };
+    const run = {
+      runId: plan.run_id || plan.runId || null,
+      sessionId: session.id,
+      goal,
+      plan,
+      terminal: null,
+      cancelled: false,
+      cancelState: "idle",
+      lastSeq: null,
+      seenEventIds: new Set(),
+      controller,
+    };
     active = run;
-    aborter = controller;
+    UI()?.markConfirmed?.(run.runId);
     UI()?.setConnection("connecting");
     gotoTab("swarm");
-    setBusy(true, "蜂群运行中…");
-    $("swarmCancel").disabled = false;
+    syncLifecycleControls("蜂群运行中…");
     try {
       const response = await fetch("/api/swarm/run", {
         method: "POST",
@@ -167,9 +292,9 @@
         signal: controller.signal,
       });
       await consumeSSE(response, (event) => {
-        // 取消或被后续状态替换的 run 不再接收迟到事件。
-        if (active !== run || run.cancelled) return;
-        if (event.run_id && !run.runId) run.runId = event.run_id;
+        // 取消、被后续状态替换、旧 run、重复或倒序事件一律丢弃。
+        if (active !== run || run.cancelled || run.terminal) return;
+        if (!acceptRunEnvelope(run, event)) return;
         UI()?.handleEvent(event);
         if (["swarm.done", "swarm.error", "swarm.cancelled", "swarm.waiting_user", "swarm.skipped"].includes(event.type)) {
           run.terminal = event;
@@ -185,35 +310,30 @@
       if (!terminal) throw new Error("蜂群事件流未返回终态");
       if (terminal.type === "swarm.done") {
         UI()?.setConnection("connected");
-        setBusy(false, "蜂群任务完成");
+        run.finishMessage = "蜂群任务完成";
       } else if (terminal.type === "swarm.cancelled") {
         UI()?.setConnection("disconnected");
-        setBusy(false, "蜂群任务已取消");
+        run.finishMessage = "蜂群任务已取消";
       } else if (terminal.type === "swarm.waiting_user") {
         UI()?.setConnection("connected");
-        setBusy(false, "蜂群等待确认");
+        run.finishMessage = "蜂群等待确认";
       } else if (terminal.type === "swarm.skipped") {
         UI()?.setConnection("connected");
-        setBusy(false, "已改用单 Agent");
+        run.finishMessage = "已改用单 Agent";
       } else {
         const message = terminal.payload?.message || terminal.payload?.error || "蜂群任务失败";
         throw new Error(message);
       }
     } catch (error) {
       if (error.name !== "AbortError") {
+        run.finishMessage = "蜂群任务失败";
         UI()?.handleEvent({ type: "swarm.error", payload: { message: error.message } });
         UI()?.setConnection("error");
-        setBusy(false, "蜂群任务失败");
       }
     } finally {
-      const stillCurrent = active === run;
-      if (stillCurrent) active = null;
-      if (aborter === controller) aborter = null;
-      if (!active && !planning) {
-        $("swarmCancel").disabled = true;
-        $("send").disabled = false;
-        $("input").focus();
-      }
+      if (active === run) active = null;
+      syncLifecycleControls(run.finishMessage);
+      $("input").focus();
     }
   }
 
@@ -222,44 +342,60 @@
       discardPlan();
       return;
     }
-    if (!active) return;
-    const runId = active.runId;
+    const run = active;
+    if (!run || run.cancelState === "requesting") return;
+    const runId = run.runId;
+    run.cancelState = "requesting";
+    syncLifecycleControls("正在取消蜂群…");
     try {
       if (!runId) throw new Error("任务尚未建立运行 ID");
       const result = await jsonPost(`/api/swarm/${encodeURIComponent(runId)}/cancel`, {});
-      if (result.ok === false || result.cancelled === false) throw new Error(result.err || "服务端未接受取消请求");
-      const run = active;
-      if (run) run.cancelled = true;
-      aborter?.abort();
+      if (active !== run || run.terminal) return;
+      if (result.ok !== true || result.cancel_requested !== true) {
+        throw new Error(result.err || "服务端未接受取消请求");
+      }
+      run.cancelled = true;
+      run.cancelState = "accepted";
+      run.finishMessage = "蜂群任务已取消";
+      run.controller.abort();
       UI()?.handleEvent({ type: "swarm.cancelled", run_id: runId, payload: { reason: "用户取消" } });
       UI()?.setConnection("disconnected");
-      if (active === run) active = null;
-      setBusy(false, "蜂群任务已取消");
+      syncLifecycleControls("蜂群任务已取消");
     } catch (error) {
-      UI()?.handleEvent({ type: "swarm.error", run_id: runId, payload: { message: `取消失败：${error.message}` } });
-      setBusy(false, "取消请求失败");
+      if (active === run) {
+        run.cancelState = "idle";
+        UI()?.handleEvent({
+          type: "swarm.notice",
+          run_id: runId,
+          payload: { message: `取消失败，蜂群仍在运行：${error.message}` },
+        });
+        syncLifecycleControls("取消失败，蜂群仍在运行");
+      }
     }
   }
 
-  function useSingle() {
+  async function useSingle() {
     if (!pending) return;
-    const goal = pending.goal;
-    pending = null;
-    UI()?.reset();
-    gotoTab("insp");
-    sendTurn(goal);
+    await startSingleForOrigin({ ...pending });
   }
 
   function discardPlan() {
     pending = null;
     UI()?.reset();
     UI()?.setConnection("idle");
-    setBusy(false, "就绪");
+    syncLifecycleControls("就绪");
     $("input").focus();
   }
 
   function installSendInterceptors() {
+    $("sessions")?.addEventListener?.("click", () => {
+      setTimeout(() => syncLifecycleControls(), 0);
+    });
     $("send").onclick = () => {
+      if (pending?.mode === "single" && cur()?.id === pending.sessionId) {
+        useSingle();
+        return;
+      }
       const value = $("input").value;
       $("input").value = "";
       autoGrow($("input"));
@@ -274,9 +410,6 @@
   window.addEventListener("muliao-swarm-single", useSingle);
   window.addEventListener("muliao-swarm-cancel-plan", discardPlan);
   window.addEventListener("muliao-swarm-cancel-run", cancelActive);
-  window.addEventListener("muliao-swarm-toggle-pause", () => {
-    UI()?.handleEvent({ type: "swarm.notice", payload: { message: "暂停将在下一里程碑接入；当前可取消任务。" } });
-  });
 
   installSendInterceptors();
   window.MuliaoSwarm = { planGoal, runPending, cancelActive, get active() { return active; } };

@@ -1012,6 +1012,83 @@ class SwarmStore:
             ),
         )
 
+    @staticmethod
+    def _promote_capsule_evidence(
+        connection: sqlite3.Connection,
+        capsule: WorkCapsule,
+    ) -> None:
+        """Promote receiver-accepted inline evidence in the ACK transaction."""
+
+        for raw in capsule.facts:
+            data = dict(raw)
+            data.setdefault("task_id", capsule.task_id)
+            if str(data["task_id"]) != capsule.task_id:
+                raise IdentityConflictError("capsule fact belongs to another task")
+            fact = FactRecord.from_dict(data)
+            current = connection.execute(
+                "SELECT task_id FROM facts WHERE fact_id = ?", (fact.fact_id,)
+            ).fetchone()
+            if current is not None and str(current["task_id"]) != fact.task_id:
+                raise IdentityConflictError(
+                    f"fact_id {fact.fact_id!r} belongs to another task"
+                )
+            connection.execute(
+                """
+                INSERT INTO facts(
+                    fact_id, task_id, state, value_json, source_ref,
+                    source_sha256, depends_on_json, expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fact_id) DO UPDATE SET
+                    state = excluded.state,
+                    value_json = excluded.value_json,
+                    source_ref = excluded.source_ref,
+                    source_sha256 = excluded.source_sha256,
+                    depends_on_json = excluded.depends_on_json,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    fact.fact_id, fact.task_id, fact.state,
+                    canonical_json(fact.value), fact.source_ref,
+                    fact.source_sha256, canonical_json(fact.depends_on),
+                    fact.expires_at, fact.updated_at,
+                ),
+            )
+
+        for raw in capsule.artifacts:
+            data = dict(raw)
+            data.setdefault("task_id", capsule.task_id)
+            if str(data["task_id"]) != capsule.task_id:
+                raise IdentityConflictError("capsule artifact belongs to another task")
+            artifact = ArtifactRecord.from_dict(data)
+            current = connection.execute(
+                "SELECT task_id FROM artifacts WHERE artifact_id = ?",
+                (artifact.artifact_id,),
+            ).fetchone()
+            if current is not None and str(current["task_id"]) != artifact.task_id:
+                raise IdentityConflictError(
+                    f"artifact_id {artifact.artifact_id!r} belongs to another task"
+                )
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    artifact_id, task_id, uri, mime, sha256,
+                    status, depends_on_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(artifact_id) DO UPDATE SET
+                    uri = excluded.uri,
+                    mime = excluded.mime,
+                    sha256 = excluded.sha256,
+                    status = excluded.status,
+                    depends_on_json = excluded.depends_on_json
+                """,
+                (
+                    artifact.artifact_id, artifact.task_id, artifact.uri,
+                    artifact.mime, artifact.sha256, artifact.status,
+                    canonical_json(artifact.depends_on), artifact.created_at,
+                ),
+            )
+
     def record_capsule_ack(
         self,
         capsule: WorkCapsule,
@@ -1055,6 +1132,8 @@ class SwarmStore:
                 if existing["ack_json"]:
                     persisted = CapsuleAck.from_dict(json.loads(existing["ack_json"]))
                     if persisted.status == ack.status:
+                        if persisted.status == "accepted":
+                            self._promote_capsule_evidence(connection, capsule)
                         duplicate = CapsuleAck(
                             message_id=persisted.message_id,
                             capsule_id=persisted.capsule_id,
@@ -1093,6 +1172,8 @@ class SwarmStore:
                         capsule.message_id, capsule.capsule_id,
                     ),
                 )
+                if ack.status == "accepted":
+                    self._promote_capsule_evidence(connection, capsule)
                 row = connection.execute(
                     "SELECT * FROM capsules WHERE message_id = ?", (capsule.message_id,)
                 ).fetchone()
@@ -1103,6 +1184,8 @@ class SwarmStore:
                 connection, capsule, body_hash,
                 run_id=run_id, stage_id=stage_id, attempt=attempt, ack=ack,
             )
+            if ack.status == "accepted":
+                self._promote_capsule_evidence(connection, capsule)
             row = connection.execute(
                 "SELECT * FROM capsules WHERE message_id = ?", (capsule.message_id,)
             ).fetchone()
