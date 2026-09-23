@@ -465,3 +465,114 @@ voice.state sleeping
 8. API Key 仅从环境变量或仓库外配置读取；仓库不包含凭据。
 9. `voice_control` 默认关闭；集成 UI 尚未提供 capability 开关。
 10. M0–M5 完成前未实施 M6 微信回复建议。
+
+---
+
+# M3A WEB-GOAL 契约层交接（2026-09-23 追加）
+
+> 本节记录 WEB-GOAL 浏览器第三通道 M3A 阶段的成果与共享文件请求。
+> 依据：`16-幕僚浏览器WEB-GOAL升级方案.md`、`18-幕僚voice-worktree状态审计与集成实施计划.md`。
+> 全部改动只在 voice 独占范围（`voice/**`、`tests/test_voice_*.py`），**未改任何共享/蜂群文件**。
+
+## Base / Head commit
+
+```text
+Base commit:  6e00f6d  (M5 加固收尾)
+Head commit:  63288f1  (WEB-GOAL dry-run 闭环)
+```
+
+本批 10 个提交：
+
+```text
+69acf74 feat: WEB-GOAL 冻结数据契约 (web_contracts)
+be3e0d5 feat: 把受限上下文 state 送进 Jev 路由 (M4 接线)
+7ef04d2 fix: "停止播报"命令真正打断上一 operation 的音频
+b44209a feat: WEB-GOAL observation 构建器 + 节点身份 (web_observation)
+778ec89 feat: WEB-GOAL policy 引擎 + 防注入 (web_policy)
+1bf82b2 feat: WEB-GOAL 一次性确认令牌 (web_confirm)
+69ef61c feat: WEB-GOAL 独立完成验证 (web_verifier)
+4352349 feat: WEB-GOAL 第二次 Jev 双头 chooser (web_goal_router)
+72f0544 fix: target_id observation-local、node 句柄 document-stable
+63288f1 feat: WEB-GOAL dry-run 闭环 + fake backend (web_backend/web_goal_loop)
+```
+
+## Changed files（全部 voice 独占）
+
+```text
+voice/web_contracts.py      # 冻结数据契约（Observation/ActionProposal/ConfirmationToken/…）
+voice/web_observation.py    # 节点身份 + page_revision + target 编号 + 隐私/不支持面过滤
+voice/web_policy.py         # ALLOW/REQUIRE_CONFIRMATION/NEEDS_INPUT/BLOCK + scheme 拒绝 + 防注入
+voice/web_confirm.py        # 一次性确认令牌（绑定最终结构化计划，非用户原话）
+voice/web_verifier.py       # 独立完成验证（三态）+ commit_state=unknown + answer_from_page 接地
+voice/web_goal_router.py    # 第二次 Jev：operation + *_target 双头 Choice + validate_choice
+voice/web_backend.py        # BrowserBackend Protocol + FakeDomBackend（M3A 内存 DOM）
+voice/web_goal_loop.py      # observe→route→policy→confirm→act→re-observe→verify 闭环
+voice/jev_router.py         # route(command, state) 转发受限上下文；needs_screen 提为稳定字段
+voice/engine.py             # "停止播报"无条件停止；TTS 失败仍 executed 不重试
+tests/test_voice_web_contracts.py / _observation / _policy / _confirm / _verifier / _goal_router / _goal_loop.py
+tests/test_voice_router.py  # 补 state 转发与 needs_screen 覆盖
+tests/test_voice_m0.py      # 补 stop 命令无条件停止覆盖
+```
+
+## API/schema changes
+
+- **无对外 HTTP/事件 schema 变更**：M3A 全部是 voice 内部模块，未接 `service.py` 生产 runtime，未新增 `/api/voice/*` 端点，未新增 `voice.*` 事件。
+- WEB-GOAL 内部契约（`voice/web_contracts.py`）已冻结：`Observation`（observation_id/page_revision/session_id/tab_id/origin/targets/omitted_target_count/supported_actions）、`ActionProposal`（三元组绑定、无自由文本字段）、`ConfirmationToken`、`VerificationResult`（三态）、`WebErrorCode`（含 TARGET_STALE/UNSUPPORTED_SURFACE/COMMIT_UNKNOWN/…）。
+- 计划中的对外变更（留待 M3B/M3C 接线时提交）：`voice.*` payload 增 `channel=fast|browser|desktop`；可能增 `voice.verification` 事件。**均未实施。**
+
+## 自动测试
+
+```text
+python -m pytest -q
+456 passed, 63 subtests passed
+
+python -m unittest discover -s tests -p 'test_voice_*.py'
+Ran 391 tests - OK
+
+SYSTEM_PROMPT SHA-256: 50e07b3b31dc5ca87420135484c4002cbce6878ece982defb026ce36e12e7ea7（与 origin/main 逐字节一致）
+受保护/蜂群文件改动：0
+秘密扫描（含 tp-/sk-/apikey_/ghp_/github_pat_）：无命中
+git diff --check：通过
+compileall：通过
+```
+
+M3A 各模块测试：web_contracts 30、web_observation 19+（重编号/节点稳定）、web_policy 22（含防注入）、web_confirm 17、web_verifier 23、web_goal_router 25、web_goal_loop 13。
+
+## 真机验收
+
+**M3A 不需要真机**：全程 dry-run + FakeDomBackend，零真实 Chrome/CDP/网络/麦克风。真实浏览器属于 M3B（专用 Chrome 只读 Alpha），尚未实施。
+
+## Shared-file requests（M3A 新增，交集成窗口）
+
+在原有 §1–§7 请求基础上，WEB-GOAL 追加以下共享文件请求。**voice 分支不直接改这些文件。**
+
+### A. `permissions.py`：WEB-GOAL 的权限语义需裁定（关键）
+
+- 补充方案与 doc 16 §7.1 要求：语音发起 WEB-GOAL 同时需要 `voice_control=true` **且** `browser=true`。
+- **现状冲突**：`browser` 当前是 `DATA_SCOPES` 之一，语义是"读取 Chrome/Edge 的部分历史标题、URL、时间"（只读采集）。WEB-GOAL 需要的是"读取当前网页的实时可见文本与控件摘要 + 驱动页面动作"，这与"读历史"不是同一件事。
+- **请集成窗口裁定**（三选一）：
+  1. 复用现有 `browser` DATA_SCOPE 同时门控实时 DOM 读取（简单，但把"读历史"和"读实时页面+动作"混为一谈，语义偏宽）；
+  2. 新增 `browser_control` capability（与 `voice_control` 并列，默认关，`all=true` 不开启），专门门控 WEB-GOAL 的实时 DOM 读取与动作——**voice 分支倾向此项**，但这是共享权限契约变更，必须由集成窗口实施；
+  3. M3B 首版先只允许 `voice_control + browser` 双开的**只读**观察，任何写动作再叠加确认门，capability 细分留到 M3C。
+- 在裁定前，M3B/M3C 的真实浏览器接线**不启动**。M3A 纯 dry-run 不触碰权限，可安全合入。
+
+### B. `requirements.txt` / `muliao.spec`：M3B 浏览器依赖
+
+- M3B 若采用自研直连 CDP（voice 分支推荐方案），依赖极小（可能只需 websocket 客户端；`websockets` 或标准库）。
+- 若采用 `browser-harness==0.1.13` 作外部工具：**不进 requirements、不封进 exe**（PyInstaller onefile 冻结会破坏其 `sys.executable -m browser_harness.daemon` 启动；依赖全 `==` 锁死易与 FastAPI/pydantic 冲突）。应作为外部已安装 CLI/MCP 调用。
+- 请集成窗口在 M3B 定稿依赖策略后再改 `requirements.txt`/`muliao.spec`。
+
+### C. `server.py`：M3B/M3C 事件通道
+
+- WEB-GOAL 接线到生产 runtime 时（M3B），`voice.*` payload 会增 `channel` 字段、可能增 `voice.verification` 事件。届时按原 §1 请求由集成窗口挂载，仍不改 SYSTEM_PROMPT、不写聊天 `_sessions`/`_cache_stats`。
+
+## Known limitations（M3A）
+
+1. **纯契约 + fake backend**：M3A 不启动真实 Chrome，不连 CDP，不读真实 DOM。所有网页交互经 `FakeDomBackend` 内存模拟。
+2. **未接生产 runtime**：`WebGoalLoop` 尚未被 `service.py`/`runtime.py` 构建；`build_runtime` 仍只 `mode="fast"`。WEB-GOAL 通道对用户不可达，属 M3B 接线工作。
+3. **未实现的结构**：iframe/Shadow DOM/canvas/文件上传/下载/弹窗新标签/嵌套滚动/复杂键盘——`web_observation` 只把 iframe/shadow/canvas 报为 `UnsupportedSurface`，其余待 M3B 的 CDP backend 明确拒绝。
+4. **无真实 Chrome 生命周期**：专用 profile、随机回环端口、孤儿进程清理属 M3B（`web_chrome.py`，尚未创建）。
+5. **确认交互未接 UI**：`ConfirmationStore` + `confirm_provider` 回调已就绪，但独立页面 `/voice/` 的确认 UI、语音确认话术属 M3C。
+6. **verifier 的 criteria 由调用方声明**：`web_verifier` 提供四类 check（origin/title/text/control_state/field_value），但"某任务的成功判据"需在 M3B/M3C 按场景配置，尚无自动生成。
+7. **Jev 双头 chooser 未经真实 Jev 回归**：`web_goal_router` 的 operation/target fan-out 与 validate_choice 用 fake answers 测通，真实 TypeSafe Jev 的中文网页 state 判定准确率待 M3B 实测（呼应 doc 13 §6.4 中文阈值需真实样本回调）。
+8. **主线接线仍是前置**：`orchestrator.py`/`goal.py`/`perception.py`/`context.py`（桌面 GOAL）目前仍是孤儿模块（见 doc 18 §2），未接生产 runtime；WEB-GOAL 与 DESKTOP-GOAL 的三通道分流（`kind=goal` → web/desktop）属后续接线批次。
