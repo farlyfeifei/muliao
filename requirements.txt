@@ -28,3 +28,11 @@ pywin32==312 ; sys_platform == "win32"
 # 仅 Windows 需要；缺库或非 Win 时 machine_control 各函数降级返回 control_unavailable。
 # comtypes 为 pywinauto 的传递依赖，pip 自动带入，无需单列。
 pywinauto==0.6.9 ; sys_platform == "win32"
+
+# ---- 言出法随语音子系统（voice/**）----
+# 全部为「函数内延迟 import」：缺库时语音功能优雅降级，不影响主程序启动与聊天/蜂群。
+# 模型文件不打进包，运行时从仓库外 ASCII 路径加载（见 voice-models.json）。
+numpy==2.3.5                                 # 音频帧数值处理
+sherpa-onnx==1.13.8                          # 本地 ASR（SenseVoice）/ 离线 TTS（VITS）推理
+webrtcvad==2.0.14                            # 语音活动检测（VAD）
+PyAudio==0.2.14 ; sys_platform == "win32"    # 麦克风采集 / 音频播放（PortAudio 绑定）
