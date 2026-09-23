@@ -128,9 +128,12 @@
           <div class="composer-bar">
             <span class="c-hint">Enter 发送 · Shift+Enter 换行</span>
             <div class="c-right">
-              <span class="model-sel" id="modelSel" title="对话模型 / 判断引擎">
-                <svg><use href="#i-brain"/></svg><span id="modelSelTxt">gpt-5.6-sol-free</span><i class="sep">·</i><span id="modelSelJev">Jev</span>
-              </span>
+              <div class="model-picker" id="modelPicker">
+                <button type="button" class="model-sel" id="modelSel" title="选择对话模型 / 判断引擎" aria-haspopup="listbox" aria-expanded="false">
+                  <svg><use href="#i-brain"/></svg><span id="modelSelTxt">—</span><i class="sep">·</i><span id="modelSelJev">Jev</span><svg class="chev"><use href="#i-chev-d"/></svg>
+                </button>
+                <div class="model-menu" id="modelMenu" role="listbox" hidden></div>
+              </div>
               <button type="button" class="send" id="send" data-mode="send" title="发送" aria-label="发送" aria-pressed="false"><svg><use href="#i-up"/></svg></button>
             </div>
           </div>

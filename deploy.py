@@ -19,6 +19,9 @@ import winreg
 from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import model_catalog  # noqa: E402  仓库根：对话模型默认档（部署自检用）
 DIST = os.path.join(HERE, "dist")
 SETUP_EXE = os.path.join(DIST, "幕僚Muliáo-Setup.exe")
 DIST_EXE = os.path.join(DIST, "Muliáo.exe")
@@ -437,7 +440,7 @@ def smoke_test() -> bool:
 
         status = get(base, "/api/status", 45)
         log(f"status: model={status.get('model')} engine={status.get('engine')} jev_ok={status.get('jev_ok')}")
-        ok &= status.get("model") == "gpt-5.6-sol-free"
+        ok &= bool(status.get("model")) and status.get("model") == model_catalog.DEFAULT_MODEL
         for path in ("/", "/app.js", "/styles.css", "/icon-glow.svg"):
             r = urllib.request.urlopen(base + path, timeout=10)
             body = r.read()

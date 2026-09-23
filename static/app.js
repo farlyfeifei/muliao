@@ -1216,6 +1216,143 @@ function updatePermHint() {
   }).catch(() => {});
 }
 
+/* ================= 对话模型选择 ================= */
+// 模型来自 /api/models：上游实探（verified）+ 官方文档目录（未验证）。
+// 点选 → POST /api/models/select 切运行时活动模型，立即对后续回合生效（不重启、不写盘）。
+let modelMenuLoaded = false;
+let modelMenuLoading = false;
+let modelActiveId = "";
+
+function closeModelMenu() {
+  const menu = $("modelMenu"), btn = $("modelSel");
+  if (menu) menu.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function openModelMenu() {
+  const menu = $("modelMenu"), btn = $("modelSel");
+  if (!menu || !btn) return;
+  menu.hidden = false;
+  btn.setAttribute("aria-expanded", "true");
+  if (!modelMenuLoaded && !modelMenuLoading) loadModels(false);
+}
+
+function toggleModelMenu() {
+  const menu = $("modelMenu");
+  if (!menu) return;
+  if (menu.hidden) openModelMenu(); else closeModelMenu();
+}
+
+function modelFootHtml(d) {
+  if (d.probe_ok) {
+    const n = (d.models || []).filter((m) => m.verified).length;
+    return `<div class="mm-foot">已连上游 · ${n} 个授权模型实探可用</div>`;
+  }
+  const err = String(d.probe_err || "").slice(0, 140);
+  // 区分「key 无效/额度」与「网络抖动」，给可操作提示，不笼统报错。
+  const isAuth = /401|invalid[_ ]?api[_ ]?key|api-?key|unauthor|额度|quota|forbidden|403/i.test(err);
+  const cls = isAuth ? "err" : "warn";
+  const msg = isAuth
+    ? "上游未授权该 Key（401 / invalid_api_key）：以下是官方文档目录，待有效 Key 后点「刷新」自动列出真实可用模型。"
+    : "暂未能连上游探测模型，以下为官方文档目录；网络恢复后点「刷新」重试。";
+  return `<div class="mm-foot ${cls}">${esc(msg)}${err ? `<br><code style="color:var(--dimmer)">${esc(err)}</code>` : ""}</div>`;
+}
+
+function renderModelMenu(d) {
+  const menu = $("modelMenu");
+  if (!menu) return;
+  const models = Array.isArray(d.models) ? d.models : [];
+  modelActiveId = d.active || "";
+  const items = models.map((m) => {
+    const active = m.id === modelActiveId;
+    const badge = m.verified
+      ? `<span class="mm-badge verified">实探</span>`
+      : `<span class="mm-badge doc">文档</span>`;
+    const check = active ? `<svg class="mm-check"><use href="#i-chev-r"/></svg>` : "";
+    return `<button type="button" class="mm-item${active ? " active" : ""}" data-model="${esc(m.id)}" role="option" aria-selected="${active}">
+        <span class="mm-row1">${check}<span class="mm-label">${esc(m.label || m.id)}</span>${badge}</span>
+        <span class="mm-id">${esc(m.id)}</span>
+        ${m.note ? `<span class="mm-note">${esc(m.note)}</span>` : ""}
+      </button>`;
+  }).join("");
+  menu.innerHTML =
+    `<div class="mm-head"><span class="mm-title">对话模型</span>` +
+    `<button type="button" class="mm-refresh" id="mmRefresh" title="重新探测上游可用模型">刷新</button></div>` +
+    (items || `<div class="mm-foot">没有可用模型</div>`) +
+    modelFootHtml(d);
+  const rb = $("mmRefresh");
+  if (rb) rb.onclick = (e) => { e.stopPropagation(); loadModels(true); };
+  menu.querySelectorAll(".mm-item").forEach((el) => {
+    el.onclick = (e) => { e.stopPropagation(); selectModel(el.getAttribute("data-model")); };
+  });
+}
+
+async function loadModels(force) {
+  if (modelMenuLoading) return;
+  modelMenuLoading = true;
+  const rb = $("mmRefresh");
+  if (rb) { rb.disabled = true; rb.textContent = "探测中…"; }
+  try {
+    const url = "/api/models" + (force ? "?refresh=1" : "");
+    const d = await (await fetch(url)).json();
+    modelMenuLoaded = true;
+    renderModelMenu(d || {});
+    if (d && d.active) { const t = $("modelSelTxt"); if (t) t.textContent = d.active; }
+  } catch {
+    const menu = $("modelMenu");
+    if (menu && !menu.innerHTML) menu.innerHTML = `<div class="mm-foot err">加载模型列表失败</div>`;
+  } finally {
+    modelMenuLoading = false;
+    const rb2 = $("mmRefresh");
+    if (rb2) { rb2.disabled = false; rb2.textContent = "刷新"; }
+  }
+}
+
+async function selectModel(id) {
+  if (!id || id === modelActiveId) { closeModelMenu(); return; }
+  try {
+    const r = await fetch("/api/models/select", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: id }),
+    });
+    const d = await r.json();
+    if (d && d.ok && d.model) {
+      modelActiveId = d.model;
+      const t = $("modelSelTxt"); if (t) t.textContent = d.model;
+      const v = $("val-llm"); if (v) v.textContent = d.model;
+      // 菜单里高亮迁移，不重新探测（省一次上游调用）
+      const menu = $("modelMenu");
+      if (menu) menu.querySelectorAll(".mm-item").forEach((el) => {
+        const on = el.getAttribute("data-model") === d.model;
+        el.classList.toggle("active", on);
+        el.setAttribute("aria-selected", String(on));
+        const row = el.querySelector(".mm-row1");
+        if (row) {
+          const old = row.querySelector(".mm-check"); if (old) old.remove();
+          if (on) row.insertAdjacentHTML("afterbegin", `<svg class="mm-check"><use href="#i-chev-r"/></svg>`);
+        }
+      });
+    }
+  } catch {}
+  closeModelMenu();
+}
+
+function initModelPicker() {
+  const btn = $("modelSel");
+  if (!btn) return;
+  btn.onclick = (e) => { e.stopPropagation(); toggleModelMenu(); };
+  document.addEventListener("click", (e) => {
+    const picker = $("modelPicker");
+    if (picker && !picker.contains(e.target)) closeModelMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeModelMenu();
+  });
+  // 立即用「秒回」的 /api/models 把活动模型名填上，不必等较慢的 /api/status。
+  // 同时预热一次菜单数据，点开即用。
+  loadModels(false);
+}
+
 /* ================= 启动 ================= */
 loadSessions();
 if (!sessions.length) newSession(); else { curId = sessions[0].id; renderSessions(); renderThread(); }
@@ -1225,6 +1362,7 @@ updateCounts(); setInterval(updateCounts, 3000);
 initTabs();
 initNotify();
 initPerm();
+initModelPicker();
 
 $("newChat").onclick = newSession;
 async function dispatchGoal(text) {

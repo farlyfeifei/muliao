@@ -5,6 +5,7 @@
 #   3) 提供静态前端 + 权限同意闸门 + 本机采集（通知/进程/窗口）
 # 启动：python server.py   （默认 http://127.0.0.1:8930）
 import asyncio
+import contextlib
 import copy
 import json
 import math
@@ -16,6 +17,7 @@ import threading
 import uuid
 import webbrowser
 from urllib.parse import urlsplit
+from typing import Any, Mapping
 
 from runtime_paths import config_path, data_dir
 
@@ -124,16 +126,39 @@ import permissions
 import collectors
 import machine_tools
 import action_gate
+import model_catalog
 from swarm import RECIPES, ROLE_POOL, SwarmOrchestrator, deterministic_fallback_plan
 from swarm_api import SWARM_PLAN_QUESTIONS, SwarmService
 from swarm_models import BeeSpec
 from swarm_runtime import BeeRuntime
 
 # ---- 配置（环境变量优先，其次读取仓库外 %APPDATA%\Muliao\config.json）----
-# 对话模型（主模型，负责想和写）
-LLM_BASE = _setting("MULIAO_LLM_BASE", "http://152.53.54.178:8318/v1")
+# 对话模型（主模型，负责想和写）——阿里云千问 OpenAI 兼容网关。
+# 默认基址/模型见 model_catalog；可被环境变量或仓库外 config.json 覆盖。
+LLM_BASE = _setting("MULIAO_LLM_BASE", model_catalog.ALIYUN_BASE)
 LLM_KEY = _setting("MULIAO_LLM_KEY")
-LLM_MODEL = _setting("MULIAO_LLM_MODEL", "gpt-5.6-sol-free")
+LLM_MODEL = _setting("MULIAO_LLM_MODEL", model_catalog.DEFAULT_MODEL)
+
+# 运行时活动模型：前端可在「模型选择」里切换，立即对后续回合生效，不重启。
+# 默认取 LLM_MODEL；只在内存里，切换不写盘（持久化由 config.json 负责）。
+_ACTIVE_MODEL = LLM_MODEL
+_ACTIVE_MODEL_LOCK = threading.Lock()
+
+
+def active_model() -> str:
+    with _ACTIVE_MODEL_LOCK:
+        return _ACTIVE_MODEL
+
+
+def set_active_model(model_id: str) -> str:
+    """切换运行时活动模型，返回生效后的模型 id。空值忽略。"""
+    global _ACTIVE_MODEL
+    mid = str(model_id or "").strip()
+    if not mid:
+        return active_model()
+    with _ACTIVE_MODEL_LOCK:
+        _ACTIVE_MODEL = mid
+    return mid
 
 # Jev（TypeSafe System One，负责快判断）
 JEV_URL = _setting("MULIAO_JEV_URL", "https://api.typesafe.ai/v1/systemone")
@@ -154,7 +179,37 @@ if getattr(sys, "frozen", False):
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 
-app = FastAPI(title="幕僚 Muliáo")
+
+# 关闭钩子注册表：语音等子系统在接线时把「释放资源」函数注册进来，由 _app_lifespan
+# 在 shutdown 阶段统一调用（幂等、互不影响）。用 lifespan 而非 add_event_handler：
+# 一旦给 FastAPI 传入自定义 lifespan，Starlette 会**忽略** add_event_handler 注册的
+# 处理函数——语音子系统的关闭钩子若用那种方式注册就会静默失效，导致麦克风泄漏。
+_LIFESPAN_SHUTDOWN_HOOKS: list[callable] = []
+
+
+def register_shutdown_hook(fn: callable) -> None:
+    """注册一个进程退出时的释放钩子（幂等：重复注册同一函数只保留一次）。"""
+    if callable(fn) and fn not in _LIFESPAN_SHUTDOWN_HOOKS:
+        _LIFESPAN_SHUTDOWN_HOOKS.append(fn)
+
+
+@contextlib.asynccontextmanager
+async def _app_lifespan(app_: "FastAPI"):
+    """单一生命周期入口：任意 ASGI 启动方式（python server.py / uvicorn server:app /
+    gunicorn）都保证后台线程在跑、退出时释放子系统资源。
+    """
+    # startup：后台模型探测线程（幂等，单例守卫）
+    _start_models_refresher()
+    yield
+    # shutdown：释放语音等子系统资源
+    for _hook in list(_LIFESPAN_SHUTDOWN_HOOKS):
+        try:
+            _hook()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+app = FastAPI(title="幕僚 Muliáo", lifespan=_app_lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"])
 
 # 本机网页写接口统一防跨站：只接受固定回环 Host/Origin、同站 Fetch 与 JSON。
@@ -248,7 +303,7 @@ def _prewarm_cache():
     """后台预热线程：用 SYSTEM_PROMPT 打一次极短请求，把这段长前缀写进上游 prompt 缓存。
     这样连首轮对话的 system 部分都能命中（实测 TTL>65s，连续对话每轮刷新）。"""
     url = LLM_BASE.rstrip("/") + "/chat/completions"
-    payload = {"model": LLM_MODEL,
+    payload = {"model": active_model(),
                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": "hi"}],
                "stream": False, "max_tokens": 1}
@@ -576,12 +631,159 @@ async def status():
         "jev_model": h.get("model") or JEV_MODEL,
         "jev_ms": h.get("ms"),
         "jev_console": JEV_CONSOLE,
-        "model": LLM_MODEL,
+        "model": active_model(),
+        "default_model": LLM_MODEL,
         "base": LLM_BASE,
         # 权限：未同意总条款时，前端先弹权限页
         "agreed": cons["agreed"],
         "granted_scopes": permissions.granted_scopes(),
     })
+
+
+# ============ 对话模型目录 / 切换 ============
+# 探测上游 GET {base}/models 拿这把 key 真正被授权的模型；失败就回落到文档目录。
+_models_cache: dict[str, Any] = {"ids": [], "ok": None, "err": None, "at": 0.0}
+_MODELS_TTL_OK = 300.0   # 探测成功缓存 5 分钟
+_MODELS_TTL_FAIL = 20.0  # 探测失败缓存 20 秒：既挡住「每次开面板都打上游」的抖动，
+                         # 又让 key 修好/网络恢复后很快自动重探。
+
+
+async def probe_models(force: bool = False) -> dict[str, Any]:
+    """探测上游可用模型 id。成功与失败都缓存（不同 TTL），避免频繁打开面板猛打上游。
+
+    返回 {ok, ids, err}。绝不抛异常——探测失败时前端仍能展示文档目录。
+    线程安全：缓存读写都在 _models_lock 下，后台刷新线程与请求可并发。
+    """
+    now = time.time()
+    if not force:
+        snap = _cache_snapshot()
+        if snap.get("ok") is not None and _cache_fresh(snap, now):
+            return {"ok": bool(snap["ok"]), "ids": list(snap["ids"]), "err": snap["err"]}
+    url = LLM_BASE.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {LLM_KEY}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            ids = model_catalog.normalize_probed_payload(r.json())
+            with _models_lock:
+                _models_cache.update({"ids": ids, "ok": True, "err": None, "at": time.time()})
+            return {"ok": True, "ids": ids, "err": None}
+        err = f"HTTP {r.status_code}: {r.text[:160]}"
+        with _models_lock:
+            # 保留上次成功的 ids（若有），失败只更新 ok/err/at
+            _models_cache.update({"ok": False, "err": err, "at": time.time()})
+            return {"ok": False, "ids": list(_models_cache["ids"]), "err": err}
+    except Exception as e:  # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+        with _models_lock:
+            _models_cache.update({"ok": False, "err": err, "at": time.time()})
+            return {"ok": False, "ids": list(_models_cache["ids"]), "err": err}
+
+
+_models_lock = threading.Lock()
+# 后台刷新线程是否在跑（进程内单例，避免重复起线程）
+_models_refresher_started = False
+
+
+def _models_response(probe: Mapping[str, Any], probing: bool) -> Any:
+    """把探测结果（可能来自缓存/正在后台探测）拼成 /api/models 响应体。"""
+    models = model_catalog.merge_models(probe.get("ids") or [])
+    return _json({
+        "ok": True,
+        "probe_ok": bool(probe.get("ok")),
+        "probe_err": probe.get("err"),
+        "probing": bool(probing),
+        "active": active_model(),
+        "default": LLM_MODEL,
+        "base": LLM_BASE,
+        "models": models,
+    })
+
+
+def _cache_snapshot() -> dict[str, Any]:
+    with _models_lock:
+        return {"ok": _models_cache["ok"], "ids": list(_models_cache["ids"]),
+                "err": _models_cache["err"], "at": _models_cache["at"]}
+
+
+def _cache_fresh(snap: Mapping[str, Any], now: float | None = None) -> bool:
+    if snap.get("ok") is None:
+        return False
+    ttl = _MODELS_TTL_OK if snap.get("ok") else _MODELS_TTL_FAIL
+    return ((now if now is not None else time.time()) - float(snap.get("at") or 0.0)) < ttl
+
+
+def _start_models_refresher() -> None:
+    """起一个后台守护线程，按 TTL 周期性重探上游模型并刷新缓存。
+
+    GET /api/models 因此只读缓存、绝不阻塞、绝不在请求里 spawn 任务；
+    真实授权列表由本线程在后台默默补上。key 修好后无需重启即可自动出现。
+    """
+    global _models_refresher_started
+    if _models_refresher_started:
+        return
+    _models_refresher_started = True
+
+    def _loop() -> None:
+        # 进程内自带事件循环，与 uvicorn 的主循环互不干扰。
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            while True:
+                snap = _cache_snapshot()
+                if not _cache_fresh(snap):
+                    try:
+                        loop.run_until_complete(probe_models(force=True))
+                    except Exception:  # noqa: BLE001
+                        pass
+                # 命中缓存就按较短的失败 TTL 节奏轮询；成功则更省。
+                time.sleep(min(_MODELS_TTL_FAIL, 15.0))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, name="models-refresher", daemon=True).start()
+
+
+@app.get("/api/models")
+async def list_models(req: Request):
+    """返回可选模型列表：上游实探（verified）+ 文档目录（未验证），并标出当前活动模型。
+
+    默认**只读缓存、绝不阻塞**：后台刷新线程（_start_models_refresher）按 TTL 默默
+    重探上游，本端点即时用缓存（冷启动时即文档目录）应答，probing 表示「还没探到」。
+    ``?refresh=1``（前端「刷新」按钮）才同步等待一次真实探测，给用户确定的最新结果。
+    """
+    force = req.query_params.get("refresh") == "1"
+    if force:
+        probe = await probe_models(force=True)
+        return _models_response(probe, probing=False)
+    snap = _cache_snapshot()
+    probing = snap.get("ok") is None or not _cache_fresh(snap)
+    return _models_response(
+        {"ok": snap.get("ok"), "ids": snap.get("ids") or [], "err": snap.get("err")},
+        probing=probing,
+    )
+
+
+@app.post("/api/models/select")
+async def select_model(req: Request):
+    """切换运行时活动对话模型：body {model: "<id>"}。立即对后续回合生效，不写盘。"""
+    try:
+        b = await req.json()
+    except Exception:
+        return _json({"ok": False, "err": "请求体不是合法 JSON"}, 400)
+    if not isinstance(b, dict):
+        return _json({"ok": False, "err": "请求体必须是 JSON 对象"}, 400)
+    mid = str(b.get("model") or "").strip()
+    if not mid:
+        return _json({"ok": False, "err": "model 不能为空"}, 422)
+    if len(mid) > 128:
+        return _json({"ok": False, "err": "model 过长"}, 422)
+    now = set_active_model(mid)
+    return _json({"ok": True, "model": now})
 
 
 # ============ 权限同意闸门 ============
@@ -1081,7 +1283,7 @@ def _swarm_llm_config() -> dict:
     return {
         "base": LLM_BASE,
         "key": LLM_KEY,
-        "model": LLM_MODEL,
+        "model": active_model(),
         "system_prompt": SYSTEM_PROMPT,
     }
 
@@ -1098,7 +1300,7 @@ async def _swarm_bee_runner(bee_id: str, context: dict):
         bee_id=str(bee_id),
         role_prompt=_SWARM_ROLE_PROMPTS.get(str(bee_id), "严格按任务契约完成被分配的工作。"),
         allowed_tools=tuple(str(name) for name in allowed_tools),
-        model=LLM_MODEL,
+        model=active_model(),
     )
     queue: asyncio.Queue = asyncio.Queue()
     cancel_event = context.get("cancel_event")
@@ -1713,7 +1915,7 @@ async def chat(req: Request):
                     # 每轮都从后端 store 重建：system 恒定在最前，历史只增不改。
                     # _sess_msgs 已剔除非法序列，不会把半截 tool_calls 发给上游。
                     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _sess_msgs(session_id)
-                    payload = {"model": LLM_MODEL, "messages": messages, "stream": True,
+                    payload = {"model": active_model(), "messages": messages, "stream": True,
                                "max_tokens": MAX_REPLY_TOKENS}
                     if tools:
                         payload["tools"] = tools
@@ -2281,6 +2483,7 @@ if __name__ == "__main__":
     print(f"   对话模型 {LLM_MODEL} @ {LLM_BASE}")
     print(f"   判断引擎 Jev @ {JEV_URL}（key 前缀 {JEV_KEY[:12]}…）")
     threading.Thread(target=_prewarm_cache, daemon=True).start()
+    _start_models_refresher()
 
     if not NO_BROWSER:
         url = f"http://127.0.0.1:{target_port}"
