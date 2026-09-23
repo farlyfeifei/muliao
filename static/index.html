@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>幕僚 Muliáo</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="swarm.css" />
+</head>
+<body>
+  <!-- 线性图标库（symbol 复用，仿 ZCode 的细线图标风格） -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 12a7.5 7.5 0 0 1-7.5 7.5H9L4.5 22v-4.2A7.5 7.5 0 0 1 12.5 4.5 7.5 7.5 0 0 1 20 12Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 9a6 6 0 1 0-12 0c0 5-2 6-2 6h16s-2-1-2-6Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M13.7 20a2 2 0 0 1-3.4 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a8 8 0 1 1 16 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12 18l4-5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-scale" viewBox="0 0 24 24"><path d="M12 4v16M7 20h10M5 9h14M5 9l-2.5 5a3 3 0 0 0 5 0L5 9Zm14 0-2.5 5a3 3 0 0 0 5 0L19 9Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19V5M4 19h16M8 16v-5M12.5 16V8M17 16v-3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M18.4 5.6l-1.6 1.6M7.2 16.8l-1.6 1.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-chev-r" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chev-d" viewBox="0 0 24 24"><path d="M5 9l7 7 7-7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chev-l2" viewBox="0 0 24 24"><path d="M11 6l-6 6 6 6M19 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.9 5.6L19.5 10l-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.4L12 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7.5 3v6c0 4.6-3.1 8.3-7.5 9.5C7.6 20.3 4.5 16.6 4.5 12V6L12 3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9.2 12.2l2 2 3.6-3.9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-pen" viewBox="0 0 24 24"><path d="M16.5 3.9l3.6 3.6L8.4 19.2l-4.4.8.8-4.4L16.5 3.9Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2.5 5 13.5h5.5L10 21.5l8.5-11.5H13l0-7.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5A1.5 1.5 0 0 1 5 6h4l2 2.5h8a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 19 19.5H5A1.5 1.5 0 0 1 3.5 18v-10.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+    <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 4.5A3 3 0 0 0 6.6 8 3 3 0 0 0 5 13.4 3 3 0 0 0 7.6 18a3 3 0 0 0 4.9 1V4.9a2.6 2.6 0 0 0-3-.4Zm5 0A3 3 0 0 1 17.4 8 3 3 0 0 1 19 13.4 3 3 0 0 1 16.4 18a3 3 0 0 1-4.9 1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-.6 4M20 5v6h-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9.8 3.2v3.3M14.2 3.2v3.3M9.8 17.5v3.3M14.2 17.5v3.3M3.2 9.8h3.3M3.2 14.2h3.3M17.5 9.8h3.3M17.5 14.2h3.3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 20.5h6M12 17v3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 12h17M12 3.5c2.4 2.5 3.6 5.4 3.6 8.5S14.4 18 12 20.5C9.6 18 8.4 15.1 8.4 12S9.6 6 12 3.5Z" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 3.5h7.5L18.5 8.5v12H6v-17Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M13.2 3.7V9h5.1M8.8 13h6.4M8.8 16.4h4.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+    <symbol id="i-swarm" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="5" cy="17" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="19" cy="17" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.7 7.2 6.3 14.8M13.3 7.2l4.4 7.6M7.5 17h9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  </defs></svg>
+
+  <div id="app" class="app">
+
+    <!-- ============ 左栏 ============ -->
+    <aside class="side" id="side">
+      <div class="side-head">
+        <img src="icon-glow.svg" alt="幕僚" class="logo" />
+        <div class="logo-txt"><b>幕僚</b><span>Muliáo</span></div>
+        <button class="icon-btn collapse" id="collapseSide" title="收起侧栏"><svg><use href="#i-chev-l2"/></svg></button>
+      </div>
+
+      <div class="side-body">
+        <button class="new-chat-btn" id="newChat">
+          <svg><use href="#i-plus"/></svg><span>新建会话</span><kbd>Ctrl N</kbd>
+        </button>
+
+        <div class="search">
+          <svg><use href="#i-search"/></svg>
+          <input id="search" type="text" placeholder="搜索会话…" autocomplete="off" />
+          <kbd>Ctrl K</kbd>
+        </div>
+
+        <nav class="nav">
+          <button class="nav-item on" data-goto="chat"><svg><use href="#i-chat"/></svg><span>对话工作台</span></button>
+          <button class="nav-item" data-goto="notify"><svg><use href="#i-bell"/></svg><span>通知收件箱</span><em class="nav-badge" id="navNotifyBadge"></em></button>
+          <button class="nav-item" data-goto="cache"><svg><use href="#i-gauge"/></svg><span>缓存账本</span><em class="nav-pct" id="navCachePct"></em></button>
+        </nav>
+
+        <div class="side-sep"></div>
+        <div id="sessions" class="sessions"></div>
+
+        <div class="engine">
+          <div class="erow"><span class="dot" id="dot-llm"></span><span class="ek">对话模型</span><span class="ev" id="val-llm">—</span></div>
+          <div class="erow"><span class="dot" id="dot-judge"></span><span class="ek">判断引擎</span><span class="ev" id="val-judge">连接中</span></div>
+        </div>
+      </div>
+
+      <div class="side-foot">
+        <button class="foot-row" id="privacyBtn" title="查看与管理权限">
+          <span class="avatar">幕</span>
+          <div class="foot-txt"><b>本地优先</b><span id="counts">—</span></div>
+          <svg class="chev"><use href="#i-chev-r"/></svg>
+        </button>
+        <div class="tip" id="permTip"><i class="tip-dot"></i><span id="permTipTxt">逐项授权 · 数据只在本机</span></div>
+        <div class="ver">v0.1</div>
+      </div>
+    </aside>
+    <button class="side-reopen" id="reopenSide" title="展开侧栏"><svg><use href="#i-chev-r"/></svg></button>
+
+    <!-- ============ 中栏 ============ -->
+    <main class="main">
+      <header class="topbar">
+        <div class="tb-left">
+          <span class="tb-sub" id="topSub"><i class="work-dot"></i>本机参谋工作台</span>
+        </div>
+        <button class="tb-title" id="topTitleBtn"><span id="topTitle">新会话</span><svg><use href="#i-chev-d"/></svg></button>
+        <div class="tb-right">
+          <span class="pill" id="enginePill"><i class="dot"></i><span id="enginePillTxt">Jev 连接中</span></span>
+        </div>
+      </header>
+
+      <div class="thread" id="thread">
+        <div class="empty" id="empty">
+          <div class="empty-bg" aria-hidden="true"><img src="icon-glow.svg" alt="" /></div>
+          <img src="icon-glow.svg" alt="幕僚" class="empty-logo" />
+          <h1>幕僚工作台</h1>
+          <p class="empty-kicker">DECIDE · THINK · VERIFY</p>
+          <p>交代目标，<b>Jev</b> 先给出决策门控，主模型展开可见思考，结束后由 <b>Jev</b> 复核。<br />通知、工具调用和缓存证据都进入右侧决策账本。</p>
+          <div class="flow-strip" aria-label="回合流程">
+            <span><i>01</i> 快判断</span><b></b><span><i>02</i> 深思考</span><b></b><span><i>03</i> 复核</span>
+          </div>
+          <div class="seed-grid">
+            <button class="seed"><svg><use href="#i-shield"/></svg><span>帮我把整个项目删掉重新初始化</span><i class="chev">›</i></button>
+            <button class="seed"><svg><use href="#i-spark"/></svg><span>解释一下什么是置信度门控</span><i class="chev">›</i></button>
+            <button class="seed"><svg><use href="#i-pen"/></svg><span>写一首关于深圳夜晚的短诗</span><i class="chev">›</i></button>
+            <button class="seed"><svg><use href="#i-bolt"/></svg><span>我这条消息会被判定为风险吗</span><i class="chev">›</i></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="judgebar" id="judgebar"></div>
+
+      <div class="composer-wrap">
+        <div class="composer" id="composer">
+          <textarea id="input" class="input" rows="1" placeholder="给幕僚下达指令…"></textarea>
+          <div class="composer-bar">
+            <span class="c-hint">Enter 发送 · Shift+Enter 换行</span>
+            <div class="c-right">
+              <span class="model-sel" id="modelSel" title="对话模型 / 判断引擎">
+                <svg><use href="#i-brain"/></svg><span id="modelSelTxt">gpt-5.6-sol-free</span><i class="sep">·</i><span id="modelSelJev">Jev</span>
+              </span>
+              <button class="send" id="send" title="发送"><svg><use href="#i-up"/></svg></button>
+            </div>
+          </div>
+        </div>
+        <div class="statusbar">
+          <span class="sb-l"><i class="sb-dot" id="sbDot"></i><span id="statusTxt">就绪</span></span>
+          <span class="sb-r">缓存稳态 <b id="statusCache">—</b><i class="sb-sep">·</i>目标 ≥90%</span>
+        </div>
+      </div>
+    </main>
+
+    <!-- ============ 右栏 ============ -->
+    <aside class="insp" id="insp-aside">
+      <div class="insp-tabs">
+        <button class="itab on" data-tab="insp" title="本回合体检"><svg><use href="#i-scale"/></svg></button>
+        <button class="itab" id="tab-swarm" data-tab="swarm" title="蜂群任务"><svg><use href="#i-swarm"/></svg><span class="itab-badge" id="swarmBadge"></span></button>
+        <button class="itab" data-tab="notify" title="系统通知"><svg><use href="#i-bell"/></svg><span class="itab-badge" id="notifyBadge"></span></button>
+        <button class="itab" data-tab="cache" title="缓存命中率"><svg><use href="#i-chart"/></svg></button>
+        <span class="insp-spacer"></span>
+        <span class="insp-label" id="inspLabel">决策账本</span>
+        <button class="icon-btn" id="inspClose" title="收起右栏"><svg><use href="#i-close"/></svg></button>
+      </div>
+
+      <!-- 体检 -->
+      <div class="insp-pane" id="pane-insp">
+        <div class="insp-scroll" id="insp">
+          <div class="insp-empty">发送消息后，这里显示这一回合的逐项判断与置信度，以及答完后的复核结论。</div>
+        </div>
+        <div class="gate-legend">门控 <i class="g auto"></i>放行 <i class="g review"></i>复核 <i class="g esc"></i>升级</div>
+      </div>
+
+      <!-- 蜂群任务 -->
+      <div class="insp-pane" id="pane-swarm" hidden>
+        <div class="swarm-toolbar" id="swarmToolbar">
+          <span class="swarm-run-title" id="swarmRunTitle">蜂群任务</span>
+          <span class="swarm-toolbar-actions">
+            <button class="icon-btn sm" id="swarmPause" title="暂停或继续" disabled><svg><use href="#i-pause"/></svg></button>
+            <button class="icon-btn sm" id="swarmCancel" title="取消任务" disabled><svg><use href="#i-close"/></svg></button>
+          </span>
+        </div>
+        <div class="insp-scroll swarm-scroll" id="swarmPane"></div>
+        <div class="swarm-footer" id="swarmFooter"><span id="swarmSummary">等待任务</span><span id="swarmSeq">seq —</span></div>
+      </div>
+
+      <!-- 通知 -->
+      <div class="insp-pane" id="pane-notify" hidden>
+        <div class="notify-head">
+          <span id="notifySummary">检测平台中…</span>
+          <span class="nh-acts">
+            <label class="nh-triage" title="用 Jev 给通知分类并判断是否需处理">
+              <input type="checkbox" id="triageToggle" checked /> Jev 分级
+            </label>
+            <button class="icon-btn sm" id="notifyRefresh" title="刷新"><svg><use href="#i-refresh"/></svg></button>
+            <label class="nh-auto" title="每 20 秒自动刷新"><input type="checkbox" id="notifyAuto" checked /><span>自动</span></label>
+          </span>
+        </div>
+        <div class="insp-scroll" id="notifyList">
+          <div class="insp-empty">正在检测本机通知来源…</div>
+        </div>
+      </div>
+
+      <!-- 缓存 -->
+      <div class="insp-pane" id="pane-cache" hidden>
+        <div class="insp-scroll" id="cachePane">
+          <div class="insp-empty">发送消息后，这里显示 prompt 缓存命中率（稳态 ≥90% 为达标）。</div>
+        </div>
+      </div>
+    </aside>
+    <button class="insp-reopen" id="reopenInsp" title="展开右栏"><svg><use href="#i-scale"/></svg></button>
+
+  </div>
+
+  <!-- ============ 权限确认页（首次启动 / 点「隐私与权限」时显示） ============ -->
+  <div class="perm-overlay" id="permOverlay" hidden>
+    <div class="perm-card">
+      <div class="perm-head">
+        <img src="icon-glow.svg" alt="幕僚" class="perm-logo" />
+        <div>
+          <h1>幕僚需要访问你的电脑</h1>
+          <p class="perm-sub">幕僚是本地优先的参谋。下面每一项都要你<b>逐项授权</b>，未授权的一律采不到。<br />
+          所有数据只存在本机 <code>%APPDATA%\Muliao\</code>，可随时一键焚毁。</p>
+        </div>
+      </div>
+
+      <div class="perm-notice">
+        <svg><use href="#i-shield"/></svg>
+        <span>幕僚<b>只读</b>：不改你的文件、不注入进程、不改系统设置、不上传原始内容。除对话模型与 Jev 判断外无任何外联。</span>
+      </div>
+
+      <div class="perm-body">
+        <div class="perm-toolbar">
+          <span class="perm-count" id="permCount">已选 0 / 7 项</span>
+          <span class="perm-spacer"></span>
+          <button class="perm-link" id="permSelectAll">全选</button>
+          <button class="perm-link" id="permSelectNone">全不选</button>
+        </div>
+        <div class="perm-list" id="permList"></div>
+      </div>
+
+      <div class="perm-foot">
+        <label class="perm-agree">
+          <input type="checkbox" id="permAgree" />
+          <span>我已阅读并同意：幕僚读取上面勾选的<b>我自己的</b>数据用于本地分析与参谋建议；原始数据不离开本机；我可随时撤销或焚毁。</span>
+        </label>
+        <div class="perm-actions">
+          <button class="perm-btn ghost" id="permLater">稍后再说<span class="hint">仅用对话，不采集</span></button>
+          <button class="perm-btn grant" id="permGrant" disabled>授权并进入幕僚</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="swarm-ui.js"></script>
+  <script src="app.js"></script>
+  <script src="swarm-controller.js"></script>
+</body>
+</html>

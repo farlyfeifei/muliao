@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <!-- 金色流光：渐变坐标随时间平移，做出金属光泽扫过的效果 -->
+    <linearGradient id="gold-flow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"    stop-color="#7a4a12"/>
+      <stop offset="0.28" stop-color="#ffc46b"/>
+      <stop offset="0.46" stop-color="#fff6d8"/>
+      <stop offset="0.58" stop-color="#ffd479"/>
+      <stop offset="0.82" stop-color="#e08a24"/>
+      <stop offset="1"    stop-color="#8a5316"/>
+      <animateTransform attributeName="gradientTransform" type="translate"
+                        values="-0.6 -0.6; 0.6 0.6; -0.6 -0.6" dur="5.5s" repeatCount="indefinite"/>
+    </linearGradient>
+
+    <!-- 次级环用稍暗的金，拉开层次 -->
+    <linearGradient id="gold-deep" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0"    stop-color="#b8791f"/>
+      <stop offset="0.42" stop-color="#ffd98a"/>
+      <stop offset="0.72" stop-color="#e79a2c"/>
+      <stop offset="1"    stop-color="#8f5715"/>
+      <animateTransform attributeName="gradientTransform" type="translate"
+                        values="0.5 -0.5; -0.5 0.5; 0.5 -0.5" dur="7s" repeatCount="indefinite"/>
+    </linearGradient>
+
+    <radialGradient id="core" cx="0.42" cy="0.36" r="0.72">
+      <stop offset="0"    stop-color="#fffdf3"/>
+      <stop offset="0.35" stop-color="#ffe6a8"/>
+      <stop offset="0.72" stop-color="#ffb454"/>
+      <stop offset="1"    stop-color="#d97b16"/>
+    </radialGradient>
+
+    <!-- 背后的柔光晕 -->
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0"    stop-color="#ffb454" stop-opacity="0.34"/>
+      <stop offset="0.45" stop-color="#ff9c2e" stop-opacity="0.13"/>
+      <stop offset="1"    stop-color="#ff8c1a" stop-opacity="0"/>
+    </radialGradient>
+
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="2.6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="bloom" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- 呼吸光晕 -->
+  <circle cx="100" cy="100" r="96" fill="url(#halo)">
+    <animate attributeName="opacity" values="0.55;1;0.55" dur="4.2s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- 外环：粗，顺时针缓转 -->
+  <g filter="url(#soft)">
+    <circle cx="100" cy="100" r="72" fill="none" stroke="url(#gold-flow)" stroke-width="7"
+            stroke-linecap="round" stroke-dasharray="330 122" opacity="0.95">
+      <animateTransform attributeName="transform" type="rotate"
+                        from="0 100 100" to="360 100 100" dur="26s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- 中环：细，逆时针，转得稍快 -->
+  <circle cx="100" cy="100" r="55" fill="none" stroke="url(#gold-deep)" stroke-width="3.4"
+          stroke-linecap="round" stroke-dasharray="176 170" opacity="0.8">
+    <animateTransform attributeName="transform" type="rotate"
+                      from="360 100 100" to="0 100 100" dur="17s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- 内环：极细虚线，顺时针 -->
+  <circle cx="100" cy="100" r="39" fill="none" stroke="url(#gold-flow)" stroke-width="1.6"
+          stroke-linecap="round" stroke-dasharray="9 13" opacity="0.62">
+    <animateTransform attributeName="transform" type="rotate"
+                      from="0 100 100" to="360 100 100" dur="34s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- 轨道上的游标光点 -->
+  <g>
+    <animateTransform attributeName="transform" type="rotate"
+                      from="0 100 100" to="360 100 100" dur="9s" repeatCount="indefinite"/>
+    <circle cx="100" cy="28" r="4.6" fill="#fff3cf" filter="url(#soft)">
+      <animate attributeName="opacity" values="0.45;1;0.45" dur="1.8s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+  <g>
+    <animateTransform attributeName="transform" type="rotate"
+                      from="180 100 100" to="-180 100 100" dur="13s" repeatCount="indefinite"/>
+    <circle cx="100" cy="45" r="3" fill="#ffd479" opacity="0.85"/>
+  </g>
+
+  <!-- 中心：落定的判断 -->
+  <circle cx="100" cy="100" r="17" fill="url(#core)" filter="url(#bloom)" opacity="0.75">
+    <animate attributeName="r" values="15;22;15" dur="3.4s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="100" cy="100" r="13.5" fill="url(#core)"/>
+  <circle cx="100" cy="100" r="13.5" fill="none" stroke="#fff8e2" stroke-width="1" opacity="0.5"/>
+  <circle cx="95.5" cy="95" r="3.6" fill="#fffdf5" opacity="0.85"/>
+
+  <!-- 中心脉冲圈 -->
+  <circle cx="100" cy="100" r="14" fill="none" stroke="#ffc46b" stroke-width="1.6" opacity="0">
+    <animate attributeName="r" values="14;44" dur="3.4s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.75;0" dur="3.4s" repeatCount="indefinite"/>
+  </circle>
+</svg>
