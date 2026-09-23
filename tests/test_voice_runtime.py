@@ -713,5 +713,123 @@ class RuntimeBuildTests(unittest.TestCase):
                 resources.close()
 
 
+class RecognizerFallbackWiringTests(unittest.TestCase):
+    @staticmethod
+    def settings(**changes):
+        base = VoiceSettings(
+            sensevoice_dir=Path("C:/models/sensevoice"),
+            jev_url="https://example.test/systemone",
+            jev_key="jev-test",
+            jev_model="jev-latest",
+            mimo_base_url="https://api.xiaomimimo.com/v1",
+            mimo_api_key="",
+        )
+        return replace(base, **changes)
+
+    def test_disabled_asr_builds_transcript_only_recognizer(self):
+        with mock.patch("voice.runtime.SenseVoiceRecognizer") as sense_cls, \
+                mock.patch("voice.runtime.SapiSpeaker"):
+            _, resources = build_runtime(self.settings(), speak=False, enable_asr=False)
+        try:
+            sense_cls.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "disabled"):
+                resources.recognizer.transcribe(None)
+        finally:
+            resources.close()
+
+    def test_cloud_asr_off_by_default_builds_plain_local_recognizer(self):
+        with mock.patch("voice.runtime.SenseVoiceRecognizer") as sense_cls, \
+                mock.patch("voice.runtime.MiMoAsrClient") as cloud_cls, \
+                mock.patch("voice.runtime.SapiSpeaker"):
+            _, resources = build_runtime(
+                # Even with a key present, the explicit opt-in flag is False.
+                self.settings(mimo_api_key="test-only", mimo_asr_enabled=False),
+                speak=False,
+            )
+        try:
+            cloud_cls.assert_not_called()
+            self.assertIs(resources.recognizer, sense_cls.return_value)
+        finally:
+            resources.close()
+
+    def test_cloud_asr_enabled_without_key_stays_local_only(self):
+        with mock.patch("voice.runtime.SenseVoiceRecognizer") as sense_cls, \
+                mock.patch("voice.runtime.MiMoAsrClient") as cloud_cls, \
+                mock.patch("voice.runtime.SapiSpeaker"):
+            _, resources = build_runtime(
+                self.settings(mimo_api_key="", mimo_asr_enabled=True),
+                speak=False,
+            )
+        try:
+            cloud_cls.assert_not_called()
+            self.assertIs(resources.recognizer, sense_cls.return_value)
+        finally:
+            resources.close()
+
+    def test_cloud_asr_enabled_with_key_wraps_local_in_fallback(self):
+        from voice.asr_fallback import FallbackRecognizer
+
+        with mock.patch("voice.runtime.SenseVoiceRecognizer") as sense_cls, \
+                mock.patch("voice.runtime.MiMoAsrClient") as cloud_cls, \
+                mock.patch("voice.runtime.SapiSpeaker"):
+            _, resources = build_runtime(
+                self.settings(mimo_api_key="test-only", mimo_asr_enabled=True),
+                speak=False,
+            )
+        try:
+            cloud_cls.assert_called_once()
+            self.assertEqual(cloud_cls.call_args.kwargs["api_key"], "test-only")
+            self.assertIsInstance(resources.recognizer, FallbackRecognizer)
+            self.assertIs(resources.recognizer.primary, sense_cls.return_value)
+            self.assertIs(resources.recognizer.fallback, cloud_cls.return_value)
+        finally:
+            resources.close()
+
+    def test_resource_close_closes_the_wrapped_cloud_client(self):
+        from voice.asr_fallback import FallbackRecognizer
+
+        closed: list[str] = []
+
+        class Closable:
+            def __init__(self, name):
+                self.name = name
+
+            def close(self):
+                closed.append(self.name)
+
+        local, cloud = Closable("local"), Closable("cloud")
+        resources = VoiceRuntimeResources(
+            router=None,
+            speaker=Closable("speaker"),
+            recognizer=FallbackRecognizer(local, cloud, api_key="k"),
+        )
+        resources.close()
+        self.assertEqual(sorted(closed), ["cloud", "local", "speaker"])
+
+
+class FallbackGetRecognizerTests(unittest.TestCase):
+    def test_get_recognizer_delegates_to_primary_local_loader(self):
+        from voice.asr_fallback import FallbackRecognizer
+
+        sentinel = object()
+
+        class Primary:
+            def _get_recognizer(self):
+                return sentinel
+
+        wrapper = FallbackRecognizer(Primary(), None, api_key="")
+        self.assertIs(wrapper._get_recognizer(), sentinel)
+
+    def test_get_recognizer_raises_when_primary_lacks_loader(self):
+        from voice.asr_fallback import FallbackRecognizer
+
+        class Bare:
+            pass
+
+        wrapper = FallbackRecognizer(Bare(), None, api_key="")
+        with self.assertRaises(AttributeError):
+            wrapper._get_recognizer()
+
+
 if __name__ == "__main__":
     unittest.main()

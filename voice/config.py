@@ -70,6 +70,8 @@ class VoiceSettings:
     mimo_tts_model: str = "mimo-v2.5-tts"
     mimo_tts_voice: str = "冰糖"
     mimo_tts_enabled: bool = False
+    mimo_asr_model: str = "mimo-v2.5-asr"
+    mimo_asr_enabled: bool = False
     jev_cache_enabled: bool = True
     jev_cache_seconds: float = 300.0
 
@@ -100,6 +102,8 @@ class VoiceSettings:
             mimo_tts_model=_setting("MULIAO_MIMO_TTS_MODEL", "mimo-v2.5-tts"),
             mimo_tts_voice=_setting("MULIAO_MIMO_TTS_VOICE", "冰糖"),
             mimo_tts_enabled=_bool_setting("MULIAO_MIMO_TTS_ENABLED", True),
+            mimo_asr_model=_setting("MULIAO_MIMO_ASR_MODEL", "mimo-v2.5-asr"),
+            mimo_asr_enabled=_bool_setting("MULIAO_MIMO_ASR_ENABLED", False),
             jev_cache_enabled=_bool_setting("MULIAO_JEV_CACHE_ENABLED", True),
             jev_cache_seconds=_float_setting("MULIAO_JEV_CACHE_SECONDS", 300.0),
             sample_rate=_int_setting("MULIAO_VOICE_SAMPLE_RATE", 16_000),

@@ -87,6 +87,21 @@ class FallbackRecognizer:
         with self._lock:
             return self._breaker_opened_at is not None
 
+    def _get_recognizer(self) -> Any:
+        """Delegate to the primary local recognizer's lazy loader.
+
+        Warm-up and model validation (voice/service.py, voice/models.py) force the
+        local SenseVoice model to load via ``recognizer._get_recognizer()``. When
+        the runtime wraps the local recognizer in this fallback, that accessor must
+        still reach the *local* model — the cloud client is never pre-loaded, so a
+        missing local asset fails warm-up exactly as before.
+        """
+
+        loader = getattr(self.primary, "_get_recognizer", None)
+        if not callable(loader):
+            raise AttributeError("primary recognizer has no _get_recognizer()")
+        return loader()
+
     def _breaker_allows(self) -> bool:
         with self._lock:
             if self._breaker_opened_at is None:

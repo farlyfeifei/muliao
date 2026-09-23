@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from .actions import DryRunExecutor, WindowsNotepadExecutor
+from .asr_fallback import FallbackRecognizer
 from .asr_local import SenseVoiceRecognizer
+from .asr_mimo import MiMoAsrClient
 from .audio_player import CancellableAudioPlayer, PyAudioPcmSink
 from .capture import PyAudioVADCapture
 from .config import VoiceSettings
@@ -36,11 +38,19 @@ class VoiceRuntimeResources:
     echo_guard: EchoGuard | None = None
     goal_client: Any | None = None
     jev_cache: JevResponseCache | None = None
+    recognizer: Any | None = None
 
     def close(self) -> None:
         errors: list[BaseException] = []
         seen: set[int] = set()
-        for resource in (self.speaker, self.router, self.player, self.sink, self.goal_client):
+        for resource in (
+            self.speaker,
+            self.router,
+            self.player,
+            self.sink,
+            self.goal_client,
+            self.recognizer,
+        ):
             if resource is None or id(resource) in seen:
                 continue
             seen.add(id(resource))
@@ -131,11 +141,7 @@ def build_runtime(
     )
 
     adapter = WindowsFastAdapter() if act else DryRunFastAdapter()
-    recognizer: Any = (
-        SenseVoiceRecognizer(settings.sensevoice_dir)
-        if enable_asr
-        else _TranscriptOnlyRecognizer()
-    )
+    recognizer = _build_recognizer(settings, enable_asr=enable_asr)
     permission = ExistingVoicePermission()
     events = JsonLineEventSink()
 
@@ -159,6 +165,7 @@ def build_runtime(
             echo_guard=echo_guard,
             goal_client=goal_client,
             jev_cache=jev_cache,
+            recognizer=recognizer,
         )
 
     engine = VoiceEngine(
@@ -177,7 +184,34 @@ def build_runtime(
         sink=sink,
         echo_guard=echo_guard,
         jev_cache=jev_cache,
+        recognizer=recognizer,
     )
+
+
+def _build_recognizer(settings: VoiceSettings, *, enable_asr: bool) -> Any:
+    """Local SenseVoice recognizer, optionally wrapped with a MiMo cloud fallback.
+
+    The cloud ASR fallback is OFF by default: sending audio off-device is a
+    privacy-sensitive action, so it only engages when explicitly enabled AND a
+    MiMo key is present. Even then it fires solely on a missing/unloadable local
+    model (see asr_fallback._is_missing_model_error) — never to paper over a real
+    decode error — and a cloud failure re-raises the original local error so an
+    empty transcript never reaches Jev. ``_get_recognizer()`` delegates to the
+    local model, so warm-up and model validation still exercise SenseVoice.
+    """
+
+    if not enable_asr:
+        return _TranscriptOnlyRecognizer()
+    local = SenseVoiceRecognizer(settings.sensevoice_dir)
+    cloud_enabled = settings.mimo_asr_enabled and bool(settings.mimo_api_key)
+    if not cloud_enabled:
+        return local
+    cloud = MiMoAsrClient(
+        api_key=settings.mimo_api_key,
+        model=settings.mimo_asr_model,
+        base_url=settings.mimo_base_url,
+    )
+    return FallbackRecognizer(local, cloud, api_key=settings.mimo_api_key)
 
 
 def _build_goal_engine(
