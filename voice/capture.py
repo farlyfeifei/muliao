@@ -1,0 +1,195 @@
+"""PyAudio + WebRTC VAD 单句采集。"""
+from __future__ import annotations
+
+from collections import deque
+import threading
+from typing import Any, Callable
+
+from .cancellation import CancellationToken, VoiceCancelled
+from .contracts import AudioSegment
+
+
+class PyAudioVADCapture:
+    """等待说话开始，并在连续静音后返回一个 PCM 语音段。"""
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 16_000,
+        frame_ms: int = 30,
+        vad_mode: int = 2,
+        silence_ms: int = 600,
+        pre_roll_ms: int = 300,
+        max_utterance_ms: int = 12_000,
+        listen_timeout_ms: int = 15_000,
+        min_speech_ms: int = 300,
+        input_device_index: int | None = None,
+        pyaudio_factory: Callable[[], Any] | None = None,
+        vad_factory: Callable[[int], Any] | None = None,
+        mute_gate: Any | None = None,
+    ) -> None:
+        if sample_rate not in {8_000, 16_000, 32_000, 48_000}:
+            raise ValueError("unsupported VAD sample rate")
+        if frame_ms not in {10, 20, 30}:
+            raise ValueError("frame_ms must be 10, 20, or 30")
+        self.sample_rate = sample_rate
+        self.frame_ms = frame_ms
+        self.vad_mode = vad_mode
+        self.silence_ms = silence_ms
+        self.pre_roll_ms = pre_roll_ms
+        self.max_utterance_ms = max_utterance_ms
+        self.listen_timeout_ms = listen_timeout_ms
+        self.min_speech_ms = min_speech_ms
+        self.input_device_index = input_device_index
+        self._pyaudio_factory = pyaudio_factory
+        self._vad_factory = vad_factory
+        self.mute_gate = mute_gate
+        self.frame_consumer: Callable[[bytes], Any] | None = None
+        self.frame_resetter: Callable[[], Any] | None = None
+        self._stop_event = threading.Event()
+        self._stream = None
+        self._stream_lock = threading.Lock()
+
+    @property
+    def samples_per_frame(self) -> int:
+        return self.sample_rate * self.frame_ms // 1000
+
+    def capture_utterance(self, *, cancellation: CancellationToken | None = None) -> AudioSegment:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        import pyaudio
+        import webrtcvad
+
+        self._stop_event.clear()
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        audio = (self._pyaudio_factory or pyaudio.PyAudio)()
+        vad = (self._vad_factory or webrtcvad.Vad)(self.vad_mode)
+        stream = None
+        try:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self.sample_rate,
+                input=True,
+                input_device_index=self.input_device_index,
+                frames_per_buffer=self.samples_per_frame,
+            )
+            with self._stream_lock:
+                self._stream = stream
+            return self._read_segment(stream, vad, cancellation=cancellation)
+        finally:
+            with self._stream_lock:
+                self._stream = None
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            audio.terminate()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._stream_lock:
+            stream = self._stream
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+
+    def _read_segment(
+        self,
+        stream: Any,
+        vad: Any,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> AudioSegment:
+        pre_roll_frames = max(1, self.pre_roll_ms // self.frame_ms)
+        silence_frames = max(1, self.silence_ms // self.frame_ms)
+        min_speech_frames = max(1, self.min_speech_ms // self.frame_ms)
+        max_frames = max(1, self.max_utterance_ms // self.frame_ms)
+        listen_frames = max(1, self.listen_timeout_ms // self.frame_ms)
+        pre_roll: deque[bytes] = deque(maxlen=pre_roll_frames)
+        frames: list[bytes] = []
+        started = False
+        speech_count = 0
+        trailing_silence = 0
+        frames_read = 0
+        muted = False
+
+        while len(frames) < max_frames:
+            if self._stop_event.is_set() or (cancellation is not None and cancellation.cancelled):
+                raise VoiceCancelled("voice capture cancelled")
+            if not started and frames_read >= listen_frames:
+                break
+            frame = stream.read(self.samples_per_frame, exception_on_overflow=False)
+            frames_read += 1
+            if len(frame) != self.samples_per_frame * 2:
+                continue
+            speaking_result: list[bool] = []
+
+            def consume_allowed(allowed_frame: bytes) -> None:
+                if self.frame_consumer is not None:
+                    try:
+                        self.frame_consumer(allowed_frame)
+                    except Exception:
+                        # 实时字幕是 display-only；失败不能阻断最终命令 ASR。
+                        pass
+                speaking_result.append(bool(vad.is_speech(allowed_frame, self.sample_rate)))
+
+            if self.mute_gate is not None:
+                submit = getattr(self.mute_gate, "submit", None)
+                if callable(submit):
+                    allowed = bool(submit(frame, consume_allowed))
+                else:
+                    allowed = bool(self.mute_gate.allow_frame(frame))
+                    if allowed:
+                        consume_allowed(frame)
+                if not allowed:
+                    pre_roll.clear()
+                    frames.clear()
+                    started = False
+                    speech_count = 0
+                    trailing_silence = 0
+                    frames_read = 0
+                    if not muted and self.frame_resetter is not None:
+                        try:
+                            self.frame_resetter()
+                        except Exception:
+                            pass
+                    muted = True
+                    continue
+            else:
+                consume_allowed(frame)
+            muted = False
+            speaking = speaking_result[0]
+            if not started:
+                pre_roll.append(frame)
+                if not speaking:
+                    continue
+                started = True
+                frames.extend(pre_roll)
+                speech_count = 1
+                continue
+
+            frames.append(frame)
+            if speaking:
+                speech_count += 1
+                trailing_silence = 0
+            else:
+                trailing_silence += 1
+                if trailing_silence >= silence_frames:
+                    break
+
+        if not started:
+            raise TimeoutError("no speech detected before capture timeout")
+        if speech_count < min_speech_frames:
+            raise ValueError("speech segment is shorter than min_speech_ms")
+        return AudioSegment(pcm=b"".join(frames), sample_rate=self.sample_rate)
