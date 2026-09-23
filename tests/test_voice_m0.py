@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from voice.contracts import ActionResult, AudioSegment, RouteDecision, Transcript
+from voice.engine import VoiceEngine
+from voice.events import MemoryEventSink
+from voice.wake import WakeDetector
+
+
+class Counter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+
+class FakePermission(Counter):
+    def __init__(self, enabled: bool) -> None:
+        super().__init__()
+        self.enabled = enabled
+
+    def allowed(self) -> bool:
+        self.calls += 1
+        return self.enabled
+
+
+class FakeCapture(Counter):
+    def capture_utterance(self) -> AudioSegment:
+        self.calls += 1
+        return AudioSegment(b"\0\0" * 160)
+
+
+class FakeRecognizer(Counter):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+    def transcribe(self, audio: AudioSegment) -> Transcript:
+        self.calls += 1
+        return Transcript(self.text)
+
+
+class FakeRouter(Counter):
+    def __init__(self, decision: RouteDecision | None = None) -> None:
+        super().__init__()
+        self.commands: list[str] = []
+        self.decision = decision or RouteDecision(
+            accepted=True,
+            kind="open_app",
+            target="notepad",
+            confidence=0.99,
+        )
+
+    def route(self, command: str) -> RouteDecision:
+        self.calls += 1
+        self.commands.append(command)
+        return self.decision
+
+
+class FakeExecutor(Counter):
+    def __init__(self, ok: bool = True) -> None:
+        super().__init__()
+        self.decisions: list[RouteDecision] = []
+        self.ok = ok
+
+    def execute(self, decision: RouteDecision) -> ActionResult:
+        self.calls += 1
+        self.decisions.append(decision)
+        return ActionResult(self.ok, "open_app:notepad", "opened" if self.ok else "failed")
+
+
+class FakeSpeaker(Counter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.texts: list[str] = []
+
+    def speak(self, text: str) -> None:
+        self.calls += 1
+        self.texts.append(text)
+
+
+def make_engine(*, allowed=True, transcript="幕僚幕僚，打开记事本", decision=None):
+    permission = FakePermission(allowed)
+    recognizer = FakeRecognizer(transcript)
+    router = FakeRouter(decision)
+    executor = FakeExecutor()
+    speaker = FakeSpeaker()
+    events = MemoryEventSink()
+    engine = VoiceEngine(
+        permission=permission,
+        recognizer=recognizer,
+        router=router,
+        executor=executor,
+        speaker=speaker,
+        events=events,
+    )
+    return engine, permission, recognizer, router, executor, speaker, events
+
+
+class WakeDetectorTests(unittest.TestCase):
+    def test_strips_fixed_wake_phrase(self):
+        match = WakeDetector().detect("幕僚幕僚，打开记事本")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.command, "打开记事本")
+
+    def test_accepts_pause_punctuation_between_words(self):
+        match = WakeDetector().detect("幕僚……幕僚，打开记事本")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.command, "打开记事本")
+
+    def test_rejects_single_or_mid_sentence_wake_word(self):
+        detector = WakeDetector()
+        self.assertIsNone(detector.detect("幕僚，打开记事本"))
+        self.assertIsNone(detector.detect("请幕僚幕僚打开记事本"))
+        self.assertIsNone(detector.detect("打开记事本"))
+
+
+class VoiceM0Tests(unittest.TestCase):
+    def test_denied_permission_does_not_open_microphone_or_call_dependencies(self):
+        engine, _, recognizer, router, executor, speaker, _ = make_engine(allowed=False)
+        capture = FakeCapture()
+        result = engine.run_once(capture)
+        self.assertEqual(result.status, "permission_denied")
+        self.assertEqual(capture.calls, 0)
+        self.assertEqual(recognizer.calls, 0)
+        self.assertEqual(router.calls, 0)
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+
+    def test_wake_miss_has_zero_jev_and_action_calls(self):
+        engine, _, recognizer, router, executor, speaker, events = make_engine(
+            transcript="打开记事本"
+        )
+        result = engine.process_audio(AudioSegment(b"\0\0" * 160))
+        self.assertEqual(result.status, "wake_miss")
+        self.assertEqual(recognizer.calls, 1)
+        self.assertEqual(router.calls, 0)
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+        self.assertTrue(any(e.type == "voice.metric" for e in events.events))
+
+    def test_wake_phrase_is_stripped_before_router_and_notepad_executes(self):
+        engine, _, _, router, executor, speaker, events = make_engine()
+        result = engine.process_transcript("幕僚幕僚，打开记事本")
+        self.assertEqual(result.status, "executed")
+        self.assertEqual(router.commands, ["打开记事本"])
+        self.assertEqual(executor.calls, 1)
+        self.assertEqual(speaker.texts, ["好的，记事本打开了。"])
+        self.assertTrue(all(e.type.startswith("voice.") for e in events.events))
+
+    def test_rejected_route_does_not_execute_or_speak(self):
+        decision = RouteDecision(accepted=False, kind="none", reason="not whitelisted")
+        engine, _, _, router, executor, speaker, _ = make_engine(decision=decision)
+        result = engine.process_transcript("幕僚幕僚，删除全部文件")
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(router.calls, 1)
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+
+    def test_destructive_route_requires_confirmation(self):
+        decision = RouteDecision(
+            accepted=False,
+            kind="open_app",
+            target="notepad",
+            confidence=0.9,
+            destructive=True,
+        )
+        engine, _, _, _, executor, speaker, events = make_engine(decision=decision)
+        result = engine.process_transcript("幕僚幕僚，执行危险动作")
+        self.assertEqual(result.status, "confirmation_required")
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(speaker.calls, 0)
+        self.assertTrue(any(e.type == "voice.confirmation" for e in events.events))
+
+
+if __name__ == "__main__":
+    unittest.main()
