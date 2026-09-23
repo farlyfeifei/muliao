@@ -576,3 +576,192 @@ M3A 各模块测试：web_contracts 30、web_observation 19+（重编号/节点�
 6. **verifier 的 criteria 由调用方声明**：`web_verifier` 提供四类 check（origin/title/text/control_state/field_value），但"某任务的成功判据"需在 M3B/M3C 按场景配置，尚无自动生成。
 7. **Jev 双头 chooser 未经真实 Jev 回归**：`web_goal_router` 的 operation/target fan-out 与 validate_choice 用 fake answers 测通，真实 TypeSafe Jev 的中文网页 state 判定准确率待 M3B 实测（呼应 doc 13 §6.4 中文阈值需真实样本回调）。
 8. **主线接线仍是前置**：`orchestrator.py`/`goal.py`/`perception.py`/`context.py`（桌面 GOAL）目前仍是孤儿模块（见 doc 18 §2），未接生产 runtime；WEB-GOAL 与 DESKTOP-GOAL 的三通道分流（`kind=goal` → web/desktop）属后续接线批次。
+
+---
+
+# M5 收尾批次交接（Jev 缓存 / ASR 降级 / 分段计时 / VITS）（HEAD d16dfda，2026-09-24 追加）
+
+> 本节记录 M5 收尾批次（Jev 响应 TTL 缓存、MiMo 云 ASR 降级接线、ASR/Jev/执行/TTS
+> 分段计时指标、离线 VITS 说话人与 MiMo→VITS→SAPI 降级链，及一批对抗审查修复）的
+> 成果与遗留项。依据：`13-言出法随语音控制方案.md` §4.5/§7.4、
+> `18-幕僚voice-worktree状态审计与集成实施计划.md` §5.4。
+> 全部改动只在 voice 独占范围（`voice/**`、`tests/test_voice_*.py`、`voice-models.json`），
+> **未改任何共享/受保护/蜂群文件**。
+
+## Base / Head commit
+
+```text
+Base commit:  8394a0d  (M3：FAST/DESKTOP-GOAL orchestrator 接入生产 runtime)
+Head commit:  d16dfda  (fix：收紧 MiMo ASR 云备援门控——审查发现)
+```
+
+更早的 `6e00f6d`（M5 加固：echo guard / 撤权 / teardown）是本批的血缘锚点，已在上一节
+（M3A 交接）记为 Base，不在本批提交范围内。
+
+本批 7 个提交（`8394a0d..d16dfda`）：
+
+```text
+0849099 feat: MiMo 云 ASR 降级 + 熔断器（FallbackRecognizer，本地优先，云仅备援）
+339fad2 feat: Jev 响应 TTL 缓存（FAST router 与 GOAL chooser 共用一个传输包裹）
+db6ba32 feat: 把 MiMo 云 ASR 降级接进 runtime 识别器（默认关，仅本地缺失才上云）
+355aa76 feat: ASR/Jev/exec/TTS 分段计时指标（沿用 voice.metric，不改事件契约）
+fc44fc8 feat: 声明 VITS aishell3 模型为可选降级层（manifest，缺失降级不 fail closed）
+61445df feat: 离线 VITS 说话人 + MiMo→VITS→SAPI TTS 降级链接线
+d16dfda fix: 收紧 MiMo ASR 云备援门控（HIGH 误判上云 + MEDIUM 取消污染熔断器）
+```
+
+## Changed files（全部 voice 独占）
+
+```text
+voice/jev_cache.py            # 新增：JevResponseCache + cache_key（有界 TTL，线程安全，只缓存成功响应）
+voice/asr_fallback.py         # 新增：FallbackRecognizer + FallbackStats（本地优先 / 云备援 / 熔断器）
+                              #     fix d16dfda：_is_missing_model_error 收窄为 FileNotFoundError/ImportError；
+                              #     VoiceCancelled 在云往返中直接重抛，不计入熔断器失败
+voice/tts_vits.py             # 新增：VitsSpeaker（sherpa-onnx VITS aishell3，懒加载、可注入、可取消）
+voice/config.py               # 改：新增 jev_cache_enabled/jev_cache_seconds、mimo_asr_model/mimo_asr_enabled、
+                              #     vits_dir/vits_tts_enabled；负 jev_cache_seconds 夹到 0（禁用，不崩）
+voice/runtime.py              # 改：_build_recognizer 接 FallbackRecognizer；_build_goal_engine 接 jev_cache.wrap；
+                              #     TTS 降级链 MiMo→(VITS→SAPI) 嵌套 FallbackSpeaker；
+                              #     VoiceRuntimeResources 增 jev_cache/recognizer 字段，close 时清缓存并关云 client
+voice/jev_router.py           # 改：_JevRouterBase 接可选 cache，命中即返回不发网络
+voice/engine.py               # 改：新增 _timed()，对 asr/jev/exec/tts 四段各发一条 voice.metric 计时
+voice-models.json             # 改：声明 vits_aishell3 条目（model.onnx/tokens.txt/lexicon.txt/dict，整条 optional）
+tests/test_voice_jev_cache.py        # 新增：缓存单元 + FAST-router 集成 + config 夹取（22）
+tests/test_voice_asr_fallback.py     # 新增：降级/熔断/取消/close + 误判上云回归 + 取消不污染熔断（19）
+tests/test_voice_engine_metrics.py   # 新增：分段计时与隐私 payload（9）
+tests/test_voice_tts_vits.py         # 新增：VITS 懒加载/分块/取消/缺资产/降级到 SAPI（20）
+tests/test_voice_models.py           # 改：vits_aishell3 条目 schema 校验（+5，无模型文件也能过）
+tests/test_voice_runtime.py          # 改：识别器四路径、VITS 链 wiring、资源 close 顺序、_get_recognizer 委托（+11）
+```
+
+**受保护/共享文件改动：0**（`server.py`、`permissions.py`、`runtime_paths.py`、`static/*`、
+`machine_tools.py`、`collectors.py`、`requirements.txt`、`muliao.spec`、`installer.iss`、
+`deploy.py`、`使用说明.md` 均未触碰）；**蜂群/capsule 文件改动：0**。
+
+## 对外契约要点（供集成方）
+
+### A. JevResponseCache（Jev 响应 TTL 缓存）
+
+- `wrap(ask, model)` 包裹任意 `(state, questions) -> answers` 传输，返回同签名 callable；
+  FAST router、桌面 GOAL chooser、WEB-GOAL chooser 都复用同一实现，不改各自问答逻辑。
+- key = `sha256(model + 规范化 state JSON + 规范化 questions JSON)`；key 里**不含 API key**，
+  日志也不打印 key 原文。
+- **只缓存成功**的 `Mapping` answers；网络/HTTP 异常原样抛出、**不进缓存**（瞬态失败不会被当成答案）。
+- TTL 默认 300s；`ttl_seconds == 0` 表示**禁用缓存**（每次必发网络）。有界（`max_entries`，
+  插入序淘汰），线程安全，过期项惰性清理。
+- **一个 runtime 级实例**，由 FAST router 与被包裹的 goal ask 共用；`VoiceRuntimeResources.close()`
+  会 `clear()` 它，所以跨 runtime 生命周期复用绝不会读到陈旧答案。
+
+### B. MiMo 云 ASR 降级
+
+- 默认**关闭**（`mimo_asr_enabled` 默认 `False`）：把音频送出设备是隐私敏感动作，属显式 opt-in。
+- 仅当**显式开启且有 MiMo key** 时，`_build_recognizer()` 才把本地 `SenseVoiceRecognizer`
+  包进 `FallbackRecognizer`；否则返回纯本地识别器（或 ASR 关闭时的 transcript-only stub）。
+- 只有本地模型**确实缺失/不可加载**（`FileNotFoundError` / `ImportError`，即资产文件不存在或
+  sherpa_onnx 未安装）才上云；**真实解码错误绝不上云**（`OSError`/`RuntimeError` 等原样抛出，
+  绝不把已过唤醒门控的音频泄漏给云端）。审查修复 `d16dfda` 已把此前过宽的判定收窄。
+- 云端失败**重抛本地原始错误**（绝不给 Jev 空文本/垃圾文本）；连续失败触发**熔断器**，
+  到重置窗口前半开探测，成功即闭合。无 key 时云备援直接禁用，零网络。
+- 云往返途中用户 **barge-in**（`VoiceCancelled`）**不计入**熔断器失败、也不误开熔断；直接重抛，
+  取消路径仍权威（审查修复 `d16dfda`，MEDIUM）。
+- `FallbackRecognizer._get_recognizer()` **委托本地懒加载**，所以预热与模型校验
+  （`voice/service.py`、`voice/models.py`）仍强制走**本地 SenseVoice**，本地资产缺失照旧令预热失败；
+  云 client 永不预加载。识别器记在 `VoiceRuntimeResources` 上，云 httpx client 随 runtime 一起 close。
+
+### C. 分段计时指标
+
+- `VoiceEngine._timed(operation, name, work)` 对四段各发一条 `voice.metric`：`asr_ms`（仅音频路径）、
+  `jev_ms`、`exec_ms`、`tts_ms`；值是**毫秒浮点标量**（`round(ms, 3)`）。
+- payload **不含**文本/音频/候选词/URL；只有时长。异常**原样抛出且不记采样**，所以既有错误路径仍权威，
+  不会记下幻影延迟。
+- 计时发生在 `_allowed_call` 的**内层**，所以权限门等待**不计入**模型/执行延迟。
+- **沿用既有 `voice.metric` 的 `{name, value}` 约定，未改 `voice.*` 事件契约**；`_emit` 已盖
+  `operation_id` 并丢弃陈旧/终态 operation。未运行的阶段不发采样（被拒路由只记 `jev_ms`，无 `exec_ms`/`tts_ms`）。
+
+### D. 新增配置项（全部安全默认值，只读环境变量或仓库外 JSON）
+
+```text
+jev_cache_enabled    默认开（True）         MULIAO_JEV_CACHE_ENABLED
+jev_cache_seconds    默认 300（负值夹到 0）  MULIAO_JEV_CACHE_SECONDS
+mimo_asr_model       默认 mimo-v2.5-asr     MULIAO_MIMO_ASR_MODEL
+mimo_asr_enabled     默认关（False）         MULIAO_MIMO_ASR_ENABLED
+vits_dir             默认 C:/ProgramData/Muliao/models/vits-aishell3   MULIAO_VOICE_VITS_AISHELL3_DIR
+vits_tts_enabled     默认关（False）         MULIAO_VOICE_VITS_TTS_ENABLED
+```
+
+`VoiceSettings` 保留 M0 前四个必填字段与其后位置参数顺序，新增项全部追加并带默认值；
+API key 仍只从环境变量或仓库外配置读取，仓库不含凭据。`vits_dir` 复用 manifest 的
+`MULIAO_VOICE_VITS_AISHELL3_DIR` 约定，与 `voice-models.json` 的 `vits_aishell3` 条目一致。
+
+### E. 离线 VITS 说话人与 TTS 降级链
+
+- `voice/tts_vits.py` 的 `VitsSpeaker` 是 sherpa-onnx VITS（aishell3）离线神经 TTS，公共契约对齐
+  `SapiSpeaker`（`speak/stop/close`）并暴露 `cancel()`，可直接充当 `FallbackSpeaker` 的 cloud 层。
+- runtime 用**嵌套两层 FallbackSpeaker** 组成 **MiMo → (VITS → SAPI)**：`vits_tts_enabled` 默认关，
+  关闭时仍是原 MiMo→SAPI 或纯 SAPI；开启时本地层变为 VITS→SAPI。
+- **懒加载 + 可注入**：构造不碰文件系统、不导入 sherpa_onnx、不开声卡；默认 `tts_factory`/
+  `player_factory` 只在真机执行，测试注入 fake，因此本机无模型也能完整单测。
+- `_get_tts()` 先检查四个资产文件（`model.onnx`/`tokens.txt`/`lexicon.txt`/`dict`），缺失**在导入
+  sherpa_onnx 之前**抛 `FileNotFoundError`，由内层 FallbackSpeaker **降级到 SAPI**，绝不 fail closed。
+- **并发/急停**：transition lock 只保护 ownership 交接与 player begin()，慢速 native 加载与
+  `generate()` 在锁**外**执行，所以 `cancel()`/`stop()` 能在合成途中拿到锁、递增 generation；被取代的
+  operation 在 `generate()` 返回瞬间复查并丢弃结果，**音频绝不越过急停存活**。播放经
+  `CancellableAudioPlayer` 按有界块流式送出 int16-LE PCM，块间复查取消；speaker 自带并 close 自己的
+  player，经链的 close() 传播可达。
+
+## Shared-file requests（M5 收尾批次）
+
+**这批没有要求改任何共享文件。** §1–§7 与 M3A 节的既有请求不变；本批纯 voice 独占
+（`voice/**`、`tests/test_voice_*.py`、`voice-models.json`），可安全合入。
+
+### VITS 说话人已落地（提交 61445df / fc44fc8）
+
+- `voice/tts_vits.py` 的 `VitsSpeaker` **已实现并接线**：runtime 的 TTS 降级链现为
+  **MiMo → VITS → SAPI**（详见上文契约 E）。`vits_tts_enabled` 默认关，开启即生效。
+- `voice-models.json` 新增 `vits_aishell3` 条目（`model.onnx`/`tokens.txt`/`lexicon.txt`/`dict`，
+  整条与每个文件均标 `optional: true`）；旧 `vits_tts` 占位条目保留不动（被既有测试引用）。
+- **集成方须知**：`voice/models.py` 的 required 校验列表（`validate_model_assets`）**刻意不含** vits，
+  仍是 `("sensevoice", "streaming_zipformer")`。VITS 是**可选层**，缺失时优雅降级到 SAPI，**绝不
+  fail closed**；`validate_model_assets` 对 `optional` 资产跳过缺失校验（计入 `skipped_optional_files`）。
+  **请勿**把 `vits_aishell3` 提升为 required，否则缺模型会令真机启动失败。
+
+## 自动测试
+
+```text
+python -m pytest tests/test_voice_*.py -q
+546 passed, 67 subtests passed
+
+python -m compileall -q voice
+干净（rc=0）
+
+git diff --check
+干净（无输出）
+
+SYSTEM_PROMPT SHA-256:
+50e07b3b31dc5ca87420135484c4002cbce6878ece982defb026ce36e12e7ea7（与冻结值一致）
+
+受保护/共享/蜂群文件改动：0
+仓库守卫测试（tests/test_repository_guards.py）：2 passed（prompt 字节冻结 + 源码无内嵌凭据）
+密钥扫描（tracked source）：无命中
+```
+
+各模块测试（实测，单文件可独立运行）：jev_cache 22（含 FAST-router 集成证明第二条相同命令零网络、
+不同命令仍发、错误不缓存、TTL 过期强制重取、config 负 TTL 夹取）、asr_fallback 19（本地优先 /
+缺失模型降级 / **真实解码错误不上云** / 无 key 禁用 / 云端失败抛本地错误 / 熔断开-半开-复位 /
+**取消不污染熔断器** / close）、engine_metrics 9（全流分段、音频路径 asr_ms、transcript 路径无 asr_ms、
+payload 形状与隐私、各早退路径）、tts_vits 20（int16 端点/夹取/扁平化、懒加载、分块、stale operation_id、
+缺资产 FileNotFoundError、合成途中急停不出声、幂等 close、VITS→SAPI 降级）、models 22（含 vits_aishell3
+schema 5 项）、runtime 33（含识别器四路径、VITS 链 wiring MiMo→VITS→SAPI、资源 close 顺序、
+`_get_recognizer()` 委托）。
+
+## Known limitations（M5 收尾）
+
+1. **VITS 与云 ASR 默认关**：`vits_tts_enabled` 与 `mimo_asr_enabled` 均默认 `False`，属显式 opt-in；
+   未开启时 TTS 走 MiMo→SAPI（或纯 SAPI），ASR 走纯本地 SenseVoice。VITS 真机模型（sherpa-onnx
+   aishell3 导出）本机缺失，默认 `tts_factory` 未在真机验证，留待真机首块延迟与降级实测。
+2. **真实云端未回归**：MiMo 云 ASR 降级、Jev 缓存、VITS 合成均用 fake/MockTransport 测通，真实
+   MiMo ASR、真实 TypeSafe Jev、真实 sherpa-onnx VITS 的端到端降级/命中延迟/音质待真机实测。
+3. **分段计时只发事件，不落盘**：`voice.metric` 计时样本只进事件流，无聚合/持久化面板，属可观测性
+   的后续接线。
+4. **桌面 GOAL 仍 dry-run**：`_build_goal_engine` 的桌面 GOAL 执行器在无真实 Windows UIA/OCR 执行器前
+   仍走 dry-run（`act=True` 亦然），与本批缓存/计时/VITS 接线无关，属后续里程碑。
