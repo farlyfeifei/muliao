@@ -1,7 +1,7 @@
 # Ghost 蜂群集成请求
 
-日期：2026-09-23  
-来源分支：`feature/ghost-swarm`  
+日期：2026-09-23
+来源分支：`feature/ghost-swarm`
 适用目标：`integration/two-lane`
 
 本文只描述需要由集成窗口修改的共享文件。Ghost 功能分支不会直接修改这些文件，也不涉及 `voice/**`、`static/voice/**` 或任何言出法随接口。
