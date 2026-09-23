@@ -22,6 +22,9 @@ from voice.models import (
     warmup_sensevoice,
 )
 
+MANIFEST = ROOT / "voice-models.json"
+VITS_FILES = ("model.onnx", "tokens.txt", "lexicon.txt", "dict/")
+
 
 class ModelManifestTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -327,6 +330,74 @@ class CheckedInManifestTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
+class VitsAishell3ManifestTests(unittest.TestCase):
+    """Schema-level checks for the VITS aishell3 entry.
+
+    The model asset is not present on this machine, so every test validates the
+    manifest schema and inventory parsing without requiring files on disk.
+    """
+
+    def load_checked_in(self, *, env: dict[str, str] | None = None):
+        return load_model_inventory(
+            MANIFEST,
+            repository_root=ROOT,
+            env={} if env is None else env,
+        )
+
+    def test_inventory_parses_vits_aishell3_entry(self):
+        inventory = self.load_checked_in()
+        self.assertIn("vits_aishell3", inventory.models)
+        spec = inventory.require("vits_aishell3")
+        self.assertEqual(spec.name, "vits_aishell3")
+        self.assertEqual(spec.runtime, "sherpa-onnx")
+        # Existing entries are preserved and not reordered.
+        self.assertEqual(
+            list(inventory.models)[:3],
+            ["sensevoice", "streaming_zipformer", "vits_tts"],
+        )
+
+    def test_require_returns_expected_declared_files(self):
+        spec = self.load_checked_in().require("vits_aishell3")
+        self.assertEqual(tuple(asset.name for asset in spec.files), VITS_FILES)
+        for asset in spec.files:
+            self.assertTrue(asset.purpose, f"{asset.name} missing purpose")
+
+    def test_declared_paths_are_ascii(self):
+        spec = self.load_checked_in().require("vits_aishell3")
+        self.assertTrue(str(spec.root).isascii())
+        for asset in spec.files:
+            self.assertTrue(asset.name.isascii(), asset.name)
+            self.assertTrue(str(asset.path).isascii(), str(asset.path))
+
+    def test_entry_is_optional_degradation_layer(self):
+        # VITS sits between MiMo cloud TTS and SAPI in the degradation chain, so
+        # a missing VITS model must degrade to SAPI rather than fail closed. The
+        # manifest therefore marks the entry (and each file) optional, matching
+        # the sibling vits_tts placeholder.
+        spec = self.load_checked_in().require("vits_aishell3")
+        self.assertTrue(spec.optional)
+        self.assertTrue(all(asset.optional for asset in spec.files))
+
+    def test_validate_skips_missing_optional_files_when_dir_empty(self):
+        with tempfile.TemporaryDirectory() as temp:
+            empty = Path(temp).resolve()
+            inventory = self.load_checked_in(
+                env={"MULIAO_VOICE_VITS_AISHELL3_DIR": str(empty)}
+            )
+            spec = inventory.require("vits_aishell3")
+            self.assertEqual(spec.root, empty)
+
+            report = validate_model_assets(inventory, model_names=("vits_aishell3",))
+
+        # Optional layer: missing assets are skipped, not errors, so a machine
+        # without the VITS model still starts and falls through to SAPI.
+        self.assertTrue(report.ok)
+        self.assertEqual(report.checked_files, 0)
+        self.assertEqual(report.skipped_optional_files, len(VITS_FILES))
+        self.assertEqual(report.issues, ())
+        report.raise_for_errors()  # must not raise
 
 
 if __name__ == "__main__":

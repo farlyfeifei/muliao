@@ -72,6 +72,36 @@
           "optional": true
         }
       ]
+    },
+    "vits_aishell3": {
+      "purpose": "Offline VITS aishell3 Chinese neural TTS for the M5 degradation chain",
+      "runtime": "sherpa-onnx",
+      "env": "MULIAO_VOICE_VITS_AISHELL3_DIR",
+      "default_path": "C:/ProgramData/Muliao/models/vits-aishell3",
+      "optional": true,
+      "files": [
+        {
+          "name": "model.onnx",
+          "purpose": "VITS aishell3 text-to-speech network",
+          "optional": true
+        },
+        {
+          "name": "tokens.txt",
+          "purpose": "VITS aishell3 token symbol table",
+          "optional": true
+        },
+        {
+          "name": "lexicon.txt",
+          "purpose": "Pinyin lexicon mapping Chinese words to phones",
+          "optional": true
+        },
+        {
+          "name": "dict/",
+          "purpose": "jieba word-segmentation dictionary directory",
+          "optional": true
+        }
+      ],
+      "source": "https://huggingface.co/csukuangfj/vits-icefall-zh-aishell3"
     }
   },
   "notes": [
