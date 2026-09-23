@@ -158,6 +158,7 @@ class _JevRouterBase:
         model: str = "jev-latest",
         timeout: float = 15.0,
         client: httpx.Client | None = None,
+        cache: Any | None = None,
     ) -> None:
         self.url = url
         self.api_key = api_key
@@ -167,6 +168,9 @@ class _JevRouterBase:
         self._client = client or httpx.Client(timeout=timeout, trust_env=False)
         self._owns_client = client is None
         self._lock = threading.Lock()
+        # 可选 JevResponseCache（doc 13 §7.4）：相同 utterance/state 在 TTL 内不
+        # 重复请求。只缓存成功响应；缺密钥与网络错误路径不进缓存。
+        self._cache = cache
 
     def close(self) -> None:
         if self._owns_client:
@@ -191,6 +195,19 @@ class _JevRouterBase:
             request_state = dict(state)
             if not _clean_str(request_state.get("utterance")):
                 request_state["utterance"] = command
+
+        cache_key_str: str | None = None
+        if self._cache is not None:
+            from .jev_cache import cache_key as _make_key
+
+            cache_key_str = _make_key(self.model, request_state, self.questions)
+            hit = self._cache.get(cache_key_str)
+            if isinstance(hit, Mapping):
+                answers = hit.get("answers")
+                if not isinstance(answers, dict):
+                    answers = {}
+                return answers, hit
+
         body = {
             "state": json.dumps(request_state, ensure_ascii=False),
             "model": self.model,
@@ -207,6 +224,9 @@ class _JevRouterBase:
         answers = payload.get("answers") if isinstance(payload, dict) else {}
         if not isinstance(answers, dict):
             answers = {}
+        # Cache only a well-formed successful payload; errors already returned.
+        if self._cache is not None and cache_key_str is not None and isinstance(payload, dict):
+            self._cache.put(cache_key_str, payload)
         return answers, payload if isinstance(payload, dict) else {}
 
 

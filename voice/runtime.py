@@ -12,6 +12,7 @@ from .config import VoiceSettings
 from .engine import VoiceEngine
 from .events import JsonLineEventSink
 from .fast_actions import DryRunFastAdapter, FastActionExecutor, WindowsFastAdapter
+from .jev_cache import JevResponseCache
 from .jev_router import JevFastRouter, JevM0Router
 from .permission_gate import ExistingVoicePermission
 from .safety import EchoAwareSpeaker, EchoGuard
@@ -34,6 +35,7 @@ class VoiceRuntimeResources:
     sink: PyAudioPcmSink | None = None
     echo_guard: EchoGuard | None = None
     goal_client: Any | None = None
+    jev_cache: JevResponseCache | None = None
 
     def close(self) -> None:
         errors: list[BaseException] = []
@@ -49,6 +51,10 @@ class VoiceRuntimeResources:
                 close()
             except BaseException as exc:
                 errors.append(exc)
+        # The cache holds no OS resources; drop its entries so a later reuse
+        # never serves a stale answer across runtime lifetimes.
+        if self.jev_cache is not None:
+            self.jev_cache.clear()
         if errors:
             raise ExceptionGroup("voice runtime resource close failed", errors)
 
@@ -91,10 +97,16 @@ def build_runtime(
     if mode not in {"fast", "goal"}:
         raise ValueError("build_runtime supports mode='fast' or mode='goal'")
     settings.validate_m0()
+    jev_cache = (
+        JevResponseCache(ttl_seconds=settings.jev_cache_seconds)
+        if settings.jev_cache_enabled
+        else None
+    )
     router = JevFastRouter(
         url=settings.jev_url,
         api_key=settings.jev_key,
         model=settings.jev_model,
+        cache=jev_cache,
     )
     echo_guard = EchoGuard() if speak else None
     local_speaker = _local_speaker(speak)
@@ -137,6 +149,7 @@ def build_runtime(
             events=events,
             echo_guard=echo_guard,
             act=act,
+            jev_cache=jev_cache,
         )
         return engine, VoiceRuntimeResources(
             router=router,
@@ -145,6 +158,7 @@ def build_runtime(
             sink=sink,
             echo_guard=echo_guard,
             goal_client=goal_client,
+            jev_cache=jev_cache,
         )
 
     engine = VoiceEngine(
@@ -162,6 +176,7 @@ def build_runtime(
         player=player,
         sink=sink,
         echo_guard=echo_guard,
+        jev_cache=jev_cache,
     )
 
 
@@ -175,6 +190,7 @@ def _build_goal_engine(
     events: Any,
     echo_guard: EchoGuard | None,
     act: bool,
+    jev_cache: JevResponseCache | None = None,
 ):
     """Wire the FAST/DESKTOP-GOAL orchestrator behind the engine interface.
 
@@ -195,8 +211,13 @@ def _build_goal_engine(
     # One direct, certificate-validated client shared by the chooser transport;
     # trust_env=False mirrors the FAST router's proxy workaround.
     goal_client = httpx.Client(timeout=15.0, trust_env=False)
+    goal_ask = make_goal_ask(
+        settings.jev_url, settings.jev_key, settings.jev_model, client=goal_client
+    )
+    if jev_cache is not None:
+        goal_ask = jev_cache.wrap(goal_ask, settings.jev_model)
     chooser = JevGoalChooser(
-        ask=make_goal_ask(settings.jev_url, settings.jev_key, settings.jev_model, client=goal_client),
+        ask=goal_ask,
         api_key=settings.jev_key,
         model=settings.jev_model,
     )

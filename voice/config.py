@@ -42,6 +42,13 @@ def _bool_setting(name: str, default: bool) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _float_setting(name: str, default: float) -> float:
+    try:
+        return float(_setting(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(frozen=True)
 class VoiceSettings:
     # 保留 M0 的前四个必填字段和其后位置参数顺序；新增云配置全部追加并提供安全默认值。
@@ -63,6 +70,8 @@ class VoiceSettings:
     mimo_tts_model: str = "mimo-v2.5-tts"
     mimo_tts_voice: str = "冰糖"
     mimo_tts_enabled: bool = False
+    jev_cache_enabled: bool = True
+    jev_cache_seconds: float = 300.0
 
     @classmethod
     def load(cls) -> "VoiceSettings":
@@ -91,6 +100,8 @@ class VoiceSettings:
             mimo_tts_model=_setting("MULIAO_MIMO_TTS_MODEL", "mimo-v2.5-tts"),
             mimo_tts_voice=_setting("MULIAO_MIMO_TTS_VOICE", "冰糖"),
             mimo_tts_enabled=_bool_setting("MULIAO_MIMO_TTS_ENABLED", True),
+            jev_cache_enabled=_bool_setting("MULIAO_JEV_CACHE_ENABLED", True),
+            jev_cache_seconds=_float_setting("MULIAO_JEV_CACHE_SECONDS", 300.0),
             sample_rate=_int_setting("MULIAO_VOICE_SAMPLE_RATE", 16_000),
             frame_ms=_int_setting("MULIAO_VOICE_FRAME_MS", 30),
             vad_mode=_int_setting("MULIAO_VOICE_VAD_MODE", 2),
