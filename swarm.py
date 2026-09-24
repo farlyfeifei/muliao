@@ -31,7 +31,6 @@ from swarm_planner import (
     RECIPE_STAGES,
     ROLE_POOL,
     SWARM_PLAN_QUESTIONS,
-    coerce_risk_score,
     deterministic_fallback,
     evaluate_user_gate,
     materialize_plan,
@@ -68,6 +67,88 @@ def match_tier(score: float) -> str:
     if v <= _MATCH_POOR_THRESHOLD:
         return "poor"
     return "neutral"
+
+
+def _match_score_or(value: Any, default: float) -> float:
+    """把 Jev 的匹配度答案归一到 0-10；缺答/非法/布尔一律回落到中性 default。
+
+    **不能**复用 swarm_planner.coerce_risk_score：它把 str(None)="none" 当成风险标签
+    "none" → 1.0 分。那样 Jev 只要漏答 match_quality，这只蜂就会被判成 1 分/poor，
+    它的「差经验」会被当成真实教训传给下游蜂 —— 假信号污染整条经验链。
+    匹配度缺答的正确语义是「无法评估」，必须落到中性档，不奖不罚。
+    """
+    raw = value
+    if isinstance(raw, Mapping):
+        for key in ("score", "value", "noul", "answer"):
+            if raw.get(key) is not None:
+                raw = raw[key]
+                break
+        else:
+            return float(default)
+    # 布尔不是评分：True/False 无法表达 0-10 的匹配度，按缺答处理。
+    if isinstance(raw, bool) or raw is None:
+        return float(default)
+    try:
+        return max(0.0, min(10.0, float(raw)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# 传给下游蜂的单条经验摘要长度上限：够传达「做了什么、好在哪/差在哪」，
+# 又不至于把整份阶段结果灌进每只下游蜂的 prompt。
+_LESSON_SUMMARY_LIMIT = 240
+
+
+def _lesson_summary(result: Any) -> str:
+    """把一只蜂的成果压成一句可传递的经验摘要。"""
+    if isinstance(result, Mapping):
+        for key in ("summary", "text", "output", "status"):
+            val = result.get(key)
+            if isinstance(val, str) and val.strip():
+                s = val.strip()
+                break
+        else:
+            s = _canonical_json(dict(result))
+    else:
+        s = str(result or "").strip()
+    return s[:_LESSON_SUMMARY_LIMIT]
+
+
+def _build_lessons(stage_quality: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """把一个阶段里各蜂的产出按「好/差」分档，整理成传给下游蜂的经验。
+
+    返回一条可注入下游 input_capsules 的记录（非真正 capsule，无 capsule_id，
+    不参与 handoff 校验）。只挑 good 与 poor 两档传递：neutral 不传，避免噪声。
+    没有 good 也没有 poor 时返回空 dict（调用方据此跳过注入）。
+    """
+    good: list[dict[str, Any]] = []
+    poor: list[dict[str, Any]] = []
+    for bee, q in (stage_quality or {}).items():
+        tier = str(q.get("lesson_tier") or "neutral")
+        if tier == "neutral":
+            continue
+        entry = {
+            "bee": str(bee),
+            "match_score": q.get("match_score", MATCH_SCORE_DEFAULT),
+            "summary": _lesson_summary(q.get("summary")),
+        }
+        (good if tier == "good" else poor).append(entry)
+    if not good and not poor:
+        return {}
+    good.sort(key=lambda e: e.get("match_score", 0), reverse=True)
+    poor.sort(key=lambda e: e.get("match_score", 0))
+    record: dict[str, Any] = {"kind": "stage_lessons"}
+    if good:
+        record["learn_from"] = good[:4]
+        record["learn_guidance"] = (
+            "以下同侪产出与本目标高度契合，值得借鉴其方法与证据组织方式："
+        )
+    if poor:
+        record["avoid"] = poor[:4]
+        record["avoid_guidance"] = (
+            "以下同侪产出偏离目标或证据不足，避免重蹈其做法："
+        )
+    return record
 
 BeeRunner = Callable[[str, dict[str, Any]], Awaitable[Any] | AsyncIterator[Any]]
 JevChecker = Callable[[str, dict[str, Any]], Awaitable[Mapping[str, Any]]]
@@ -577,10 +658,10 @@ def _stage_actions(response: Mapping[str, Any], bees: Sequence[str]) -> dict[str
         evidence_sufficient = _as_bool(answers.get(f"evidence_sufficient_{bee}", True))
         safe = _as_bool(answers.get(f"safe_to_continue_{bee}", True))
         conflict = _as_bool(answers.get(f"conflict_present_{bee}", False))
-        # 匹配度 0-10。用 coerce_risk_score 做夹逼（它就是通用的 0-10 归一器）：
-        # 缺答或答成布尔时回落到中性 5.0，不会把 True 误当成 1 分。
-        match_score = coerce_risk_score(
-            answers.get(f"match_quality_{bee}"), default=MATCH_SCORE_DEFAULT
+        # 匹配度 0-10。用专用归一器（不是 coerce_risk_score，见其 docstring 的
+        # "none"→1.0 陷阱）：缺答/非法/布尔一律回落中性 5.0，不奖不罚。
+        match_score = _match_score_or(
+            answers.get(f"match_quality_{bee}"), MATCH_SCORE_DEFAULT
         )
         if action == "accept":
             if not safe:
@@ -1179,6 +1260,9 @@ class SwarmOrchestrator:
                     })
 
                 retry_bees = [bee for bee in bees if checks[bee]["action"] == "retry"]
+                # 只有真的发生重试时才会被赋值；先置 None，供阶段末尾的 stage_quality
+                # 无条件读取（无重试时直接用首轮 checks）。
+                retry_checks: dict[str, dict[str, Any]] | None = None
                 for bee in bees:
                     action = checks[bee]["action"]
                     if action in {"need_context", "pause", "escalate"}:
@@ -1260,6 +1344,18 @@ class SwarmOrchestrator:
                             raise SwarmGateError(terminal_action, bee)
 
                 next_stage = stages[stage_index + 1] if stage_index + 1 < len(stages) else None
+                # 本阶段每只蜂的最终质量（重试过的用 retry_checks 覆盖首轮 checks）。
+                # 这是「经验好坏」的落点：good 值得下游学，poor 要传给下游避坑。
+                stage_quality: dict[str, dict[str, Any]] = {}
+                for bee in bees:
+                    chk = (retry_checks.get(bee) if retry_checks and bee in retry_checks
+                           else checks.get(bee)) or {}
+                    stage_quality[bee] = {
+                        "match_score": chk.get("match_score", MATCH_SCORE_DEFAULT),
+                        "lesson_tier": chk.get("lesson_tier", "neutral"),
+                        "action": chk.get("action", "accept"),
+                        "summary": _result_summary(stage_results.get(bee)),
+                    }
                 inputs_by_bee: dict[str, list[dict[str, Any]]] = {
                     str(bee): [] for bee in (next_stage or {}).get("bees", ())
                 }
@@ -1362,6 +1458,20 @@ class SwarmOrchestrator:
                                 })
                                 return
                             raise ValueError(f"unsupported handoff acknowledgement: {ack_status or '<empty>'}")
+                # 经验传递：把上一阶段每只蜂的「好经验/差经验」注入下游蜂的输入。
+                # 这不是 capsule 交接（capsule 有确定性哈希约束，不能改字段），而是
+                # 附加一条 lesson 记录——它经 _base_messages 的 input_capsules 一起进
+                # 下游蜂的 prompt。好经验让下游学习复用，差经验让下游避开同样的坑。
+                if next_stage is not None and stage_quality:
+                    lessons = _build_lessons(stage_quality)
+                    if lessons:
+                        for to_bee in inputs_by_bee:
+                            inputs_by_bee[to_bee].append(copy.deepcopy(lessons))
+                        yield emit("swarm.lessons", {
+                            "stage": stage["id"],
+                            "next_stage": next_stage["id"],
+                            "lessons": _json_safe(lessons),
+                        })
                 stage_inputs = inputs_by_bee
 
             if cancel_event.is_set():
