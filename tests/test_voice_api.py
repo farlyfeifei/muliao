@@ -719,10 +719,17 @@ class VoiceServiceSafetyTests(unittest.TestCase):
             speak=True,
             enable_asr=True,
         )
-        validate.assert_called_once_with(
+        # sensevoice 必需（单独校验并 raise_for_errors）；streaming_zipformer 只服务
+        # 实时字幕展示，作为可选能力单独校验一次，缺失不应阻断开麦。
+        validate.assert_any_call(
             load_inventory.return_value,
-            model_names=("sensevoice", "streaming_zipformer"),
+            model_names=("sensevoice",),
         )
+        validate.assert_any_call(
+            load_inventory.return_value,
+            model_names=("streaming_zipformer",),
+        )
+        self.assertEqual(validate.call_count, 2)
         report.raise_for_errors.assert_called_once_with()
         self.assertIs(warm.call_args.kwargs["recognizer_factory"](Path("unused")), recognizer_backend)
         bridge_cls.assert_called_once_with(streaming_recognizer, engine.wake, events, guard)

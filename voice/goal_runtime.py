@@ -69,9 +69,14 @@ def make_goal_ask(
 
 # Orchestrator status -> VoiceResult status. Anything unmapped falls through to
 # a rejected/failed VoiceResult carrying the original status as detail.
+#
+# ``dry_run`` is deliberately NOT mapped to ``executed``: a planned-but-untouched
+# desktop step is a simulation, not a committed side effect, so it surfaces as the
+# distinct ``simulated`` status. Reporting it as ``executed`` was a vanity point —
+# it made an act=False GOAL look like it really controlled the machine.
 _STATUS_MAP = {
     "completed": "executed",
-    "dry_run": "executed",
+    "dry_run": "simulated",
     "rejected": "rejected",
     "cancelled": "cancelled",
     "permission_denied": "permission_denied",
@@ -145,6 +150,9 @@ class GoalEngineAdapter:
     permission: Any
     speaker: Any = None
     events: Any = None
+    # When True the orchestrator runs the desktop GOAL loop with act=True, so a
+    # real step touches the machine. Defaults to False: the safe, dry-run path.
+    goal_act: bool = False
 
     # -- engine interface -------------------------------------------------
 
@@ -208,7 +216,7 @@ class GoalEngineAdapter:
         if not text:
             return VoiceResult(status="wake_miss")
         try:
-            result = self.orchestrator.process(text)
+            result = self.orchestrator.process(text, act=self.goal_act)
         except VoiceCancelled:
             return VoiceResult(status="cancelled", command=text)
         if not isinstance(result, OrchestratorResult):

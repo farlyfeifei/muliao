@@ -82,6 +82,16 @@ class VoiceSettings:
     vits_tts_enabled: bool = False
     jev_cache_enabled: bool = True
     jev_cache_seconds: float = 300.0
+    # Desktop GOAL real execution is OFF by default. Even with act=True the GOAL
+    # channel stays dry-run unless this explicit opt-in is set, so a multi-step
+    # desktop task never touches the machine without the user turning it on.
+    voice_goal_act_enabled: bool = False
+    # WEB-GOAL 浏览器通道：默认关（安全优先），显式开启才用真实 Chrome/Edge。
+    web_goal_enabled: bool = False
+    web_backend: str = "fake"          # "fake"=内存假后端 | "chrome"=真实 CDP
+    web_browser_path: str = ""         # 留空则自动探测 Edge/Chrome
+    web_headless: bool = True
+    web_nav_timeout_seconds: float = 20.0
 
     @classmethod
     def load(cls) -> "VoiceSettings":
@@ -125,6 +135,14 @@ class VoiceSettings:
             vits_tts_enabled=_bool_setting("MULIAO_VOICE_VITS_TTS_ENABLED", False),
             jev_cache_enabled=_bool_setting("MULIAO_JEV_CACHE_ENABLED", True),
             jev_cache_seconds=_non_negative_float_setting("MULIAO_JEV_CACHE_SECONDS", 300.0),
+            voice_goal_act_enabled=_bool_setting("MULIAO_VOICE_GOAL_ACT_ENABLED", False),
+            web_goal_enabled=_bool_setting("MULIAO_VOICE_WEB_GOAL_ENABLED", False),
+            web_backend=_setting("MULIAO_VOICE_WEB_BACKEND", "fake").strip().lower(),
+            web_browser_path=_setting("MULIAO_VOICE_WEB_BROWSER_PATH", "").strip(),
+            web_headless=_bool_setting("MULIAO_VOICE_WEB_HEADLESS", True),
+            web_nav_timeout_seconds=_non_negative_float_setting(
+                "MULIAO_VOICE_WEB_NAV_TIMEOUT", 20.0
+            ),
             sample_rate=_int_setting("MULIAO_VOICE_SAMPLE_RATE", 16_000),
             frame_ms=_int_setting("MULIAO_VOICE_FRAME_MS", 30),
             vad_mode=_int_setting("MULIAO_VOICE_VAD_MODE", 2),

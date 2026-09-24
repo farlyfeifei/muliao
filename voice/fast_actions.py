@@ -23,7 +23,25 @@ MAX_TEXT_LENGTH = 4_096
 MAX_URL_LENGTH = 2_048
 MAX_SEARCH_LENGTH = 1_024
 
-_ALLOWED_APPS = frozenset({"notepad", "browser", "explorer", "settings"})
+_ALLOWED_APPS = frozenset({
+    "notepad",
+    "browser",
+    "explorer",
+    "settings",
+    # Office / document editors — the user's "open Word and type" ask.
+    "word",
+    "excel",
+    "powerpoint",
+    "wps",
+    # Shells and small utilities.
+    "terminal",
+    "cmd",
+    "calc",
+    "paint",
+    # Explicit browsers (the generic "browser" token opens the default one).
+    "chrome",
+    "edge",
+})
 _ALLOWED_VOLUME_DIRECTIONS = frozenset({"up", "down"})
 _ALLOWED_MEDIA_COMMANDS = frozenset({"play_pause", "next", "previous", "stop"})
 _ALLOWED_SHORTCUTS: Mapping[str, tuple[str, ...]] = {
@@ -59,6 +77,59 @@ _APP_ALIASES = {
     "资源管理器": "explorer",
     "settings": "settings",
     "设置": "settings",
+    # Office / document editors.
+    "word": "word",
+    "word.exe": "word",
+    "winword": "word",
+    "winword.exe": "word",
+    "microsoft_word": "word",
+    "microsoftword": "word",
+    "文档": "word",
+    "word文档": "word",
+    "excel": "excel",
+    "excel.exe": "excel",
+    "microsoft_excel": "excel",
+    "microsoftexcel": "excel",
+    "表格": "excel",
+    "电子表格": "excel",
+    "powerpoint": "powerpoint",
+    "powerpoint.exe": "powerpoint",
+    "powerpnt": "powerpoint",
+    "powerpnt.exe": "powerpoint",
+    "microsoft_powerpoint": "powerpoint",
+    "演示文稿": "powerpoint",
+    "ppt": "powerpoint",
+    "幻灯片": "powerpoint",
+    "wps": "wps",
+    "wps.exe": "wps",
+    "wpsoffice": "wps",
+    # Shells and small utilities.
+    "terminal": "terminal",
+    "终端": "terminal",
+    "cmd": "cmd",
+    "cmd.exe": "cmd",
+    "command_prompt": "cmd",
+    "命令行": "cmd",
+    "命令提示符": "cmd",
+    "calc": "calc",
+    "calc.exe": "calc",
+    "calculator": "calc",
+    "计算器": "calc",
+    "paint": "paint",
+    "paint.exe": "paint",
+    "mspaint": "paint",
+    "画图": "paint",
+    "画笔": "paint",
+    # Explicit browsers.
+    "chrome": "chrome",
+    "chrome.exe": "chrome",
+    "google_chrome": "chrome",
+    "谷歌浏览器": "chrome",
+    "edge": "edge",
+    "msedge": "edge",
+    "msedge.exe": "edge",
+    "microsoft_edge": "edge",
+    "微软浏览器": "edge",
 }
 _MEDIA_ALIASES = {
     "play": "play_pause",

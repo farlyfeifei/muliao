@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             "action": result.action.action if result.action else None,
             "action_ok": result.action.ok if result.action else None,
         }, ensure_ascii=False))
-        return 0 if result.status in {"executed", "wake_only", "wake_miss"} else 2
+        return 0 if result.status in {"executed", "simulated", "wake_only", "wake_miss"} else 2
     except Exception as exc:
         print(json.dumps({
             "type": "voice.error",

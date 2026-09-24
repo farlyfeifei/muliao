@@ -2375,6 +2375,81 @@ app.include_router(voice.api.router, prefix="/api/voice")
 register_shutdown_hook(voice.api.shutdown_voice_service)
 
 
+# ---- 语音 → Ghost 蜂群 桥（P2）----
+# 让「言出法随」能把复杂多步任务升级给主线多 Agent 蜂群，复用 /api/swarm/plan 的
+# 同一套 Jev 规划 + 权限快照，安全边界不因「从语音来」而松动。默认只规划不自动执行，
+# 真正派蜂仍走前端确认后的 /api/swarm/run（与主线同一路径）。
+import voice.swarm_bridge  # noqa: E402
+
+
+async def _voice_swarm_plan(goal: str, session_id: str) -> dict:
+    """供 SwarmBridge 注入的异步规划：跑一次真实 Jev 规划，返回规范化 plan。"""
+    permissions_snapshot = _swarm_permission_snapshot()
+    planner_state = json.dumps(
+        {"goal": goal, "session_id": session_id, "permissions_snapshot": permissions_snapshot},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    jev_response = await jev_ask(planner_state, copy.deepcopy(SWARM_PLAN_QUESTIONS))
+    raw_plan = _swarm_service.plan(
+        goal, session_id, permissions_snapshot,
+        lambda _state, _questions: jev_response,
+    )
+    plan = _normalize_swarm_plan(raw_plan, permissions_snapshot, source="voice")
+    run_id = str(plan.get("run_id") or "")
+    with _swarm_plans_lock:
+        if run_id:
+            _swarm_plans[run_id] = copy.deepcopy(plan)
+    _swarm_service._update_run(
+        run_id,
+        status=plan.get("status", "planned"),
+        source=plan.get("source"),
+        recipe=plan.get("recipe"),
+        requires_confirmation=bool(plan.get("requires_confirmation")),
+        confirmation_reasons=copy.deepcopy(plan.get("confirmation_reasons") or []),
+        permission_version=permissions_snapshot["permission_version"],
+    )
+    return {"ok": True, "plan": plan}
+
+
+# auto_run=False：语音只产出蜂群计划（swarm_worthy 判定 + run_id），派蜂仍由用户在前端确认。
+_voice_swarm_bridge = voice.swarm_bridge.SwarmBridge(
+    plan_callable=_voice_swarm_plan, run_callable=None,
+    enabled=True, auto_run=False,
+)
+
+
+@app.post("/api/voice/swarm")
+async def voice_swarm(req: Request):
+    """语音升级蜂群：body {goal, session_id?, force?}。
+
+    需 voice_control 权限。返回是否 swarm_worthy、run_id、recipe，前端据此走确认派蜂。
+    """
+    if not permissions.is_granted("voice_control"):
+        return _json({"ok": False, "err": "voice_control 未授权"}, 403)
+    try:
+        b = await req.json()
+    except Exception:
+        return _json({"ok": False, "err": "请求体不是合法 JSON"}, 400)
+    if not isinstance(b, dict):
+        return _json({"ok": False, "err": "请求体必须是 JSON 对象"}, 400)
+    goal = str(b.get("goal") or "").strip()[:24000]
+    if not goal:
+        return _json({"ok": False, "err": "goal 不能为空"}, 422)
+    session_id = str(b.get("session_id") or "voice").strip()[:200]
+    force = bool(b.get("force"))
+    result = await _voice_swarm_bridge.submit_async(goal, session_id=session_id, force=force)
+    return _json({
+        "ok": result.ok,
+        "escalated": result.escalated,
+        "swarm_worthy": result.swarm_worthy,
+        "run_id": result.run_id,
+        "recipe": result.recipe,
+        "requires_confirmation": result.requires_confirmation,
+        "status": result.status,
+        "detail": result.detail,
+    })
+
+
 # ---- 静态前端（必须最后挂载，/api/* 路由优先匹配）----
 app.mount("/", StaticFiles(directory=os.path.join(HERE, "static"), html=True), name="static")
 

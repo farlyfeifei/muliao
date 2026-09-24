@@ -16,6 +16,7 @@ from .events import JsonLineEventSink
 from .fast_actions import DryRunFastAdapter, FastActionExecutor, WindowsFastAdapter
 from .jev_cache import JevResponseCache
 from .jev_router import JevFastRouter, JevM0Router
+from .machine_adapter import MachineControlActionExecutor, MachineControlFastAdapter
 from .permission_gate import ExistingVoicePermission
 from .safety import EchoAwareSpeaker, EchoGuard
 from .tts_local import FallbackSpeaker, NullSpeaker, SapiSpeaker
@@ -151,7 +152,7 @@ def build_runtime(
         else base_speaker
     )
 
-    adapter = WindowsFastAdapter() if act else DryRunFastAdapter()
+    adapter = MachineControlFastAdapter() if act else DryRunFastAdapter()
     recognizer = _build_recognizer(settings, enable_asr=enable_asr)
     permission = ExistingVoicePermission()
     events = JsonLineEventSink()
@@ -167,6 +168,7 @@ def build_runtime(
             echo_guard=echo_guard,
             act=act,
             jev_cache=jev_cache,
+            fast_adapter=adapter,
         )
         return engine, VoiceRuntimeResources(
             router=router,
@@ -236,14 +238,22 @@ def _build_goal_engine(
     echo_guard: EchoGuard | None,
     act: bool,
     jev_cache: JevResponseCache | None = None,
+    fast_adapter: Any = None,
 ):
     """Wire the FAST/DESKTOP-GOAL orchestrator behind the engine interface.
 
     Returns ``(engine, goal_client)`` where ``goal_client`` is the shared httpx
-    client owned by the runtime resources so it is closed exactly once. The
-    desktop GOAL action executor stays dry-run unless ``act`` is set; there is
-    no real Windows UIA/OCR actuator yet (that is a later milestone), so an
-    ``act=True`` desktop GOAL still plans through the dry-run executor.
+    client owned by the runtime resources so it is closed exactly once.
+
+    The desktop GOAL executor stays dry-run unless BOTH ``act`` is set AND the
+    explicit ``voice_goal_act_enabled`` opt-in is on. That double gate keeps a
+    multi-step desktop task from ever touching the machine by accident: a real
+    runtime (``act=True``) alone is not enough, because the GOAL loop drives
+    arbitrary controls. When both are set, the loop runs a real
+    :class:`~voice.machine_adapter.MachineControlActionExecutor` (pywinauto via
+    the mainline ``machine_control``) instead of the dry-run recorder. The FAST
+    channel uses the caller-supplied ``fast_adapter`` (real machine adapter when
+    ``act=True``, dry-run otherwise).
     """
 
     import httpx
@@ -252,6 +262,8 @@ def _build_goal_engine(
     from .goal_router import JevGoalChooser
     from .goal_runtime import GoalEngineAdapter, make_goal_ask
     from .orchestrator import VoiceOrchestrator
+
+    goal_act = bool(act) and bool(getattr(settings, "voice_goal_act_enabled", False))
 
     # One direct, certificate-validated client shared by the chooser transport;
     # trust_env=False mirrors the FAST router's proxy workaround.
@@ -266,16 +278,19 @@ def _build_goal_engine(
         api_key=settings.jev_key,
         model=settings.jev_model,
     )
+    goal_action = MachineControlActionExecutor() if goal_act else DryRunActionExecutor()
     goal_loop = GoalLoop(
         perception=None,
         chooser=chooser,
-        action=DryRunActionExecutor(),
-        dry_run=not act,
+        action=goal_action,
+        dry_run=not goal_act,
     )
     orchestrator = VoiceOrchestrator(
         goal_loop=goal_loop,
         router=router,
-        executor=FastActionExecutor(DryRunFastAdapter() if not act else WindowsFastAdapter()),
+        executor=FastActionExecutor(
+            fast_adapter if fast_adapter is not None else (DryRunFastAdapter() if not act else MachineControlFastAdapter())
+        ),
         permission=permission,
     )
     engine = GoalEngineAdapter(
@@ -284,6 +299,7 @@ def _build_goal_engine(
         permission=permission,
         speaker=speaker,
         events=events,
+        goal_act=goal_act,
     )
     engine.echo_guard = echo_guard
     return engine, goal_client

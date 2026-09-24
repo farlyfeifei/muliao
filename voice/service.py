@@ -946,7 +946,11 @@ def _default_runtime_factory(*, events: VoiceEventHub, dry_run: bool = False) ->
     )
     report = validate_model_assets(
         inventory,
-        model_names=("sensevoice", "streaming_zipformer"),
+        # sensevoice 是命令识别的唯一依据，必须齐备。
+        # streaming_zipformer 只服务「实时字幕」展示（asr_streaming 自述
+        # presentation-only，命令执行一律用 sensevoice 的 final transcript），
+        # 故它缺失不应阻止开麦——下面按可用性决定是否装字幕组件。
+        model_names=("sensevoice",),
     )
     report.raise_for_errors()
 
@@ -978,46 +982,63 @@ def _default_runtime_factory(*, events: VoiceEventHub, dry_run: bool = False) ->
             {"name": "sensevoice_warmup_ms", "value": round(warmup.total_seconds * 1000, 3)},
         )
 
-        streaming = inventory.require("streaming_zipformer")
-        files = {asset.name: asset.path for asset in streaming.files}
-        streaming_recognizer = StreamingZipformerRecognizer(
-            tokens=files["tokens.txt"],
-            encoder=files["encoder-epoch-99-avg-1.onnx"],
-            decoder=files["decoder-epoch-99-avg-1.onnx"],
-            joiner=files["joiner-epoch-99-avg-1.onnx"],
+        streaming_report = validate_model_assets(
+            inventory, model_names=("streaming_zipformer",)
         )
-        streaming_started = time.perf_counter()
-        streaming_recognizer.warmup()
-        events.emit(
-            "voice.metric",
-            {
-                "name": "streaming_zipformer_warmup_ms",
-                "value": round((time.perf_counter() - streaming_started) * 1000, 3),
-            },
-        )
-        bridge = StreamingCaptionBridge(
-            streaming_recognizer,
-            engine.wake,
-            events,
-            resources.echo_guard,
-        )
-        caption_pump = AsyncCaptionPump(bridge)
-
-        def accept_caption_frame(frame: bytes) -> None:
-            caption_pump.accept_pcm(
-                frame,
-                sample_rate=settings.sample_rate,
-                channels=1,
-                sample_width=2,
+        streaming_available = streaming_report.ok
+        if streaming_available:
+            streaming = inventory.require("streaming_zipformer")
+            files = {asset.name: asset.path for asset in streaming.files}
+            streaming_recognizer = StreamingZipformerRecognizer(
+                tokens=files["tokens.txt"],
+                encoder=files["encoder-epoch-99-avg-1.onnx"],
+                decoder=files["decoder-epoch-99-avg-1.onnx"],
+                joiner=files["joiner-epoch-99-avg-1.onnx"],
+            )
+            streaming_started = time.perf_counter()
+            streaming_recognizer.warmup()
+            events.emit(
+                "voice.metric",
+                {
+                    "name": "streaming_zipformer_warmup_ms",
+                    "value": round((time.perf_counter() - streaming_started) * 1000, 3),
+                },
+            )
+            bridge = StreamingCaptionBridge(
+                streaming_recognizer,
+                engine.wake,
+                events,
+                resources.echo_guard,
+            )
+            caption_pump = AsyncCaptionPump(bridge)
+        else:
+            # 实时字幕是可选的展示能力；缺 streaming 模型时跳过，不影响开麦与命令执行。
+            events.emit(
+                "voice.metric",
+                {
+                    "name": "streaming_zipformer_unavailable",
+                    "value": 1,
+                },
             )
 
-        raw_capture = build_capture(
-            settings,
-            echo_guard=resources.echo_guard,
-            frame_consumer=accept_caption_frame,
-            frame_resetter=caption_pump.reset,
-        )
-        capture = _CaptionedCapture(raw_capture, caption_pump, events)
+        if caption_pump is not None:
+            def accept_caption_frame(frame: bytes) -> None:
+                caption_pump.accept_pcm(
+                    frame,
+                    sample_rate=settings.sample_rate,
+                    channels=1,
+                    sample_width=2,
+                )
+
+            raw_capture = build_capture(
+                settings,
+                echo_guard=resources.echo_guard,
+                frame_consumer=accept_caption_frame,
+                frame_resetter=caption_pump.reset,
+            )
+            capture = _CaptionedCapture(raw_capture, caption_pump, events)
+        else:
+            capture = build_capture(settings, echo_guard=resources.echo_guard)
         return VoiceRuntime(
             engine=engine,
             capture=capture,

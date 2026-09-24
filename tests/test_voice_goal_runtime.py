@@ -90,10 +90,12 @@ class StatusMappingTests(unittest.TestCase):
         self.assertIs(result.action, action)
         self.assertIs(result.decision, decision)
 
-    def test_goal_dry_run_maps_to_executed_desktop_channel(self):
+    def test_goal_dry_run_maps_to_simulated_desktop_channel(self):
+        # dry_run 是「规划了但没碰机器」，必须如实报 simulated，绝不谎报 executed
+        # （旧实现把 dry_run 映射成 executed 是虚荣点，已修正）。
         engine, _ = adapter(OrchestratorResult("dry_run", GOAL, "点保存"))
         result = engine.process_transcript("幕僚幕僚，点保存")
-        self.assertEqual(result.status, "executed")
+        self.assertEqual(result.status, "simulated")
         self.assertIn("[desktop]", result.detail)
 
     def test_rejected_and_permission_denied_pass_through(self):
