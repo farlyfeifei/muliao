@@ -31,6 +31,7 @@ from swarm_planner import (
     RECIPE_STAGES,
     ROLE_POOL,
     SWARM_PLAN_QUESTIONS,
+    coerce_risk_score,
     deterministic_fallback,
     evaluate_user_gate,
     materialize_plan,
@@ -45,6 +46,28 @@ _RECIPE_STAGES = RECIPE_STAGES
 
 _ALLOWED_CORRECTIONS = {"accept", "retry", "need_context", "pause", "escalate"}
 _STREAM_EVENT_TYPES = {"bee.reasoning", "bee.delta", "bee.tool_call", "bee.tool_result"}
+
+# 匹配度评分：Jev 缺答时的中性回落值（不奖不罚）。
+MATCH_SCORE_DEFAULT = 5.0
+# 经验分档阈值：把 0-10 的匹配度翻译成「这只蜂的经验该怎么传给下游」。
+#   good    —— 高分经验，值得下游蜂学习/复用其做法
+#   neutral —— 平庸，作为普通上下文传递
+#   poor    —— 低分经验，要传给下游蜂**避免**重蹈覆辙
+_MATCH_GOOD_THRESHOLD = 6.5
+_MATCH_POOR_THRESHOLD = 4.0
+
+
+def match_tier(score: float) -> str:
+    """把匹配度分数翻成经验档位：good / neutral / poor。"""
+    try:
+        v = float(score)
+    except (TypeError, ValueError):
+        return "neutral"
+    if v >= _MATCH_GOOD_THRESHOLD:
+        return "good"
+    if v <= _MATCH_POOR_THRESHOLD:
+        return "poor"
+    return "neutral"
 
 BeeRunner = Callable[[str, dict[str, Any]], Awaitable[Any] | AsyncIterator[Any]]
 JevChecker = Callable[[str, dict[str, Any]], Awaitable[Mapping[str, Any]]]
@@ -502,6 +525,25 @@ def _stage_questions(bees: Sequence[str]) -> dict[str, dict[str, Any]]:
             "type": "noul",
             "instructions": f"Did {bee} expose an unresolved conflict?",
         }
+        # 匹配度评分：这只蜂的产出与最终目标的吻合程度（0-10）。
+        # 这是「经验好坏」的量化依据——高分经验值得传给下游蜂学习，低分经验要传下去
+        # 让下游避开同样的坑。只有布尔判断无法表达「好到什么程度」。
+        questions[f"match_quality_{bee}"] = {
+            "type": "score",
+            "instructions": (
+                f"How well does {bee}'s output match what the overall goal actually "
+                "requires? Judge usefulness of its evidence and conclusions, not effort."
+            ),
+            "criteria": [
+                "0 off-topic or wrong; contributes nothing usable",
+                "2 mostly irrelevant, contradicts the goal",
+                "4 weak or unsupported; needs redo",
+                "5 acceptable but shallow; usable with caveats",
+                "6 solid and on-target; minor gaps",
+                "8 strong, well-evidenced, directly advances the goal",
+                "10 exemplary; worth passing on as a good example",
+            ],
+        }
         questions[f"correction_action_{bee}"] = {
             "type": "choice",
             "instructions": f"Choose the bounded correction action for {bee}.",
@@ -535,6 +577,11 @@ def _stage_actions(response: Mapping[str, Any], bees: Sequence[str]) -> dict[str
         evidence_sufficient = _as_bool(answers.get(f"evidence_sufficient_{bee}", True))
         safe = _as_bool(answers.get(f"safe_to_continue_{bee}", True))
         conflict = _as_bool(answers.get(f"conflict_present_{bee}", False))
+        # 匹配度 0-10。用 coerce_risk_score 做夹逼（它就是通用的 0-10 归一器）：
+        # 缺答或答成布尔时回落到中性 5.0，不会把 True 误当成 1 分。
+        match_score = coerce_risk_score(
+            answers.get(f"match_quality_{bee}"), default=MATCH_SCORE_DEFAULT
+        )
         if action == "accept":
             if not safe:
                 action = "pause"
@@ -548,6 +595,9 @@ def _stage_actions(response: Mapping[str, Any], bees: Sequence[str]) -> dict[str
             "evidence_sufficient": evidence_sufficient,
             "safe_to_continue": safe,
             "conflict_present": conflict,
+            "match_score": match_score,
+            # 经验档位：直接决定这只蜂的产出该怎么传给下游蜂。
+            "lesson_tier": match_tier(match_score),
             "confidence": _answer_confidence(raw_action),
         }
     return checks

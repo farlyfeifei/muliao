@@ -163,6 +163,53 @@ TOOL_DEFS: dict[str, dict] = {
             },
         },
     },
+    "trace_agent_notification": {
+        "scope": "notifications",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "trace_agent_notification",
+                "description": (
+                    "把一条 Agent 通知溯源到它来自哪个 Agent、哪个会话、哪个项目文件夹。"
+                    "返回最匹配的会话（含 cwd 真实路径、git 分支、置信度）与候选项。"
+                    "当用户说「某个 Agent 报错/完成了」而你需要知道是哪个项目时调用。"
+                    "注意：置信度 confident=False 时必须先问用户确认，不要据此改文件。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "返回通知条数，默认 6", "default": 6},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    },
+    "read_agent_session": {
+        "scope": "ai_logs",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "read_agent_session",
+                "description": (
+                    "读取某个 Agent 会话的**完整上下文**：最初的用户指令、每步工具调用、"
+                    "工具返回的证据、最终结论。用于判断这个 Agent 有没有跑偏、干得对不对——"
+                    "只看它的结论是判断不了的，必须看它实际做了什么。"
+                    "session_id 用 trace_agent_notification 或 list_agent_sessions 拿到。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string", "description": "会话 ID"},
+                        "max_events": {"type": "integer", "description": "最多返回事件数，默认 60", "default": 60},
+                        "include_thinking": {"type": "boolean", "description": "是否包含思考流，默认否", "default": False},
+                        "tail": {"type": "boolean", "description": "true=取最近进展（默认），false=取最初指令", "default": True},
+                    },
+                    "required": ["session_id"],
+                },
+            },
+        },
+    },
     # ---- 读取文件内容（scope=file_content，独立能力，默认关、不随全选打开）----
     # 内容会进入上游模型上下文，敏感度远高于元数据，故单列一个能力。
     "list_folder": {
@@ -755,6 +802,80 @@ def execute_tool(name: str, args: dict | None) -> str:
                 ],
                 "note": "cwd 是该项目文件夹的绝对路径；要改这个项目的文件，直接用它，不要猜。",
             })
+
+        if name == "trace_agent_notification":
+            d = collectors.agent_provenance(limit=min(limit or 6, 20))
+            items = d.get("items") or []
+            out = []
+            for it in items:
+                m = it.get("match") or {}
+                out.append({
+                    "app": it.get("app_name"),
+                    "title": it.get("title"),
+                    "is_agent": bool(it.get("is_agent")),
+                    "agent_tool": it.get("agent_tool"),
+                    "project": m.get("project"),
+                    "cwd": m.get("cwd"),
+                    "session_id": m.get("session_id"),
+                    "git_branch": m.get("git_branch"),
+                    "score": m.get("score"),
+                    "confident": m.get("confident"),
+                    "reasons": m.get("reasons"),
+                    "note": it.get("reason"),
+                })
+            return finish({
+                "count": len(out),
+                "sessions_scanned": d.get("sessions_scanned"),
+                "items": out,
+                "note": d.get("note") or "",
+            })
+
+        if name == "read_agent_session":
+            sid = _as_text(args.get("session_id"))
+            if not sid:
+                return finish({"error": "invalid_args",
+                               "hint": "session_id 不能为空；先用 list_agent_sessions 或 "
+                                       "trace_agent_notification 拿到它。"})
+            d = collectors.ai_session_detail(
+                sid,
+                max_events=min(int(args.get("max_events") or 60), 200),
+                include_thinking=bool(args.get("include_thinking")),
+                tail=bool(args.get("tail", True)),
+            )
+            if not d.get("found"):
+                return finish({"error": "session_not_found",
+                               "session_id": sid,
+                               "hint": d.get("note") or "未找到该会话日志"})
+            # 给模型的视图：压缩成可读的时间线，而不是原始事件 JSON（太占上下文）。
+            timeline = []
+            for ev in d.get("events") or []:
+                k = ev.get("kind")
+                if k == "tool_use":
+                    timeline.append(f"[调用工具] {ev.get('tool')} 入参={str(ev.get('input'))[:200]}")
+                elif k == "tool_result":
+                    flag = "（报错）" if ev.get("is_error") else ""
+                    timeline.append(f"[工具结果]{flag} {str(ev.get('result'))[:260]}")
+                elif k == "thinking":
+                    timeline.append(f"[思考] {str(ev.get('text'))[:160]}")
+                elif k in ("user", "assistant"):
+                    who = "用户" if k == "user" else "Agent"
+                    timeline.append(f"[{who}] {str(ev.get('text'))[:300]}")
+            return finish({
+                "session_id": d.get("session_id"),
+                "tool": d.get("tool"),
+                "project": d.get("project"),
+                "cwd": d.get("cwd"),
+                "git_branch": d.get("git_branch"),
+                "first_user_message": d.get("first_user_message"),
+                "stats": d.get("stats"),
+                "tools_used": d.get("tools_used"),
+                "total_events": d.get("total_events"),
+                "window": d.get("window"),
+                "truncated": d.get("truncated"),
+                "timeline": timeline,
+                "note": "first_user_message 是该 Agent 最初接到的指令，timeline 是它实际做了什么。"
+                        "判断跑偏要拿两者对比；tail=false 可取最初的指令段。",
+            }, chars=8000)
 
         # ---- 读取文件内容（scope=file_content）----
         if name in ("list_folder", "read_file"):

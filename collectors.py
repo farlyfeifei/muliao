@@ -15,6 +15,7 @@ r"""本机采集层 · 权限确认后才真正生效
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -22,7 +23,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import notifier          # 复用已验证的通知抓取
 import permissions       # 权限闸门
@@ -397,6 +398,190 @@ def ai_sessions(limit: int = 30, max_files: int = 200) -> dict:
                             if os.path.isdir(os.path.join(home, r))]}
 
 
+# ============ 通知 → Agent 会话 溯源 ============
+# 为什么需要推断：Windows toast 通知只带 app_name/title/body/ts，**不带 session_id
+# 或项目路径**（实测 Claude/Codex/ZCode 的通知 launch 字段均为空）。所以「这条通知
+# 是哪个 Agent、哪个对话发出的」只能靠三个信号加权推断：
+#   ① 应用归属（app_name → 工具）
+#   ② 时间邻近（通知发出前最近活跃的那个会话）
+#   ③ 正文重叠（通知文本与会话消息/项目名的词面重合度）
+# 推断结果带 confidence 与 reason，让上层能判断该不该信。
+
+# 通知应用名（小写子串）→ _AI_LOG_DIRS 里的工具名。
+# 一个工具可能对应多个应用名（桌面版/CLI/第三方壳）。
+_AGENT_APP_HINTS: tuple[tuple[str, str], ...] = (
+    ("claude", "claude"),
+    ("codex", "codex"),
+    ("openai.codex", "codex"),
+    ("zcode", "zcode"),
+    ("cursor", "cursor"),
+    ("windsurf", "windsurf"),
+    ("gemini", "gemini"),
+    ("copilot", "copilot"),
+    ("aider", "aider"),
+)
+
+# 参与重叠度计算的停用词（中英文），避免「的/了/请/帮我」这类高频词虚增分数。
+_PROVENANCE_STOPWORDS = frozenset({
+    "的", "了", "是", "在", "和", "与", "请", "帮", "我", "你", "这", "那", "有", "就",
+    "都", "也", "还", "要", "会", "可以", "一个", "什么", "怎么", "现在", "已经",
+    "the", "a", "an", "is", "are", "was", "to", "of", "in", "and", "or", "for",
+    "on", "with", "this", "that", "it", "as", "at", "by", "be",
+})
+
+
+def _agent_tool_for_app(app_name: str, app_id: str) -> str | None:
+    """把通知的应用标识映射到日志工具名；不认识则返回 None。"""
+    blob = f"{app_name} {app_id}".lower()
+    for hint, tool in _AGENT_APP_HINTS:
+        if hint in blob:
+            return tool
+    return None
+
+
+def _tokenize(text: str, limit: int = 80) -> set[str]:
+    """粗分词：中文按 2-gram，英文按单词，去停用词。够做重叠度打分即可。"""
+    raw = re.sub(r"[^\w一-鿿]+", " ", str(text or "").lower())
+    tokens: set[str] = set()
+    for word in raw.split():
+        if word in _PROVENANCE_STOPWORDS or len(word) < 2:
+            continue
+        if re.match(r"^[a-z0-9_]+$", word):
+            tokens.add(word)
+        else:  # 含中文：取 2-gram，比单字更有区分度
+            for i in range(len(word) - 1):
+                gram = word[i:i + 2]
+                if gram not in _PROVENANCE_STOPWORDS:
+                    tokens.add(gram)
+        if len(tokens) >= limit:
+            break
+    return tokens
+
+
+def _overlap(a: set[str], b: set[str]) -> float:
+    """两个词集的重叠度：交并比，落在 0..1。"""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / len(a | b) if inter else 0.0
+
+
+def _session_corpus(session: Mapping[str, Any]) -> str:
+    """把一个会话里可用于匹配的文本拼起来（项目名 + 分支 + 首条用户消息）。
+
+    注意：这里只用 ai_sessions 已经加载的摘要字段，不重新读日志文件，
+    所以溯源的开销与 ai_sessions 同量级。
+    """
+    return " ".join(str(session.get(k) or "") for k in
+                    ("project", "cwd", "git_branch", "first_user_message"))
+
+
+def agent_provenance(limit: int = 8, window_seconds: float = 7200.0,
+                     max_sessions: int = 60) -> dict:
+    """把最近的 Agent 通知关联到最可能的 Agent 会话（含真实项目路径）。
+
+    返回每条通知的候选会话与置信度。这是「幕僚读到一条 Agent 通知后，定位到是哪个
+    Agent、哪个对话、哪个文件夹」的关键一步——定位到 cwd 之后才能去读那个项目的
+    文件、或把纠正指令发回那个 Agent，而不必猜路径。
+
+    只读，不碰任何写操作；需要 notifications + ai_logs 两个 scope。
+    """
+    if not permissions.is_granted("notifications"):
+        return {"granted": False, "items": [], "count": 0,
+                "note": "未授权通知访问"}
+    if not permissions.is_granted("ai_logs"):
+        return {"granted": False, "items": [], "count": 0,
+                "note": "未授权 AI 日志访问（溯源需要它来定位会话）"}
+
+    notes = notifications(limit=max(limit * 3, 24)).get("items") or []
+    sessions_doc = ai_sessions(limit=max_sessions, max_files=240)
+    sessions = sessions_doc.get("items") or []
+
+    out: list[dict] = []
+    for n in notes:
+        app_name = str(n.get("app_name") or "")
+        app_id = str(n.get("app") or "")
+        tool = _agent_tool_for_app(app_name, app_id)
+        title = str(n.get("title") or "")
+        body = str(n.get("body") or "")
+        ts = float(n.get("ts") or 0.0)
+        entry: dict[str, Any] = {
+            "notification_id": n.get("id"),
+            "app_name": app_name or app_id,
+            "title": title[:120],
+            "body": body[:300],
+            "ts": ts,
+            "agent_tool": tool,
+            "is_agent": bool(tool),
+            "launch": str(n.get("launch") or "")[:120],
+            "match": None,
+        }
+        if not tool:
+            # 非 Agent 应用（微信/邮件/系统安全等）：不参与溯源，但要如实说明。
+            entry["reason"] = "非 AI Agent 应用，无需溯源"
+            out.append(entry)
+            continue
+        if not sessions:
+            entry["reason"] = "本机没有可用的 Agent 会话日志"
+            out.append(entry)
+            continue
+
+        n_tokens = _tokenize(f"{title} {body}")
+        candidates = [s for s in sessions if str(s.get("tool") or "") == tool] or sessions
+        scored: list[tuple[float, dict, list[str]]] = []
+        for s in candidates:
+            last = float(s.get("last_activity") or 0.0)
+            # 时间邻近度：通知通常在会话活跃期间或刚结束时发出。
+            # 取「通知前 window 内」的会话；晚于通知的会话只轻微惩罚（时钟漂移）。
+            delta = ts - last
+            if delta >= 0:
+                recency = max(0.0, 1.0 - min(delta, window_seconds) / window_seconds)
+            else:
+                recency = max(0.0, 0.35 + 0.65 * (delta / 300.0))
+            overlap = _overlap(n_tokens, _tokenize(_session_corpus(s)))
+            score = round(0.55 * recency + 0.45 * overlap, 4)
+            reasons: list[str] = []
+            if recency > 0:
+                reasons.append(f"时间邻近(约{abs(int(delta))}秒前活跃)")
+            if overlap > 0:
+                reasons.append(f"正文与该项目文本重叠{overlap:.2f}")
+            scored.append((score, s, reasons))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best, best_reasons = scored[0]
+        # 阈值：低于此分只给候选、不下结论，避免误导模型去改错的项目。
+        confident = best_score >= 0.28
+        entry["match"] = {
+            "session_id": best.get("session_id"),
+            "tool": best.get("tool"),
+            "project": best.get("project"),
+            "cwd": best.get("cwd"),
+            "cwd_exists": best.get("cwd_exists"),
+            "git_branch": best.get("git_branch"),
+            "log_file": best.get("log_file"),
+            "score": best_score,
+            "confident": confident,
+            "reasons": best_reasons or ["仅按工具归属与最近活跃推断"],
+            "alternatives": [
+                {"project": s.get("project"), "cwd": s.get("cwd"),
+                 "session_id": s.get("session_id"), "score": sc}
+                for sc, s, _ in scored[1:4]
+            ],
+        }
+        if not confident:
+            entry["reason"] = ("置信度不足：通知正文与会话内容重合度低，"
+                               "请让用户确认是哪个项目，不要据此改动文件")
+        out.append(entry)
+
+    # 只保留 Agent 通知在前，便于模型优先处理
+    out.sort(key=lambda e: (not e.get("is_agent"), -(e.get("ts") or 0)))
+    return {"granted": True, "items": out[:limit], "count": len(out[:limit]),
+            "sessions_scanned": len(sessions),
+            "window_seconds": window_seconds,
+            "note": ("match.cwd 是该项目文件夹的绝对路径；confidence 为 False 时必须先"
+                     "向用户确认，不要据此修改文件。")}
+
+
 def json_loads(s: str):
     import json as _json
     return _json.loads(s)
@@ -444,6 +629,245 @@ def _extract_msg(o: dict):
         if t.strip():
             return p.get("role") or "assistant", t.strip()
     return None
+
+
+# ============ 会话级「完整上下文」还原 ============
+# _extract_msg 只取 text 块，会把 Agent 真正做过的事全部丢掉。实测三个真实会话里
+# 有 6614 条 tool_use、6613 条 tool_result、2380 条 thinking，而 text 只有 4474 条——
+# 也就是说「它调了什么工具、工具返回了什么证据、它怎么想的」一条都看不到。
+# 判断一个外部 Agent 有没有跑偏，恰恰要看这些证据，而不是只看它的结论性发言。
+# 下面把一条记录展开成有序的「事件」，保留角色、思考、工具调用与工具结果。
+
+# 单个文本片段保留长度：够判断意图与证据，又不至于把整条日志灌进上下文。
+_CTX_TEXT_LIMIT = 1200
+_CTX_TOOL_RESULT_LIMIT = 1500
+
+
+def _clip(text: Any, limit: int) -> str:
+    s = str(text if text is not None else "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"…(截断，原长 {len(s)})"
+
+
+def _flatten_tool_content(value: Any) -> str:
+    """tool_result 的 content 可能是 str，也可能是 [{type:text,...}] 之类的块列表。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        return json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, Mapping):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif item.get("type") == "image":
+                    parts.append("[image omitted]")
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False, default=str)[:400])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(p for p in parts if p)
+    return str(value)
+
+
+def _extract_events(o: dict) -> list[dict]:
+    """把一条 jsonl 记录展开成 0..N 个结构化事件（不丢工具调用与工具结果）。
+
+    事件形状统一为 {kind, role?, text?, tool?, input?, result?, ...}，
+    kind ∈ user / assistant / thinking / tool_use / tool_result / meta。
+    """
+    events: list[dict] = []
+    typ = o.get("type")
+    msg = o.get("message") if isinstance(o.get("message"), Mapping) else {}
+
+    if typ in ("user", "assistant") and msg:
+        role = str(msg.get("role") or typ)
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                events.append({"kind": role, "text": _clip(content, _CTX_TEXT_LIMIT)})
+        elif isinstance(content, (list, tuple)):
+            for block in content:
+                if not isinstance(block, Mapping):
+                    continue
+                btype = str(block.get("type") or "")
+                if btype == "text":
+                    if str(block.get("text") or "").strip():
+                        events.append({"kind": role,
+                                       "text": _clip(block.get("text"), _CTX_TEXT_LIMIT)})
+                elif btype == "thinking":
+                    if str(block.get("thinking") or block.get("text") or "").strip():
+                        events.append({"kind": "thinking", "role": role,
+                                       "text": _clip(block.get("thinking") or block.get("text"),
+                                                     _CTX_TEXT_LIMIT)})
+                elif btype in ("tool_use", "server_tool_use"):
+                    events.append({
+                        "kind": "tool_use", "role": role,
+                        "tool": str(block.get("name") or ""),
+                        "tool_use_id": str(block.get("id") or ""),
+                        "input": _clip(json.dumps(block.get("input"), ensure_ascii=False,
+                                                  default=str) if block.get("input") is not None
+                                       else "", _CTX_TEXT_LIMIT),
+                    })
+                elif btype in ("tool_result", "web_search_tool_result"):
+                    events.append({
+                        "kind": "tool_result",
+                        "tool_use_id": str(block.get("tool_use_id") or ""),
+                        "is_error": bool(block.get("is_error")),
+                        "result": _clip(_flatten_tool_content(block.get("content")),
+                                        _CTX_TOOL_RESULT_LIMIT),
+                    })
+                elif btype == "image":
+                    events.append({"kind": "meta", "text": "[image]"})
+        return events
+
+    # Codex 形态
+    p = o.get("payload") if isinstance(o.get("payload"), Mapping) else {}
+    if typ == "event_msg" and p.get("type") == "user_message" and isinstance(p.get("message"), str):
+        events.append({"kind": "user", "text": _clip(p["message"], _CTX_TEXT_LIMIT)})
+    elif typ == "response_item" and p.get("type") == "message" and isinstance(p.get("content"), list):
+        texts = [str(x.get("text") or "") for x in p["content"] if isinstance(x, Mapping)]
+        joined = "\n".join(t for t in texts if t.strip())
+        if joined.strip():
+            events.append({"kind": str(p.get("role") or "assistant"),
+                           "text": _clip(joined, _CTX_TEXT_LIMIT)})
+    elif typ == "response_item" and p.get("type") in ("function_call", "local_shell_call"):
+        events.append({"kind": "tool_use", "tool": str(p.get("name") or p.get("action") or ""),
+                       "input": _clip(str(p.get("arguments") or ""), _CTX_TEXT_LIMIT)})
+    elif typ == "response_item" and p.get("type") == "function_call_output":
+        events.append({"kind": "tool_result",
+                       "result": _clip(_flatten_tool_content(p.get("output")),
+                                       _CTX_TOOL_RESULT_LIMIT)})
+    elif typ == "response_item" and p.get("type") == "reasoning":
+        summary = p.get("summary") or p.get("content")
+        if summary:
+            events.append({"kind": "thinking",
+                           "text": _clip(_flatten_tool_content(summary), _CTX_TEXT_LIMIT)})
+    return events
+
+
+def _find_session_log(session_id: str, max_files: int = 400) -> tuple[str, str] | None:
+    """按 sessionId 字段（而非文件名）定位日志文件，返回 (tool, path)。
+
+    不能只靠文件名：Claude 的 jsonl 文件名通常就是 sessionId，但 codex 是
+    rollout-<时间>-<uuid> 形态，且子 agent 日志在 subagents/** 下。
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    home = os.path.expanduser("~")
+    # 先试文件名直配（最快路径），再退回逐文件扫 sessionId 字段。
+    for tool, (rel,) in _AI_LOG_DIRS.items():
+        root = os.path.join(home, rel)
+        direct = os.path.join(root, sid + ".jsonl")
+        if os.path.isfile(direct):
+            return tool, direct
+    for tool, (rel,) in _AI_LOG_DIRS.items():
+        root = os.path.join(home, rel)
+        for fp in _walk_jsonl(root, max_files):
+            if sid in os.path.basename(fp):
+                return tool, fp
+            try:
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                    for i, line in enumerate(f):
+                        if i > 40:      # sessionId 一般在前若干条元数据里
+                            break
+                        if sid in line:
+                            return tool, fp
+            except OSError:
+                continue
+    return None
+
+
+def ai_session_detail(session_id: str, *, max_events: int = 400,
+                      include_thinking: bool = False, tail: bool = True) -> dict:
+    """还原一个 Agent 会话的**完整上下文**：用户指令、思考、工具调用与工具结果。
+
+    这是「幕僚帮外部 Agent 纠偏」的数据地基：要判断它有没有跑偏，必须看到它
+    最初接到的指令、它实际调了哪些工具、工具返回了什么证据——只看结论性发言
+    是判断不了的。
+
+    参数：
+      max_events      —— 最多返回多少个事件（防超长会话灌爆上下文）。
+      include_thinking —— 是否包含思考流。默认关：思考量大且多为自言自语，
+                          纠偏判断靠「指令 + 工具证据 + 结论」就够。
+      tail            —— True 取最近的事件（默认，纠偏要看最新进展）；
+                          False 取最早的（要看最初指令时用）。
+    """
+    if not permissions.is_granted("ai_logs"):
+        return {"granted": False, "events": [], "count": 0,
+                "note": "未授权 AI 日志访问"}
+    found = _find_session_log(session_id)
+    if not found:
+        return {"granted": True, "found": False, "events": [], "count": 0,
+                "note": f"未找到 session_id={session_id!r} 的日志"}
+    tool, fp = found
+
+    events: list[dict] = []
+    cwd = ""
+    branch = ""
+    first_user = ""
+    stats = {"user": 0, "assistant": 0, "thinking": 0, "tool_use": 0, "tool_result": 0,
+             "tool_errors": 0}
+    tools_used: list[str] = []
+    try:
+        with open(fp, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json_loads(line)
+                except Exception:
+                    continue
+                if not isinstance(o, Mapping):
+                    continue
+                if not cwd and isinstance(o.get("cwd"), str):
+                    cwd = o["cwd"].strip()
+                if not branch and isinstance(o.get("gitBranch"), str):
+                    branch = o["gitBranch"].strip()
+                for ev in _extract_events(dict(o)):
+                    kind = ev.get("kind")
+                    if kind == "thinking" and not include_thinking:
+                        stats["thinking"] += 1
+                        continue
+                    if kind in stats:
+                        stats[kind] += 1
+                    if kind == "tool_use" and ev.get("tool"):
+                        if ev["tool"] not in tools_used:
+                            tools_used.append(ev["tool"])
+                    if kind == "tool_result" and ev.get("is_error"):
+                        stats["tool_errors"] += 1
+                    if kind == "user" and not first_user:
+                        first_user = str(ev.get("text") or "")[:400]
+                    ev["ts"] = _parse_ts(o.get("timestamp"))
+                    events.append(ev)
+    except OSError as exc:
+        return {"granted": True, "found": True, "events": [], "count": 0,
+                "error": type(exc).__name__}
+
+    total = len(events)
+    selected = events[-max_events:] if (tail and total > max_events) else events[:max_events]
+    return {
+        "granted": True, "found": True,
+        "session_id": session_id, "tool": tool, "log_file": fp,
+        "cwd": cwd, "project": os.path.basename(cwd.rstrip("\\/")) if cwd else "",
+        "git_branch": branch,
+        "first_user_message": first_user,     # 最初指令：判断跑偏的基准
+        "stats": stats,
+        "tools_used": tools_used[:20],
+        "total_events": total,
+        "returned_events": len(selected),
+        "truncated": total > len(selected),
+        "window": "tail" if tail else "head",
+        "events": selected,
+    }
 
 
 # ============ 用户目录文件清单 ============
