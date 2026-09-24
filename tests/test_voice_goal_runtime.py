@@ -252,6 +252,13 @@ class BuildRuntimeGoalModeTests(unittest.TestCase):
 
     def test_goal_mode_unauthorized_command_issues_zero_network(self):
         from voice.runtime import build_runtime
+        import permissions
+
+        # 显式把 voice_control 钉成「未授权」。本测试断言的是「未授权时零网络调用」，
+        # 若沿用真实授权状态，则在任何**曾经开过 voice_control 的机器**上都会假失败
+        # （ExistingVoicePermission 直读 permissions.is_granted）。密封后才可复现。
+        def _deny_voice(scope):
+            return False if scope == "voice_control" else permissions.__dict__["is_granted"](scope)
 
         with mock.patch("voice.runtime.SapiSpeaker"), mock.patch(
             "voice.runtime.SenseVoiceRecognizer"
@@ -260,13 +267,13 @@ class BuildRuntimeGoalModeTests(unittest.TestCase):
                 self.settings(), mode="goal", speak=False, enable_asr=False
             )
         try:
-            # The real ExistingVoicePermission has no voice_control grant in this
-            # isolated test, so a goal command must be denied BEFORE the chooser
-            # transport runs — zero Jev network calls.
-            with mock.patch.object(resources.goal_client, "post") as post:
-                result = engine.process_transcript("幕僚幕僚，把文件保存到桌面")
-            self.assertEqual(result.status, "permission_denied")
-            post.assert_not_called()
+            with mock.patch.object(permissions, "is_granted", side_effect=_deny_voice):
+                # A goal command must be denied BEFORE the chooser transport runs —
+                # zero Jev network calls.
+                with mock.patch.object(resources.goal_client, "post") as post:
+                    result = engine.process_transcript("幕僚幕僚，把文件保存到桌面")
+                self.assertEqual(result.status, "permission_denied")
+                post.assert_not_called()
         finally:
             resources.close()
 
