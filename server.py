@@ -1740,7 +1740,7 @@ class _UpstreamError(Exception):
 
 
 # 上游（OpenAI 兼容）有两种流式形状，都必须吃下：
-#   A) 每个分片都带 index——实测本项目用的 152.53.54.178:8318 就是这种：
+#   A) 每个分片都带 index——本项目早期实测用的中转上游就是这种：
 #      首片带 id+name+index，后续片只带 index+arguments 续传。
 #   B) 不带 index（部分实现 / 中转代理会把它吃掉），只靠「出现新 id」标记新调用开始。
 # 旧代码 `tool_acc[tc.get("index", 0)]` 在形状 B 下把**所有**分片塞进 slot 0：
