@@ -102,7 +102,7 @@ class SwarmServerApiTests(unittest.TestCase):
     def test_confirmed_run_clears_gate_emits_audit_and_completes(self):
         plan = self.plan(high_risk=True)
 
-        async def fake_runtime_run(bee_spec, goal, contract, input_capsules, emit, cancel_event):
+        async def fake_runtime_run(bee_spec, goal, contract, input_capsules, emit, cancel_event, correction=None):
             await emit({
                 "type": "bee.delta",
                 "payload": {"bee_id": bee_spec.bee_id, "text": f"{bee_spec.bee_id}-ok"},
@@ -186,7 +186,7 @@ class SwarmServerApiTests(unittest.TestCase):
         started = threading.Event()
         collected: list[dict] = []
 
-        async def blocking_runtime_run(bee_spec, goal, contract, input_capsules, emit, cancel_event):
+        async def blocking_runtime_run(bee_spec, goal, contract, input_capsules, emit, cancel_event, correction=None):
             started.set()
             while not cancel_event.is_set():
                 await asyncio.sleep(0.005)
@@ -232,7 +232,7 @@ class SwarmServerApiTests(unittest.TestCase):
     def test_run_error_event_is_sanitized(self):
         plan = self.plan()
 
-        async def failing_runtime_run(bee_spec, goal, contract, input_capsules, emit, cancel_event):
+        async def failing_runtime_run(bee_spec, goal, contract, input_capsules, emit, cancel_event, correction=None):
             raise RuntimeError(r"C:\Users\SecretName\private\token.txt")
 
         with patch.object(server._swarm_runtime, "run", new=failing_runtime_run):

@@ -1320,6 +1320,7 @@ async def _swarm_bee_runner(bee_id: str, context: dict):
             context.get("inputs") or [],
             emit,
             cancel_event,
+            correction=context.get("correction"),
         )
     )
     try:

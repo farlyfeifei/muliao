@@ -51,6 +51,75 @@ def _configured_max_tool_rounds() -> int:
 # 信息收尾作答（见 run() 里的 forced_final_round），与主线对话链路的处理一致。
 MAX_TOOL_ROUNDS = _configured_max_tool_rounds()
 
+# 纠偏意见里各字段的中文含义，用于把 Jev 的布尔裁决翻成蜂能执行的整改指令。
+# 值为 True 表示「该项有问题」——注意 conflict_present 是正向语义（True=有冲突=问题），
+# 其余三项是反向语义（False=未达标=问题），所以分开处理。
+_CORRECTION_FAILURE_WHEN_FALSE = {
+    "on_contract": "是否守在任务契约范围内",
+    "evidence_sufficient": "证据是否足以支撑下一阶段",
+    "safe_to_continue": "是否可以安全继续",
+}
+_CORRECTION_FAILURE_WHEN_TRUE = {
+    "conflict_present": "存在未解决的冲突",
+}
+
+
+def _correction_failures(correction: Mapping[str, Any]) -> list[str]:
+    """列出 Jev 复核中**未通过**的检查项（中文），按稳定顺序。"""
+    failures: list[str] = []
+    for key, label in _CORRECTION_FAILURE_WHEN_FALSE.items():
+        if key in correction and bool(correction[key]) is False:
+            failures.append(label)
+    for key, label in _CORRECTION_FAILURE_WHEN_TRUE.items():
+        if key in correction and bool(correction[key]) is True:
+            failures.append(label)
+    return failures
+
+
+def _correction_note(correction: Any) -> dict[str, Any] | None:
+    """把 Jev 上一轮的复核裁决翻成「这次重试必须怎么改」的整改说明。
+
+    重试轮若不带上这段，蜂收到的 prompt 与上一轮逐字节相同，只能重犯同样的错。
+    返回 None 表示没有可用纠偏信息（首轮、或裁决缺失），调用方据此跳过注入。
+    """
+    if not isinstance(correction, Mapping) or not correction:
+        return None
+    action = str(correction.get("action") or "").strip().lower()
+    score = correction.get("match_score")
+    tier = str(correction.get("lesson_tier") or "").strip().lower()
+
+    failures = _correction_failures(correction)
+    reason = str(correction.get("reason") or "").strip()
+
+    if not failures and not reason and action in ("", "accept"):
+        return None
+
+    lines = ["上一轮你的产出被复核后要求重做。复核结论："]
+    if score is not None:
+        lines.append(f"- 与目标的匹配度：{score}/10（档位 {tier or '未分档'}）")
+    for f in failures:
+        lines.append(f"- 未通过项：{f}")
+    if reason:
+        lines.append(f"- 复核理由：{reason[:300]}")
+    lines.append(
+        "请针对上述未通过项做出实质改进，不要重复上一轮的做法或结论："
+        "该调用工具就去调用工具取证，证据不足就补证据，"
+        "超出契约范围的部分删掉，存在冲突就明确指出冲突点。"
+    )
+    instruction = "\n".join(lines)
+
+    note: dict[str, Any] = {
+        "instruction": instruction,
+        "action": action or "retry",
+    }
+    if score is not None:
+        note["previous_match_score"] = score
+    if tier:
+        note["previous_lesson_tier"] = tier
+    if failures:
+        note["failed_checks"] = failures
+    return note
+
 
 class BeeRuntimeError(RuntimeError):
     """Base class for failures that must not produce a partial bee result."""
@@ -112,8 +181,13 @@ class BeeRuntime:
         input_capsules: Sequence[Any] | None,
         emit: EventEmitter | None,
         cancel_event: asyncio.Event | None,
+        correction: Any = None,
     ) -> dict[str, Any]:
         """Run one bee and return only a complete, successfully finalized result.
+
+        ``correction`` 是上一轮 Jev 复核给出的纠正意见（匹配度、证据是否充分、
+        为何要求重试）。重试时必须把它注入 prompt，否则那只蜂收到的指令与上次
+        逐字节相同，只能重犯同样的错——纠偏会空转。
 
         Cancellation raises :class:`asyncio.CancelledError`.  Permission,
         upstream, and tool failures raise a ``BeeRuntimeError`` subclass.  In
@@ -125,7 +199,9 @@ class BeeRuntime:
             raise TypeError("goal must be a string")
         self._raise_if_cancelled(cancel_event)
 
-        messages = self._base_messages(spec, goal, contract, input_capsules or ())
+        messages = self._base_messages(
+            spec, goal, contract, input_capsules or (), correction=correction
+        )
         history: list[dict[str, Any]] = []
         reasoning_parts: list[str] = []
         tool_usage: list[dict[str, Any]] = []
@@ -254,23 +330,33 @@ class BeeRuntime:
         goal: str,
         contract: Any,
         input_capsules: Sequence[Any],
+        correction: Any = None,
     ) -> list[dict[str, str]]:
         role_data = spec.to_dict()
         role_message = f"{BEE_ROLE_PROMPT}\nBEE_SPEC_JSON={canonical_json(role_data)}"
-        input_message = canonical_json(
-            {
-                "protocol": BEE_INPUT_PROTOCOL,
-                "bee_id": spec.bee_id,
-                "goal": goal,
-                "contract": json_value(contract),
-                "input_capsules": json_value(list(input_capsules)),
-            }
-        )
-        return [
+        payload: dict[str, Any] = {
+            "protocol": BEE_INPUT_PROTOCOL,
+            "bee_id": spec.bee_id,
+            "goal": goal,
+            "contract": json_value(contract),
+            "input_capsules": json_value(list(input_capsules)),
+        }
+        # 重试轮：把 Jev 上一轮的复核意见一并交给这只蜂。
+        # 没有这段，重试的 prompt 与上一轮逐字节相同，蜂只能重犯同样的错，
+        # 于是 retry 耗尽 → retry_exhausted → 整个 run 失败。纠偏必须闭环。
+        correction_note = _correction_note(correction)
+        if correction_note:
+            payload["correction"] = correction_note
+        input_message = canonical_json(payload)
+        messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "system", "content": role_message},
             {"role": "user", "content": input_message},
         ]
+        if correction_note:
+            # 再单独给一条显式指令，避免纠偏意见被埋在长 JSON 里被模型忽略。
+            messages.append({"role": "user", "content": correction_note["instruction"]})
+        return messages
 
     async def _available_tools(
         self,
