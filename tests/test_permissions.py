@@ -30,9 +30,14 @@ class PermissionCapabilityTests(unittest.TestCase):
     def test_voice_control_is_separate_and_default_off(self):
         status = permissions.status()
         self.assertEqual(len(permissions.DATA_SCOPES), 7)
-        self.assertEqual(permissions.CAPABILITY_SCOPES, ["voice_control", "computer_control"])
+        # 能力 scope：语音、电脑控制、读取文件正文。三者都必须默认关。
+        self.assertEqual(
+            permissions.CAPABILITY_SCOPES,
+            ["voice_control", "computer_control", "file_content"],
+        )
         self.assertFalse(status["scopes"]["voice_control"])
         self.assertFalse(status["scopes"]["computer_control"])
+        self.assertFalse(status["scopes"]["file_content"])
 
     def test_computer_control_is_separate_and_default_off(self):
         status = permissions.status()
@@ -45,6 +50,8 @@ class PermissionCapabilityTests(unittest.TestCase):
         self.assertTrue(all(status["scopes"][scope] for scope in permissions.DATA_SCOPES))
         self.assertFalse(status["scopes"]["voice_control"])
         self.assertFalse(status["scopes"]["computer_control"])
+        # 读取文件正文敏感度最高，同样绝不随「全选」打开
+        self.assertFalse(status["scopes"]["file_content"])
 
     def test_resaving_data_permissions_preserves_voice_capability(self):
         permissions.set_scope("voice_control", True)

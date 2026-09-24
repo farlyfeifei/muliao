@@ -275,6 +275,7 @@ def ai_logs(limit: int = 200, max_files: int = 60) -> dict:
         files = _walk_jsonl(root, max_files)
         files_seen += len(files)
         for fp in files[:max_files]:
+            cwd = ""
             try:
                 with open(fp, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
@@ -285,6 +286,13 @@ def ai_logs(limit: int = 200, max_files: int = 60) -> dict:
                             o = json_loads(line)
                         except Exception:
                             continue
+                        # cwd 记录该会话真实的工作目录（项目文件夹绝对路径）。
+                        # 早先版本把它丢了，模型只能靠猜文件位置——这是「找不到要操作的
+                        # 文件夹」的根因。这里补上，并顺带记 git 分支。
+                        if not cwd:
+                            c = o.get("cwd")
+                            if isinstance(c, str) and c.strip():
+                                cwd = c.strip()
                         text = _extract_msg(o)
                         if not text:
                             continue
@@ -292,6 +300,8 @@ def ai_logs(limit: int = 200, max_files: int = 60) -> dict:
                         items.append({
                             "tool": tool, "role": role, "text": body[:500],
                             "session": os.path.basename(fp)[:40],
+                            "cwd": cwd,
+                            "git_branch": str(o.get("gitBranch") or ""),
                             "ts": _parse_ts(o.get("timestamp")),
                         })
                         if len(items) >= limit * 4:
@@ -302,6 +312,86 @@ def ai_logs(limit: int = 200, max_files: int = 60) -> dict:
                 continue
     items.sort(key=lambda x: x["ts"] or 0, reverse=True)
     return {"granted": True, "items": items[:limit], "count": len(items[:limit]),
+            "files_seen": files_seen,
+            "tools_found": [t for t, (r,) in _AI_LOG_DIRS.items()
+                            if os.path.isdir(os.path.join(home, r))]}
+
+
+# Claude Code 的项目目录名是把绝对路径里的分隔符换成 '-' 编码来的
+# （如 D:\2026暑假一切\进化酒馆\muliao -> D--2026暑假一切-进化酒馆-muliao）。
+# 它只能作 cwd 缺失时的兜底线索，无法无损还原（'-' 有歧义），故只做展示。
+def _project_dir_hint(dir_name: str) -> str:
+    return str(dir_name or "").replace("--", ":\\").replace("-", "\\")
+
+
+def ai_sessions(limit: int = 30, max_files: int = 200) -> dict:
+    """列出本机 AI Agent（Claude Code / Codex）的**会话**及其真实项目路径。
+
+    这是「通知溯源」的关键：一条 Agent 通知只带应用名和标题，但它的会话日志里
+    记着 cwd（项目文件夹绝对路径）、git 分支、最后活动时间。有了这些，幕僚就能
+    从「哪个 Agent 发的通知」直接定位到「哪个项目的哪个会话」，再去读那个文件夹
+    或操作那个 Agent 窗口——不必猜文件位置。
+
+    只读元数据（路径/时间/分支/首条用户消息前 80 字），不读文件内容。
+    """
+    if not permissions.is_granted("ai_logs"):
+        return {"granted": False, "items": [], "count": 0, "note": "未授权 AI 日志访问"}
+    home = os.path.expanduser("~")
+    sessions: list[dict] = []
+    files_seen = 0
+    for tool, (rel,) in _AI_LOG_DIRS.items():
+        root = os.path.join(home, rel)
+        for fp in _walk_jsonl(root, max_files):
+            files_seen += 1
+            cwd = ""
+            branch = ""
+            sid = ""
+            first_user = ""
+            n_msgs = 0
+            try:
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            o = json_loads(line)
+                        except Exception:
+                            continue
+                        if not cwd and isinstance(o.get("cwd"), str):
+                            cwd = o["cwd"].strip()
+                        if not branch and isinstance(o.get("gitBranch"), str):
+                            branch = o["gitBranch"].strip()
+                        if not sid and isinstance(o.get("sessionId"), str):
+                            sid = o["sessionId"].strip()
+                        t = _extract_msg(o)
+                        if t:
+                            n_msgs += 1
+                            if not first_user and t[0] == "user":
+                                first_user = t[1][:80]
+            except Exception:
+                continue
+            try:
+                mtime = os.path.getmtime(fp)
+            except OSError:
+                mtime = 0
+            sid = sid or os.path.basename(fp)[:36]
+            sessions.append({
+                "tool": tool,
+                "session_id": sid,
+                "cwd": cwd,
+                # 项目名：cwd 的最后一段；cwd 缺失时用目录名编码兜底。
+                "project": (os.path.basename(cwd.rstrip("\\/")) if cwd
+                            else _project_dir_hint(os.path.basename(os.path.dirname(fp)))[:40]),
+                "git_branch": branch,
+                "last_activity": mtime,
+                "message_count": n_msgs,
+                "first_user_message": first_user,
+                "log_file": fp,
+                "cwd_exists": bool(cwd) and os.path.isdir(cwd),
+            })
+    sessions.sort(key=lambda s: s.get("last_activity") or 0, reverse=True)
+    return {"granted": True, "items": sessions[:limit], "count": len(sessions[:limit]),
             "files_seen": files_seen,
             "tools_found": [t for t, (r,) in _AI_LOG_DIRS.items()
                             if os.path.isdir(os.path.join(home, r))]}
@@ -508,6 +598,9 @@ def capabilities() -> list:
         cc_available = False
         cc_detail = "仅支持 Windows（当前平台 %s）" % sys.platform
 
+    # voice_control：语音子系统已实装；就绪与否取决于本地 ASR 模型是否下载到位。
+    voice_available, voice_detail = _voice_available()
+
     return [
         {
             "id": "computer_control", "name": "电脑控制",
@@ -521,11 +614,24 @@ def capabilities() -> list:
         },
         {
             "id": "voice_control", "name": "语音控制",
-            "desc": "允许幕僚通过语音指令控制本机；高风险动作会先请你确认",
+            "desc": "允许幕僚听「幕僚幕僚」唤醒并执行语音指令（本地识别，不上传录音）；高风险动作会先请你确认",
             "granted": permissions.is_granted("voice_control"),
-            "available": False,
-            "detail": "语音能力未在本分支实装",
-            "note": "未实装",
+            "available": voice_available,
+            "detail": voice_detail,
+            "note": None if voice_available else "需先下载本地语音模型（见 detail）",
+            "sensitive": True,
+            "kind": "capability",
+        },
+        {
+            "id": "file_content", "name": "读取文件内容",
+            "desc": (
+                "允许幕僚读取本机文本文件的**正文**（源码、配置、文档），"
+                "以便看懂 Agent 报的问题再动手改。内容会进入上游模型上下文"
+            ),
+            "granted": permissions.is_granted("file_content"),
+            "available": True,
+            "detail": "按路径读文本；密钥/凭据类文件（config.json、SSH 私钥、.env）一律拒读",
+            "note": "敏感度最高：正文会发给上游模型，仅在需要时开启",
             "sensitive": True,
             "kind": "capability",
         },
@@ -554,6 +660,30 @@ def _browser_exists() -> bool:
 def _ai_dirs_exist() -> bool:
     home = os.path.expanduser("~")
     return any(os.path.isdir(os.path.join(home, rel)) for (rel,) in _AI_LOG_DIRS.values())
+
+
+def _voice_available() -> tuple[bool, str]:
+    """语音能力是否就绪：voice 包可导入 + 本地 ASR 模型文件在位。
+
+    只探测，绝不启动麦克风/加载模型（避免在渲染权限页时占用设备或耗内存）。
+    缺模型时返回具体缺失项，让用户知道要下载什么。
+    """
+    try:
+        import voice.api  # noqa: F401
+    except Exception as exc:
+        return False, "语音模块不可导入（%s）" % type(exc).__name__
+    # 模型目录：与 voice.config 的默认解析保持一致（%PROGRAMDATA%\Muliao\models\sensevoice）
+    try:
+        from voice.config import VoiceSettings
+        sdir = str(VoiceSettings.load().sensevoice_dir)
+    except Exception:
+        sdir = os.path.join(os.environ.get("PROGRAMDATA") or "C:/ProgramData",
+                            "Muliao", "models", "sensevoice")
+    need = ("model.int8.onnx", "tokens.txt")
+    missing = [f for f in need if not os.path.isfile(os.path.join(sdir, f))]
+    if missing:
+        return False, "缺本地语音模型：%s（应放在 %s）" % ("、".join(missing), sdir)
+    return True, "语音就绪（%s）" % sdir
 
 
 # 采集器注册表：id → 采集函数

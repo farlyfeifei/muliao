@@ -542,6 +542,13 @@ def normalize_plan(plan: Mapping[str, Any]) -> PlannerDecision:
 
 
 def evaluate_user_gate(decision: PlannerDecision, *, confirmed: bool = False) -> UserGate:
+    """判断一个规划是否需要用户先表态。
+
+    注意：``confirmed`` **不能**解除澄清闸门（见
+    test_confirmation_never_bypasses_clarification_aliases）。澄清意味着目标里有
+    实质信息缺失，而「确认」只是「照你说的办」——它补不上缺失的事实。用户必须
+    真的把缺的信息说出来（重新提交更具体的目标，或经澄清应答通道），闸门才放行。
+    """
     if decision.needs_clarification:
         return UserGate("clarification", decision.clarification_reasons)
     if decision.confirmation_required and not confirmed:

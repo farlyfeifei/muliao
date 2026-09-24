@@ -1004,7 +1004,7 @@ function autoGrow(el) { el.style.height = "auto"; el.style.height = Math.min(190
 const PERM_ICON = {
   notifications: "i-bell", processes: "i-cpu", windows: "i-monitor",
   browser: "i-globe", ai_logs: "i-brain", files: "i-doc", system: "i-gauge",
-  computer_control: "i-cursor", voice_control: "i-bolt",
+  computer_control: "i-cursor", voice_control: "i-bolt", file_content: "i-pen",
 };
 let permSources = [];
 let permCaps = [];

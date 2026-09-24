@@ -36,10 +36,10 @@ class ComputerControlCapabilityTests(unittest.TestCase):
     def test_computer_control_is_a_capability_and_in_all_scopes(self):
         self.assertIn("computer_control", permissions.CAPABILITY_SCOPES)
         self.assertIn("computer_control", permissions.ALL_SCOPES)
-        # voice_control 保留在前，computer_control 紧随其后
+        # voice_control 在前，computer_control 其次，file_content（读文件正文）最后
         self.assertEqual(
             permissions.CAPABILITY_SCOPES,
-            ["voice_control", "computer_control"],
+            ["voice_control", "computer_control", "file_content"],
         )
 
     def test_computer_control_defaults_off(self):
@@ -113,10 +113,29 @@ class CollectorsCapabilitiesTests(unittest.TestCase):
         self.assertIsNotNone(vc)
         self.assertEqual(vc["name"], "语音控制")
         self.assertEqual(vc["kind"], "capability")
-        for field in ("desc", "granted", "available"):
+        for field in ("desc", "granted", "available", "detail"):
             self.assertIn(field, vc)
-        # voice 未在本分支实装
-        self.assertFalse(vc["available"])
+        self.assertIsInstance(vc["available"], bool)
+        # 语音子系统已实装；available 只取决于本机是否下载了本地 ASR 模型，
+        # 是环境相关的，不能硬断言 True/False。真正的不变量是：不可用时必须
+        # 给出可操作的缺失说明（缺哪个模型、该放哪），不能像旧版那样只写「未实装」。
+        if not vc["available"]:
+            self.assertIn("模型", vc["detail"])
+            self.assertNotIn("未实装", str(vc["detail"]) + str(vc["note"]))
+
+    def test_capabilities_lists_file_content_with_secret_guard_note(self):
+        """file_content 是敏感度最高的能力：必须默认关、且明确告知密钥文件被拦。"""
+        items = collectors.capabilities()
+        fc = self._find(items, "file_content")
+        self.assertIsNotNone(fc)
+        self.assertEqual(fc["kind"], "capability")
+        self.assertTrue(fc["sensitive"])
+        self.assertIsInstance(fc["available"], bool)
+        self.assertIsInstance(fc["granted"], bool)
+        # 说明里必须点出「密钥/凭据文件拒读」，这是该能力的安全承诺。
+        self.assertIn("拒读", str(fc["detail"]) + str(fc["note"]))
+        # 默认关：全新隔离环境下绝不该是 granted
+        self.assertFalse(fc["granted"])
 
     def test_capabilities_granted_follows_set_scope(self):
         self.assertFalse(self._find(collectors.capabilities(), "computer_control")["granted"])

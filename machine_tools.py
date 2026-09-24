@@ -141,6 +141,74 @@ TOOL_DEFS: dict[str, dict] = {
             },
         },
     },
+    "list_agent_sessions": {
+        "scope": "ai_logs",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "list_agent_sessions",
+                "description": (
+                    "列出本机 AI Agent（Claude Code / Codex）的会话，每条给出**真实项目路径 cwd**、"
+                    "git 分支、最后活动时间、首条用户消息。当用户提到「某个 Agent 的通知/报错」"
+                    "「哪个项目出问题了」时先调这个定位到具体项目和会话，**不要靠猜文件位置**。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "返回条数，默认 12", "default": 12},
+                        "filter": {"type": "string", "description": "按项目名/分支/消息内容过滤"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    },
+    # ---- 读取文件内容（scope=file_content，独立能力，默认关、不随全选打开）----
+    # 内容会进入上游模型上下文，敏感度远高于元数据，故单列一个能力。
+    "list_folder": {
+        "scope": "file_content",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "list_folder",
+                "description": (
+                    "列出指定文件夹的内容（文件名、类型、大小、修改时间）。路径用 list_agent_sessions "
+                    "拿到的 cwd，或用户明确给出的路径。用于在动手改之前看清项目结构。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "文件夹绝对路径"},
+                        "recursive": {"type": "boolean", "description": "是否递归子目录，默认 false"},
+                        "limit": {"type": "integer", "description": "最多返回条数，默认 120", "default": 120},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+    },
+    "read_file": {
+        "scope": "file_content",
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": (
+                    "读取一个文本文件的内容（可按行范围）。用于真正看懂 Agent 报的问题、方案文档、"
+                    "配置或源码，再决定怎么改。**只能读文本文件**；二进制会被拒绝。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "文件绝对路径"},
+                        "start_line": {"type": "integer", "description": "起始行（1 起），默认 1"},
+                        "max_lines": {"type": "integer", "description": "最多读取行数，默认 200", "default": 200},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+    },
     # ---- 电脑控制能力（scope=computer_control，默认关、不随全选打开、独立显式授权）----
     # 这些是「执行动作」而非只读采集。每个都受 computer_control 权限闸门 + 每次执行前的
     # Jev 门控（server.action_gate）双重约束；高风险动作会先请用户确认才真正执行。
@@ -306,15 +374,49 @@ def is_control_tool(name: str) -> bool:
 
 
 # ---- 工具执行 ----
+def _shorten_strings(obj: Any, per_str: int, depth: int = 0) -> Any:
+    """递归把对象里的长字符串裁短，**在序列化之前**做。
+
+    为什么不在序列化后截断：那会把 JSON 从中间切断成非法文本（实测 read_file
+    正文超限时模型收到的是断尾的 content 串，既读不出内容也会误导解析）。
+    裁完再 dumps，结构永远合法。
+    """
+    if depth > 6:
+        return obj
+    if isinstance(obj, str):
+        if len(obj) <= per_str:
+            return obj
+        return obj[:per_str] + f"…(已截断，原长 {len(obj)} 字符)"
+    if isinstance(obj, dict):
+        return {k: _shorten_strings(v, per_str, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_shorten_strings(v, per_str, depth + 1) for v in obj]
+    return obj
+
+
 def _trim(obj: Any, limit: int = 1500) -> str:
-    """序列化工具结果并截断。
+    """序列化工具结果并截断，**保证输出永远是合法 JSON**。
 
     limit 默认 1500 字符是**为缓存命中率**定的：工具结果是全新内容，
     必然 miss，它的体积直接决定这一轮的命中率下限（rate ≈ 前缀/(前缀+新增)）。
     实测一个未裁剪的进程列表可达 2600+ 字符，把整轮拉到 60%。
+
+    做法：按 limit 裁内部长字符串再序列化；若总量仍超预算（多个字符串累加），
+    就逐档收紧单串预算重试，直到落进「limit + 结构开销」为止。
+    绝不在序列化后做 `s[:limit]` 硬切——那会把 JSON 从中间切断成非法文本
+    （实测 read_file 正文超限时模型收到断尾 JSON，既读不出内容也会误导解析）。
     """
-    s = json.dumps(obj, ensure_ascii=False, default=str)
-    return s if len(s) <= limit else s[:limit] + f"…(已截断，原长 {len(s)})"
+    # 预算只给结构开销留少量余量（键名/引号/括号），不放水到数倍，否则缓存命中率崩。
+    budget = max(int(limit * 1.25), limit + 200)
+    for per_str in (limit, limit // 2, limit // 4, limit // 8, 60):
+        s = json.dumps(_shorten_strings(obj, per_str), ensure_ascii=False, default=str)
+        if len(s) <= budget:
+            return s
+    # 极端情况（元素数量本身巨大）：单串裁到最短仍超预算，返回该结果并如实标注。
+    s = json.dumps(_shorten_strings(obj, 40), ensure_ascii=False, default=str)
+    return json.dumps({"truncated_result": s[:budget],
+                       "note": "结果元素过多，已大幅截断；请缩小 limit 或加过滤条件。"},
+                      ensure_ascii=False)
 
 
 # ---- 异常信息脱敏（回灌给上游模型前必须过一遍）----
@@ -411,6 +513,140 @@ def _as_limit(args: dict) -> int | None:
     return min(v, 500)          # 上限防呆：模型给 10**9 也不至于把整台机器灌进上下文
 
 
+# ---- 文件内容读取的辅助与安全防线 ----
+# 噪声/依赖目录：递归列目录时跳过，避免把整棵 node_modules 灌进上下文。
+_SKIP_DIRS = frozenset({
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+    ".mypy_cache", ".pytest_cache", "dist", "build", ".idea", ".vscode",
+})
+# 单文件读取上限（防超大文件撑爆上下文）。
+_MAX_READ_BYTES = 512 * 1024
+# 二进制扩展名：不能当文本读，直接拒。
+_BINARY_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".mp4", ".mov",
+    ".mp3", ".wav", ".zip", ".rar", ".7z", ".gz", ".tar", ".exe", ".dll",
+    ".so", ".dylib", ".pyd", ".pdf", ".onnx", ".bin", ".dat", ".class",
+    ".jar", ".woff", ".woff2", ".ttf", ".otf", ".db", ".sqlite", ".sqlite3",
+})
+# 绝不允许读取的敏感路径片段（存密钥/凭据的文件）。命中即拒，防止 file_content
+# 能力被用来把 API key / 私钥 / 凭据读进上游模型上下文。
+_SECRET_PATH_HINTS = (
+    "muliao\\config.json", "muliao/config.json",       # 本项目的密钥配置
+    "config.json", ".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    ".pem", ".pfx", ".p12", ".key", "credentials", "secrets",
+    ".npmrc", ".pypirc", ".netrc", ".aws\\credentials", ".aws/credentials",
+    ".kube\\config", ".kube/config", "token.json", ".git-credentials",
+)
+# 敏感**目录**：整棵树禁读。
+# 只按文件名黑名单是不够的——实测 ~/.ssh/creator_city_deploy 这种自定义名字的
+# 私钥（无扩展名）能绕过名单被完整读出。密钥存放目录里放什么都算敏感，一律拒。
+_SECRET_DIRS = (
+    ".ssh", ".gnupg", ".aws", ".kube", ".azure", ".docker",
+    ".config\\gh", ".config/gh", "credential", "credentials",
+    "appdata\\roaming\\muliao", "appdata/roaming/muliao",
+    "appdata\\local\\muliao", "appdata/local/muliao",
+)
+# 私钥内容特征：即使路径没命中任何规则，读到这些也立即丢弃内容并拒绝。
+# 最后一道防线——目录和文件名都可能被绕过，但私钥的正文格式骗不了人。
+_PRIVATE_KEY_MARKERS = (
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN DSA PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    "ssh-rsa AAAA", "ssh-ed25519 AAAA", "ecdsa-sha2-nistp",
+)
+
+
+def _binary_ext(path: str) -> bool:
+    return os.path.splitext(str(path))[1].lower() in _BINARY_EXTS
+
+
+def _fmt_time(ts: Any) -> str:
+    """把 mtime 秒时间戳转成可读串；非法值返回空。"""
+    try:
+        v = float(ts)
+        if v <= 0:
+            return ""
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _blocked_secret_path(path: str) -> str:
+    """若路径指向存密钥/凭据的文件或敏感目录，返回拒绝原因；否则返回空串（放行）。
+
+    这是 file_content 能力的核心防线：即使权限已开，也绝不把 config.json、
+    SSH 私钥、.env、云凭据等读进上游模型上下文。
+
+    两层匹配，都用大小写不敏感的归一化子串（反斜杠统一成斜杠）：
+      ① 敏感**目录**整棵树禁读 —— 只按文件名挡不住自定义名字的私钥
+         （实测 ~/.ssh/creator_city_deploy 无扩展名，能绕过纯文件名黑名单）。
+      ② 敏感**文件名**片段 —— config.json / .env / *.key / *.pem 等。
+    """
+    raw = str(path or "")
+    low = raw.replace("\\", "/").lower()
+
+    # ① 敏感目录：路径中任何一段命中即拒（整棵树）
+    for d in _SECRET_DIRS:
+        seg = d.replace("\\", "/").lower().strip("/")
+        # 目录名作为独立路径段出现：/a/.ssh/b 或结尾 /a/.ssh
+        if f"/{seg}/" in f"/{low}/" or low.endswith(f"/{seg}"):
+            return (f"该路径位于敏感目录（{os.path.basename(d)}）内，"
+                    "整棵树禁止读取；不要重试该路径")
+
+    # ② 敏感文件名片段（结尾或后接分隔符，避免误伤 myconfig.json.bak 之类）
+    for hint in _SECRET_PATH_HINTS:
+        h = hint.replace("\\", "/").lower()
+        if low.endswith(h) or f"/{h}" in low or low.endswith(h.lstrip("/")):
+            return f"该路径疑似存放密钥/凭据（{os.path.basename(raw)}），出于安全不允许读取"
+    return ""
+
+
+def _looks_like_private_key(content: str) -> bool:
+    """内容兜底：正文含私钥特征就判定为凭据文件（路径规则的最后一道防线）。
+
+    目录名和文件名都可能被绕过（自定义命名、非常规位置），但私钥正文格式骗不了人。
+    """
+    head = str(content or "")[:4000]
+    return any(marker in head for marker in _PRIVATE_KEY_MARKERS)
+
+
+def _safe_abs_path(path: str) -> str | None:
+    """把模型给的路径规范成本机绝对路径；不存在或非绝对则返回 None。
+
+    要求绝对路径，避免相对路径落到进程 CWD（打包态 CWD 不可预期）读到意外文件。
+    """
+    p = str(path or "").strip()
+    if not p:
+        return None
+    if not os.path.isabs(p):
+        return None
+    norm = os.path.normpath(p)
+    if not os.path.exists(norm):
+        return None
+    return norm
+
+
+def _file_brief(path: str, base: str) -> dict:
+    """构造一条文件/目录摘要（名、类型、大小）。相对 base 给出简短相对路径。"""
+    is_dir = os.path.isdir(path)
+    try:
+        size_kb = 0 if is_dir else max(0, os.path.getsize(path)) // 1024
+    except OSError:
+        size_kb = 0
+    try:
+        rel = os.path.relpath(path, base)
+    except ValueError:
+        rel = os.path.basename(path)
+    return {
+        "name": rel.replace("\\", "/"),
+        "kind": "dir" if is_dir else "file",
+        "size_kb": size_kb,
+    }
+
+
 def execute_tool(name: str, args: dict | None) -> str:
     """执行工具，返回给模型的字符串结果。
     双重闸门：先查该工具是否已授权（防止授权被撤销后仍被调用）。"""
@@ -420,12 +656,12 @@ def execute_tool(name: str, args: dict | None) -> str:
         return _trim({"error": "unavailable_tool",
                       "hint": "该工具当前不可用。不要重试；请基于已有信息回答，或告知用户在权限页开启相应能力。"})
 
-    def finish(obj) -> str:
+    def finish(obj, chars: int = 1500) -> str:
         # 采集可能耗时；若用户在采集途中撤权，结果不得返回给模型。
         if not permissions.is_granted(t["scope"]):
             return _trim({"error": "unavailable_tool",
                           "hint": "权限已撤销，本次采集结果已丢弃。不要重试。"})
-        return _trim(obj)
+        return _trim(obj, limit=chars)
 
     try:
         limit = _as_limit(args)
@@ -493,6 +729,115 @@ def execute_tool(name: str, args: dict | None) -> str:
                 "count": len(items), "keyword": kw or None, "tools": d.get("tools_found"),
                 "matches": [f"[{x['tool']}/{x['role']}] {x['text'][:150]}" for x in items],
             })
+
+        if name == "list_agent_sessions":
+            d = collectors.ai_sessions(limit=min(limit or 12, 40))
+            kw = _as_text(args.get("filter")).lower()
+            items = d.get("items", [])
+            if kw:
+                items = [s for s in items if kw in " ".join([
+                    str(s.get("project") or ""), str(s.get("cwd") or ""),
+                    str(s.get("git_branch") or ""), str(s.get("first_user_message") or ""),
+                ]).lower()]
+            return finish({
+                "count": len(items), "tools": d.get("tools_found"), "filter": kw or None,
+                "sessions": [
+                    {
+                        "tool": s.get("tool"),
+                        "project": s.get("project"),
+                        "cwd": s.get("cwd"),
+                        "cwd_exists": s.get("cwd_exists"),
+                        "git_branch": s.get("git_branch"),
+                        "last_activity": _fmt_time(s.get("last_activity")),
+                        "messages": s.get("message_count"),
+                        "first_user_message": s.get("first_user_message"),
+                    } for s in items
+                ],
+                "note": "cwd 是该项目文件夹的绝对路径；要改这个项目的文件，直接用它，不要猜。",
+            })
+
+        # ---- 读取文件内容（scope=file_content）----
+        if name in ("list_folder", "read_file"):
+            path = _as_text(args.get("path"))
+            blocked = _blocked_secret_path(path)
+            if blocked:
+                return finish({"error": "path_not_allowed",
+                               "hint": f"{blocked}。不要重试该路径。"})
+            resolved = _safe_abs_path(path)
+            if resolved is None:
+                return finish({"error": "invalid_args",
+                               "hint": "path 必须是本机存在的绝对路径。"})
+
+            if name == "list_folder":
+                if not os.path.isdir(resolved):
+                    return finish({"error": "not_a_directory", "path": resolved})
+                recursive = bool(args.get("recursive"))
+                n = min(limit or 120, 400)
+                out = []
+                try:
+                    if recursive:
+                        for root, dirs, files in os.walk(resolved):
+                            # 跳过噪声/依赖目录，避免把整棵 node_modules 灌进上下文
+                            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+                            for fn in files:
+                                fp = os.path.join(root, fn)
+                                out.append(_file_brief(fp, resolved))
+                                if len(out) >= n:
+                                    raise StopIteration
+                            if len(out) >= n:
+                                break
+                    else:
+                        for e in os.scandir(resolved):
+                            if e.is_dir() and e.name in _SKIP_DIRS:
+                                continue
+                            out.append(_file_brief(e.path, resolved))
+                            if len(out) >= n:
+                                break
+                except StopIteration:
+                    pass
+                except OSError as exc:
+                    return finish({"error": "read_failed", "path": resolved,
+                                   "detail": type(exc).__name__})
+                out.sort(key=lambda x: (x["kind"], x["name"].lower()))
+                return finish({
+                    "path": resolved, "count": len(out), "truncated": len(out) >= n,
+                    "entries": [f"{'[D] ' if e['kind']=='dir' else '    '}{e['name']}"
+                                + (f"  {e['size_kb']}KB" if e["kind"] == "file" else "")
+                                for e in out],
+                }, chars=4000)
+
+            # read_file
+            if not os.path.isfile(resolved):
+                return finish({"error": "not_a_file", "path": resolved})
+            if _binary_ext(resolved):
+                return finish({"error": "binary_file",
+                               "hint": "该扩展名是二进制文件，无法当文本读取。"})
+            try:
+                if os.path.getsize(resolved) > _MAX_READ_BYTES:
+                    return finish({"error": "file_too_large",
+                                   "hint": f"文件超过 {_MAX_READ_BYTES // 1024}KB，"
+                                           "请缩小范围或只读关键部分。"})
+                with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except OSError as exc:
+                return finish({"error": "read_failed", "path": resolved,
+                               "detail": type(exc).__name__})
+            start = max(1, int(args.get("start_line") or 1))
+            max_lines = min(int(args.get("max_lines") or 200), 600)
+            chunk = lines[start - 1: start - 1 + max_lines]
+            content = "".join(chunk)
+            # 内容兜底：路径规则可能被自定义命名/非常规位置绕过，但私钥正文格式骗不了人。
+            # 命中即丢弃内容、返回拒绝——绝不把私钥正文回灌给上游模型。
+            if _looks_like_private_key(content):
+                return finish({"error": "path_not_allowed",
+                               "hint": "该文件正文含私钥/凭据特征，出于安全已拒绝读取。"
+                                       "不要重试该路径。"})
+            return finish({
+                "path": resolved, "total_lines": len(lines),
+                "start_line": start, "returned_lines": len(chunk),
+                "truncated": start - 1 + max_lines < len(lines),
+                "content": content,
+            }, chars=8000)
 
         # ---- 电脑控制能力（执行动作）----
         # 到这里 computer_control 权限已过（函数头 scope 闸门）；动作该不该做由

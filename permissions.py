@@ -28,7 +28,9 @@ _lock = threading.RLock()
 # 七类只读数据源；保留稳定标识，供 collectors、machine_tools 与蜂群权限快照使用。
 DATA_SCOPES = ["notifications", "processes", "windows", "browser", "ai_logs", "files", "system"]
 # 执行/设备能力独立于数据采集。能力必须逐项显式开启，永不随“全部数据”授权打开。
-CAPABILITY_SCOPES = ["voice_control", "computer_control"]
+# file_content：读取文件**正文**（而非仅元数据）。正文会进入上游模型上下文，
+# 敏感度远高于文件名/大小/时间，故单列一个能力，必须显式授权。
+CAPABILITY_SCOPES = ["voice_control", "computer_control", "file_content"]
 ALL_SCOPES = DATA_SCOPES + CAPABILITY_SCOPES
 
 # 默认状态：全部未授权
