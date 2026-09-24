@@ -1843,7 +1843,11 @@ async def chat(req: Request):
         _sess_append(session_id, [{"role": "user", "content": last_user}])
         tools = machine_tools.available_tool_specs()
         tool_names = machine_tools.available_tool_names()
-        max_tool_rounds = int(os.environ.get("MULIAO_MAX_TOOL_ROUNDS", "4"))
+        # 工具调用轮数：默认**不限**（0 = 放开），让模型一路调到问题真正解决为止。
+        # 只保留一个硬安全阀，防止模型陷入无限自我调用把额度和时间烧光；
+        # 撞到阀值时不是静默截断，而是撤掉 tools 强制收尾一轮（见下方 force_final）。
+        max_tool_rounds = int(os.environ.get("MULIAO_MAX_TOOL_ROUNDS", "0"))
+        TOOL_ROUND_HARD_CAP = int(os.environ.get("MULIAO_MAX_TOOL_ROUNDS_CAP", "64"))
         url = LLM_BASE.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {LLM_KEY}", "Content-Type": "application/json"}
         timeout = httpx.Timeout(240.0, connect=20.0)
@@ -1853,6 +1857,7 @@ async def chat(req: Request):
         tools_used = []
         final_text = ""
         hit_max_rounds = False
+        force_final = False          # 撞上限后撤掉 tools，逼模型必须作答
 
         if tools:
             yield sse({"type": "tools_available", "tools": tool_names})
@@ -1915,13 +1920,16 @@ async def chat(req: Request):
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                for round_i in range(max_tool_rounds + 1):
+                round_i = 0
+                while True:
+                    round_i += 1
                     # 每轮都从后端 store 重建：system 恒定在最前，历史只增不改。
                     # _sess_msgs 已剔除非法序列，不会把半截 tool_calls 发给上游。
                     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _sess_msgs(session_id)
                     payload = {"model": active_model(), "messages": messages, "stream": True,
                                "max_tokens": MAX_REPLY_TOKENS}
-                    if tools:
+                    # force_final 时**不下发 tools**：模型没法再要工具，只能据已有信息作答。
+                    if tools and not force_final:
                         payload["tools"] = tools
                         payload["tool_choice"] = "auto"
 
@@ -1958,12 +1966,25 @@ async def chat(req: Request):
                         final_text = round_text
                         break
 
-                    if round_i == max_tool_rounds:
-                        # 最后一轮模型仍在要工具：不能静默无回复，
-                        # 也不能把「没有 tool 回复的 assistant(tool_calls)」写进历史。
+                    # 轮数上限：默认不限（max_tool_rounds<=0 时只用硬安全阀）。
+                    # 撞阀后**不静默截断**：置 force_final 继续下一轮，那轮不下发 tools，
+                    # 模型无法再要工具，只能据已获取的信息作答——保证一定有回答。
+                    effective_cap = (TOOL_ROUND_HARD_CAP if max_tool_rounds <= 0
+                                     else min(max_tool_rounds, TOOL_ROUND_HARD_CAP))
+                    if round_i > effective_cap:
+                        if force_final:
+                            # 收尾轮竟仍返回 tool_calls（异常上游）：落一句可解释的话再停。
+                            hit_max_rounds = True
+                            final_text = round_text or (
+                                f"工具调用已达上限 {effective_cap} 轮，收尾作答未产出内容；"
+                                "请缩小问题范围后重试。")
+                            break
                         hit_max_rounds = True
-                        final_text = round_text
-                        break
+                        force_final = True
+                        yield sse({"type": "notice",
+                                   "message": f"工具调用已达上限 {effective_cap} 轮，"
+                                              "正在用已获取的信息收尾作答…"})
+                        continue
 
                     # 原子写：assistant(tool_calls) 与它全部的 tool 结果**一次性**进 store。
                     # 这是本次加固的关键。旧代码先 append assistant，再逐个 append tool，
@@ -2049,14 +2070,14 @@ async def chat(req: Request):
                     if turn_state["epoch"] != _permission_version():
                         raise asyncio.CancelledError()
                     _sess_append(session_id, [asst_tc] + results)
-                else:
-                    hit_max_rounds = True
             if hit_max_rounds:
-                note = (f"工具调用已达上限 {max_tool_rounds} 轮，我用已获取的信息作答；"
-                        "如需更多请缩小问题范围。")
-                yield sse({"type": "notice", "message": note})
+                # 撞阀后的收尾轮已尝试作答；这里只兜底「收尾轮仍空」的情况，
+                # 保证前端绝不会出现「调完工具就没了」的空白回合。
                 if not final_text.strip():
-                    final_text = note
+                    final_text = (
+                        "我已用完本轮允许的工具调用次数，但收尾作答没有产出内容。"
+                        "请缩小问题范围或分成几步再问我。")
+                    yield sse({"type": "notice", "message": final_text})
 
         except _UpstreamError as e:
             yield sse({"type": "error", "message": str(e)})
