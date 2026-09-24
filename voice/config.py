@@ -95,12 +95,15 @@ class VoiceSettings:
 
     @classmethod
     def load(cls) -> "VoiceSettings":
-        default_model = (
-            Path(os.environ.get("LOCALAPPDATA") or Path.home())
-            / "Muliao"
-            / "models"
-            / "sensevoice"
-        )
+        # 与 voice-models.json 清单里 sensevoice 的 default_path 保持一致
+        # （C:/ProgramData/Muliao/models/sensevoice）。此前这里默认指向 LOCALAPPDATA，
+        # 与清单分歧，导致模型按清单下载好后运行时仍报 missing file。
+        default_model = Path(
+            _setting(
+                "MULIAO_VOICE_MODELS_ROOT",
+                os.path.join(os.environ.get("PROGRAMDATA") or "C:/ProgramData", "Muliao", "models"),
+            )
+        ) / "sensevoice"
         raw_device = _setting("MULIAO_VOICE_INPUT_DEVICE", "").strip()
         try:
             device = int(raw_device) if raw_device else None
