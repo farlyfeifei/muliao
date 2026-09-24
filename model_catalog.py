@@ -17,29 +17,65 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
-# 兼容 OpenAI 的阿里云千问网关基址（官方文档给出的 base_url）。
-ALIYUN_BASE = "https://maas.qianwenaiapi.com/compatible-mode/v1"
+# 兼容 OpenAI 的阿里云百炼「Token Plan 个人版」套餐专属网关基址。
+# 注意：不是通用的 maas.qianwenaiapi.com（那个会拿套餐 key 去打官方百炼，报
+# invalid_api_key）。套餐 key（sk-sp- 前缀）必须配这个专属域名。
+ALIYUN_BASE = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 
-# 默认主模型：能力档最高的一档，作为开箱默认（可被配置/前端切换覆盖）。
-DEFAULT_MODEL = "qwen3.8-max"
+# 默认主模型：glm-5.3。
+# 选型依据（实测同一提示的 total_tokens）：glm-5.3 在工具调用场景最省档之一
+# （181~200 tokens，deepseek-v4-pro 320、qwen3.8-max 351），且稳定支持
+# tool_calls —— 幕僚每个动作都要过门控+调工具，工具调用成本是主要开销。
+DEFAULT_MODEL = "glm-5.3"
 
-# 按官方文档整理的可选模型目录。
-#   id    —— 传给上游 chat.completions 的 model 字段（务必逐字一致）。
-#   label —— 前端展示名。
-#   tier  —— 档位，仅用于排序与说明：max > plus > flash。
-#   note  —— 一句话定位。
-# 这些是**文档目录**，未经该 key 实探验证；探测成功后真实列表会合并进来。
-DOCUMENTED: tuple[dict[str, str], ...] = (
-    {"id": "qwen3.8-max", "label": "Qwen3.8 Max", "tier": "max",
-     "note": "旗舰档：最强推理与写作，成本最高。"},
-    {"id": "qwen3.7-plus", "label": "Qwen3.7 Plus", "tier": "plus",
-     "note": "均衡档：能力与成本折中，日常主力。"},
-    {"id": "qwen3.8-flash", "label": "Qwen3.8 Flash", "tier": "flash",
-     "note": "极速档：低延迟低成本，适合轻量任务。"},
+# 非对话模型（图像生成 / TTS / 实时语音）：上游 /models 会列出来，但它们
+# 走不通 /chat/completions（实测 400/500），显示出来就是「不存在的模型」。
+# 按用户要求：不显示。命中下列任一子串即过滤掉。
+NON_CHAT_HINTS: tuple[str, ...] = (
+    "image", "wan2", "tts", "audio", "realtime", "vision-gen",
+    "embedding", "rerank", "ocr", "asr",
 )
 
-# tier 排序权重（数字越小越靠前）。
-_TIER_ORDER = {"max": 0, "plus": 1, "flash": 2}
+
+def is_chat_capable(model_id: str) -> bool:
+    """该模型 id 是否可能用于 /chat/completions（过滤图像/TTS/实时语音等非对话模型）。"""
+    low = str(model_id or "").lower()
+    return not any(h in low for h in NON_CHAT_HINTS)
+
+
+# 实测可用的对话模型目录（逐个打过 /chat/completions 验证 200，非猜测）。
+#   id    —— 传给上游 chat.completions 的 model 字段（务必逐字一致）。
+#   label —— 前端展示名。
+#   tier  —— 档位，用于排序：max > plus > flash/econo。
+#   note  —— 一句话定位，附实测 token 消耗量级（省 token 优先）。
+# 探测成功时以真实列表为准（source="probe"）；探测失败才回落到这份（已验证过的）目录。
+DOCUMENTED: tuple[dict[str, str], ...] = (
+    {"id": "glm-5.3", "label": "GLM-5.3", "tier": "econo",
+     "note": "默认档：实测最省 token 之一（工具调用 ~200），稳定支持工具调用。"},
+    {"id": "glm-5.2", "label": "GLM-5.2", "tier": "econo",
+     "note": "省 token 档：工具调用实测最省（~181 tokens）。"},
+    {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "tier": "plus",
+     "note": "对话回复最省（~134 tokens），工具调用略费。"},
+    {"id": "deepseek-v4.1-flash", "label": "DeepSeek V4.1 Flash", "tier": "flash",
+     "note": "均衡档，工具调用与对话都可用。"},
+    {"id": "qwen3.8-max", "label": "Qwen3.8 Max", "tier": "max",
+     "note": "旗舰档：能力最强，token 消耗中等偏高。"},
+    {"id": "qwen3.8-flash", "label": "Qwen3.8 Flash", "tier": "flash",
+     "note": "千问极速档。"},
+    {"id": "qwen3.7-max", "label": "Qwen3.7 Max", "tier": "max",
+     "note": "千问上代旗舰。"},
+    {"id": "qwen3.7-plus", "label": "Qwen3.7 Plus", "tier": "plus",
+     "note": "千问均衡档，实测 token 偏费。"},
+    {"id": "qwen3.6-flash", "label": "Qwen3.6 Flash", "tier": "flash",
+     "note": "千问早期档，实测 token 最费，不建议默认。"},
+    {"id": "deepseek-v4-flash-0731", "label": "DeepSeek V4 Flash (0731)", "tier": "flash",
+     "note": "DeepSeek 快档快照版。"},
+    {"id": "auto", "label": "Auto（上游自动选）", "tier": "auto",
+     "note": "由上游按请求自动挑模型，token 消耗不可控。"},
+)
+
+# tier 排序权重（数字越小越靠前）。默认档 glm-5.3 排最前。
+_TIER_ORDER = {"econo": 0, "flash": 1, "plus": 2, "max": 3, "auto": 4}
 
 
 def documented_ids() -> tuple[str, ...]:
@@ -57,12 +93,16 @@ def _tier_of(model_id: str) -> int:
         if m["id"] == model_id:
             return _TIER_ORDER.get(m["tier"], 9)
     low = model_id.lower()
-    if "max" in low:
+    if "glm" in low:
         return 0
+    if "max" in low or "pro" in low:
+        return 3
     if "plus" in low:
-        return 1
-    if "flash" in low or "turbo" in low:
         return 2
+    if "flash" in low or "turbo" in low:
+        return 1
+    if low == "auto":
+        return 4
     return 5
 
 
@@ -70,8 +110,9 @@ def merge_models(probed: Sequence[str]) -> list[dict[str, Any]]:
     """把上游探测到的真实模型 id 与本地文档目录合并成一份可展示列表。
 
     规则：
+      - **非对话模型一律不显示**（图像/TTS/实时语音等，走不通 chat.completions）。
       - 探测到的模型 source="probe"（真实可用，排在前）。
-      - 文档目录里、但没被探测到的，source="documented"（未验证，排在后）。
+      - 文档目录里、但没被探测到的，source="documented"（已验证过但当前未探到，排在后）。
       - 同名去重：探测结果优先，并继承文档目录的 label/tier/note。
       - 同 source 内按 tier 权重再按 id 排序，稳定可预期。
     """
@@ -80,9 +121,12 @@ def merge_models(probed: Sequence[str]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for raw in probed or ():
         mid = str(raw or "").strip()
-        if mid and mid not in seen:
-            seen.add(mid)
-            probed_ids.append(mid)
+        if not mid or mid in seen:
+            continue
+        if not is_chat_capable(mid):     # 过滤图像/TTS/实时语音等非对话模型
+            continue
+        seen.add(mid)
+        probed_ids.append(mid)
 
     rows: list[dict[str, Any]] = []
     for mid in probed_ids:
@@ -96,7 +140,7 @@ def merge_models(probed: Sequence[str]) -> list[dict[str, Any]]:
             "verified": True,
         })
     for mid, doc in doc_by_id.items():
-        if mid in seen:
+        if mid in seen or not is_chat_capable(mid):
             continue
         rows.append({
             "id": mid,
@@ -108,6 +152,7 @@ def merge_models(probed: Sequence[str]) -> list[dict[str, Any]]:
         })
 
     rows.sort(key=lambda r: (0 if r["source"] == "probe" else 1,
+                             0 if r["id"] == DEFAULT_MODEL else 1,   # 默认模型置顶
                              _tier_of(r["id"]), r["id"]))
     return rows
 

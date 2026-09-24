@@ -1,7 +1,7 @@
 {
-  "MULIAO_LLM_BASE": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+  "MULIAO_LLM_BASE": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
   "MULIAO_LLM_KEY": "replace-with-local-secret",
-  "MULIAO_LLM_MODEL": "qwen3.8-max",
+  "MULIAO_LLM_MODEL": "glm-5.3",
   "MULIAO_JEV_URL": "https://api.typesafe.ai/v1/systemone",
   "MULIAO_JEV_MODELS_URL": "https://api.typesafe.ai/v1/models",
   "MULIAO_JEV_KEY": "replace-with-local-secret",

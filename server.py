@@ -170,9 +170,13 @@ JEV_CONSOLE = "https://console.typesafe.ai/keys"   # 额度/key 管理入口
 PORT = int(os.environ.get("MULIAO_PORT", "8930"))
 NO_BROWSER = os.environ.get("MULIAO_NO_BROWSER") == "1"
 INSTANCE_TOKEN = os.environ.get("MULIAO_INSTANCE_TOKEN", "")
-# 单轮回复 token 上限：ΔH（每轮新增前缀）主要来自 assistant 回复，封顶它可稳住命中率。
-# 参谋本应简洁；160 tokens ≈ 100-150 中文字，够给「结论+依据」。
-MAX_REPLY_TOKENS = int(os.environ.get("MULIAO_MAX_REPLY", "160"))
+# 单轮回复 token 上限（completion_tokens 预算）。
+# 注意：默认对话模型 glm-5.3 / qwen3.8 是**推理模型**，其 reasoning_content（思考流）
+# 也计入 completion_tokens 预算。实测长 system 前缀下推理可吐 300+ 段，旧的 160 会被
+# 思考烧光 → 工具调用与正文被截断（模型只回「好的」却没真发 tool_call）。故上限须容纳
+# 「思考 + 工具调用参数 + 正文」。reasoning_content 只流式转发给前端、**不写进会话历史**
+# （历史只存 final_text 与 tool_calls+结果），所以调大此上限不污染 prompt 缓存前缀。
+MAX_REPLY_TOKENS = int(os.environ.get("MULIAO_MAX_REPLY", "1500"))
 # 资源根目录：开发态 = 本文件所在目录；PyInstaller 打包态（onefile）= 运行时解压目录 sys._MEIPASS
 if getattr(sys, "frozen", False):
     HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
